@@ -69,7 +69,7 @@ func (d *SQLiteDriver) GetRescheduleJobQuery() string {
 }
 
 func (d *SQLiteDriver) GetCurrentTimeQuery() string {
-	return "SELECT datetime('now')"
+	return "SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')"
 }
 
 func (d *SQLiteDriver) FormatQueryParams(args ...interface{}) []interface{} {

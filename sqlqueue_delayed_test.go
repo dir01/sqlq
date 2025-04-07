@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -89,8 +90,8 @@ func TestJobRetries(t *testing.T) {
 		// Create channels to track job processing attempts
 		jobAttempts := make(chan int, 5) // Buffer for multiple attempts
 
-		// Track the number of attempts
-		attemptCount := 0
+		// Use atomic counter to avoid race conditions
+		var attemptCount int32 = 0
 		maxRetries := 2 // We'll allow 2 retries (3 total attempts)
 
 		// Subscribe to jobs
@@ -101,11 +102,11 @@ func TestJobRetries(t *testing.T) {
 				return err
 			}
 
-			attemptCount++
-			jobAttempts <- attemptCount
+			count := atomic.AddInt32(&attemptCount, 1)
+			jobAttempts <- int(count)
 
 			// Fail the job for the first two attempts
-			if attemptCount <= maxRetries {
+			if count <= int32(maxRetries) {
 				return errors.New("simulated failure")
 			}
 
@@ -160,8 +161,8 @@ func TestJobRetries(t *testing.T) {
 		// Create channels to track job processing attempts
 		jobAttempts := make(chan int, 3) // Buffer for multiple attempts
 
-		// Track the number of attempts
-		attemptCount := 0
+		// Use atomic counter to avoid race conditions
+		var attemptCount int32 = 0
 		maxRetries := 1 // We'll allow 1 retry (2 total attempts)
 
 		// Subscribe to jobs
@@ -172,8 +173,8 @@ func TestJobRetries(t *testing.T) {
 				return err
 			}
 
-			attemptCount++
-			jobAttempts <- attemptCount
+			count := atomic.AddInt32(&attemptCount, 1)
+			jobAttempts <- int(count)
 
 			// Always fail the job
 			return errors.New("simulated failure")

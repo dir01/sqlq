@@ -197,15 +197,34 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 	var params []interface{}
 
 	if options.delay > 0 {
-		// Get current database time
-		var dbTime time.Time
-		err := tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
-		if err != nil {
-			return fmt.Errorf("failed to get database time: %w", err)
+		// Get current database time and calculate scheduled time
+		var scheduledAt time.Time
+	
+		if q.dbType == DBTypeSQLite {
+			// SQLite returns a string, not a time.Time
+			var timeStr string
+			err := tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&timeStr)
+			if err != nil {
+				return fmt.Errorf("failed to get database time: %w", err)
+			}
+		
+			// Parse the time string
+			parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
+			if err != nil {
+				return fmt.Errorf("failed to parse database time: %w", err)
+			}
+		
+			scheduledAt = parsedTime.Add(options.delay)
+		} else {
+			// PostgreSQL and MySQL return a time.Time
+			var dbTime time.Time
+			err := tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
+			if err != nil {
+				return fmt.Errorf("failed to get database time: %w", err)
+			}
+		
+			scheduledAt = dbTime.Add(options.delay)
 		}
-
-		// Calculate scheduled time
-		scheduledAt := dbTime.Add(options.delay)
 		
 		query = q.driver.GetInsertDelayedJobQuery()
 		params = q.driver.FormatQueryParams(jobType, payloadBytes, scheduledAt, options.maxRetries)
@@ -340,15 +359,34 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 	// Calculate exponential backoff
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
 	
-	// Get current database time
-	var dbTime time.Time
-	err = tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
-	if err != nil {
-		return fmt.Errorf("failed to get database time: %w", err)
-	}
+	// Get current database time and calculate next run time with backoff
+	var nextRunTime time.Time
 	
-	// Calculate next run time with backoff
-	nextRunTime := dbTime.Add(backoff)
+	if q.dbType == DBTypeSQLite {
+		// SQLite returns a string, not a time.Time
+		var timeStr string
+		err = tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&timeStr)
+		if err != nil {
+			return fmt.Errorf("failed to get database time: %w", err)
+		}
+		
+		// Parse the time string
+		parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse database time: %w", err)
+		}
+		
+		nextRunTime = parsedTime.Add(backoff)
+	} else {
+		// PostgreSQL and MySQL return a time.Time
+		var dbTime time.Time
+		err = tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
+		if err != nil {
+			return fmt.Errorf("failed to get database time: %w", err)
+		}
+		
+		nextRunTime = dbTime.Add(backoff)
+	}
 	
 	// Update the job's scheduled_at time
 	rescheduleQuery := q.driver.GetRescheduleJobQuery()
