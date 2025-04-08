@@ -322,7 +322,7 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 	defer tx.Rollback()
 
 	// Mark job as failed and increment retry count
-	err := q.driver.MarkJobFailed(q.db, job.ID, errorMsg)
+	err = q.driver.MarkJobFailed(q.db, job.ID, errorMsg)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed: %w", err)
 	}
