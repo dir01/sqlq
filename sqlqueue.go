@@ -86,7 +86,7 @@ const (
 
 // Error definitions
 var (
-	ErrUnsupportedDBType = errors.New("unsupported database type")
+	ErrUnsupportedDBType  = errors.New("unsupported database type")
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
 )
 
@@ -199,7 +199,7 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 	if options.delay > 0 {
 		// Get current database time and calculate scheduled time
 		var scheduledAt time.Time
-	
+
 		if q.dbType == DBTypeSQLite {
 			// SQLite returns a string, not a time.Time
 			var timeStr string
@@ -207,13 +207,13 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 			if err != nil {
 				return fmt.Errorf("failed to get database time: %w", err)
 			}
-		
+
 			// Parse the time string
 			parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
 			if err != nil {
 				return fmt.Errorf("failed to parse database time: %w", err)
 			}
-		
+
 			scheduledAt = parsedTime.Add(options.delay)
 		} else {
 			// PostgreSQL and MySQL return a time.Time
@@ -222,10 +222,10 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 			if err != nil {
 				return fmt.Errorf("failed to get database time: %w", err)
 			}
-		
+
 			scheduledAt = dbTime.Add(options.delay)
 		}
-		
+
 		query = q.driver.GetInsertDelayedJobQuery()
 		params = q.driver.FormatQueryParams(jobType, payloadBytes, scheduledAt, options.maxRetries)
 	} else {
@@ -257,10 +257,13 @@ func (q *SQLQueue) Subscribe(
 		concurrency:   defaultConcurrency,
 		prefetchCount: defaultPrefetch,
 	}
-
 	// Apply provided options
 	for _, opt := range opts {
 		opt(&options)
+	}
+	// Options sanity adjustments
+	if options.prefetchCount < options.concurrency {
+		options.prefetchCount = options.concurrency
 	}
 
 	subCtx, cancel := context.WithCancel(ctx)
@@ -309,7 +312,7 @@ func (q *SQLQueue) workerLoop(sub *subscriber) {
 			if err != nil {
 				log.Printf("Job handler failed for job %d: %v", job.ID, err)
 				_ = tx.Rollback()
-				
+
 				// Handle retry logic
 				if job.RetryCount < job.MaxRetries {
 					if err := q.retryJob(sub.ctx, job, err.Error()); err != nil {
@@ -350,7 +353,7 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 	// Mark job as failed and increment retry count
 	failedQuery := q.driver.GetMarkJobFailedQuery()
 	failedParams := q.driver.FormatQueryParams(errorMsg, job.ID)
-	
+
 	_, err = tx.ExecContext(ctx, failedQuery, failedParams...)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed: %w", err)
@@ -358,10 +361,10 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 
 	// Calculate exponential backoff
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
-	
+
 	// Get current database time and calculate next run time with backoff
 	var nextRunTime time.Time
-	
+
 	if q.dbType == DBTypeSQLite {
 		// SQLite returns a string, not a time.Time
 		var timeStr string
@@ -369,13 +372,13 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 		if err != nil {
 			return fmt.Errorf("failed to get database time: %w", err)
 		}
-		
+
 		// Parse the time string
 		parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
 		if err != nil {
 			return fmt.Errorf("failed to parse database time: %w", err)
 		}
-		
+
 		nextRunTime = parsedTime.Add(backoff)
 	} else {
 		// PostgreSQL and MySQL return a time.Time
@@ -384,14 +387,14 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 		if err != nil {
 			return fmt.Errorf("failed to get database time: %w", err)
 		}
-		
+
 		nextRunTime = dbTime.Add(backoff)
 	}
-	
+
 	// Update the job's scheduled_at time
 	rescheduleQuery := q.driver.GetRescheduleJobQuery()
 	rescheduleParams := q.driver.FormatQueryParams(nextRunTime, job.ID)
-	
+
 	_, err = tx.ExecContext(ctx, rescheduleQuery, rescheduleParams...)
 	if err != nil {
 		return fmt.Errorf("failed to reschedule job: %w", err)
