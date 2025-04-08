@@ -413,10 +413,7 @@ func (q *SQLQueue) processJobs() error {
 // processJobsForSubscriber fetches jobs for a specific subscriber and sends them to worker goroutines
 func (q *SQLQueue) processJobsForSubscriber(sub *subscriber) error {
 	// Find jobs that haven't been processed by this consumer
-	query := q.driver.GetJobsForConsumerQuery()
-	params := q.driver.FormatQueryParams(sub.consumerName, sub.jobType)
-
-	rows, err := q.db.QueryContext(sub.ctx, query, params...)
+	rows, err := q.driver.GetJobsForConsumer(q.db, sub.consumerName, sub.jobType)
 	if err != nil {
 		return fmt.Errorf("failed to query jobs: %w", err)
 	}
