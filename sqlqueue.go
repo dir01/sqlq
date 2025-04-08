@@ -193,49 +193,23 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	var query string
-	var params []interface{}
-
 	if options.delay > 0 {
 		// Get current database time and calculate scheduled time
-		var scheduledAt time.Time
-
-		if q.dbType == DBTypeSQLite {
-			// SQLite returns a string, not a time.Time
-			var timeStr string
-			err := tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&timeStr)
-			if err != nil {
-				return fmt.Errorf("failed to get database time: %w", err)
-			}
-
-			// Parse the time string
-			parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
-			if err != nil {
-				return fmt.Errorf("failed to parse database time: %w", err)
-			}
-
-			scheduledAt = parsedTime.Add(options.delay)
-		} else {
-			// PostgreSQL and MySQL return a time.Time
-			var dbTime time.Time
-			err := tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
-			if err != nil {
-				return fmt.Errorf("failed to get database time: %w", err)
-			}
-
-			scheduledAt = dbTime.Add(options.delay)
+		currentTime, err := q.driver.GetCurrentTime(q.db)
+		if err != nil {
+			return fmt.Errorf("failed to get database time: %w", err)
 		}
+		scheduledAt := currentTime.Add(options.delay)
 
-		query = q.driver.GetInsertDelayedJobQuery()
-		params = q.driver.FormatQueryParams(jobType, payloadBytes, scheduledAt, options.maxRetries)
+		err = q.driver.InsertDelayedJob(q.db, jobType, payloadBytes, scheduledAt, options.maxRetries)
+		if err != nil {
+			return fmt.Errorf("failed to insert delayed job: %w", err)
+		}
 	} else {
-		query = q.driver.GetInsertJobQuery()
-		params = q.driver.FormatQueryParams(jobType, payloadBytes, options.maxRetries)
-	}
-
-	_, err = tx.ExecContext(ctx, query, params...)
-	if err != nil {
-		return fmt.Errorf("failed to insert job: %w", err)
+		err = q.driver.InsertJob(q.db, jobType, payloadBytes, options.maxRetries)
+		if err != nil {
+			return fmt.Errorf("failed to insert job: %w", err)
+		}
 	}
 
 	return nil
@@ -325,10 +299,7 @@ func (q *SQLQueue) workerLoop(sub *subscriber) {
 			}
 
 			// Mark as processed
-			markQuery := q.driver.GetMarkJobProcessedQuery()
-			markParams := q.driver.FormatQueryParams(job.ID, sub.consumerName)
-
-			_, err = tx.ExecContext(sub.ctx, markQuery, markParams...)
+			err = q.driver.MarkJobProcessed(q.db, job.ID, sub.consumerName)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("Failed to mark job %d as processed: %v", job.ID, err)
 				_ = tx.Rollback()
@@ -351,10 +322,7 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 	defer tx.Rollback()
 
 	// Mark job as failed and increment retry count
-	failedQuery := q.driver.GetMarkJobFailedQuery()
-	failedParams := q.driver.FormatQueryParams(errorMsg, job.ID)
-
-	_, err = tx.ExecContext(ctx, failedQuery, failedParams...)
+	err := q.driver.MarkJobFailed(q.db, job.ID, errorMsg)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed: %w", err)
 	}
@@ -363,39 +331,13 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
 
 	// Get current database time and calculate next run time with backoff
-	var nextRunTime time.Time
-
-	if q.dbType == DBTypeSQLite {
-		// SQLite returns a string, not a time.Time
-		var timeStr string
-		err = tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&timeStr)
-		if err != nil {
-			return fmt.Errorf("failed to get database time: %w", err)
-		}
-
-		// Parse the time string
-		parsedTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
-		if err != nil {
-			return fmt.Errorf("failed to parse database time: %w", err)
-		}
-
-		nextRunTime = parsedTime.Add(backoff)
-	} else {
-		// PostgreSQL and MySQL return a time.Time
-		var dbTime time.Time
-		err = tx.QueryRowContext(ctx, q.driver.GetCurrentTimeQuery()).Scan(&dbTime)
-		if err != nil {
-			return fmt.Errorf("failed to get database time: %w", err)
-		}
-
-		nextRunTime = dbTime.Add(backoff)
+	currentTime, err := q.driver.GetCurrentTime(q.db)
+	if err != nil {
+		return fmt.Errorf("failed to get database time: %w", err)
 	}
+	nextRunTime := currentTime.Add(backoff)
 
-	// Update the job's scheduled_at time
-	rescheduleQuery := q.driver.GetRescheduleJobQuery()
-	rescheduleParams := q.driver.FormatQueryParams(nextRunTime, job.ID)
-
-	_, err = tx.ExecContext(ctx, rescheduleQuery, rescheduleParams...)
+	err = q.driver.RescheduleJob(q.db, job.ID, nextRunTime)
 	if err != nil {
 		return fmt.Errorf("failed to reschedule job: %w", err)
 	}
