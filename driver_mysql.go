@@ -6,7 +6,7 @@ import (
 )
 
 // MySQLDriver implements the Driver interface for MySQL
-type MySQLDriver struct{
+type MySQLDriver struct {
 	db *sql.DB
 }
 
@@ -41,7 +41,7 @@ func (d *MySQLDriver) InitSchema() error {
 		`CREATE INDEX idx_jobs_job_type ON jobs(job_type(255))`,
 
 		`CREATE INDEX idx_jobs_scheduled_at ON jobs(scheduled_at)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id INT AUTO_INCREMENT PRIMARY KEY,
 			original_job_id INT,
@@ -53,9 +53,8 @@ func (d *MySQLDriver) InitSchema() error {
 			max_retries INT,
 			failure_reason TEXT
 		)`,
-		
-		`CREATE INDEX idx_dlq_job_type ON dead_letter_queue(job_type(255))`
-	}
+
+		`CREATE INDEX idx_dlq_job_type ON dead_letter_queue(job_type(255))`,
 	}
 
 	for _, query := range queries {
@@ -157,7 +156,7 @@ func (d *MySQLDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
 	return tx.Commit()
 }
 
-func (d *MySQLDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
+func (d *MySQLDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error) {
 	query := `
 		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
 		FROM dead_letter_queue
@@ -174,29 +173,29 @@ func (d *MySQLDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetter
 		`
 		return d.queryDeadLetterJobs(query, limit)
 	}
-	
+
 	return d.queryDeadLetterJobs(query, jobType, limit)
 }
 
-func (d *MySQLDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
+func (d *MySQLDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]deadLetterJob, error) {
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var jobs []DeadLetterJob
+	var jobs []deadLetterJob
 	for rows.Next() {
-		var j DeadLetterJob
+		var j deadLetterJob
 		if err := rows.Scan(
-			&j.ID, 
-			&j.OriginalID, 
-			&j.JobType, 
-			&j.Payload, 
-			&j.CreatedAt, 
-			&j.FailedAt, 
-			&j.RetryCount, 
-			&j.MaxRetries, 
+			&j.ID,
+			&j.OriginalID,
+			&j.JobType,
+			&j.Payload,
+			&j.CreatedAt,
+			&j.FailedAt,
+			&j.RetryCount,
+			&j.MaxRetries,
 			&j.FailureReason,
 		); err != nil {
 			return nil, err
@@ -219,7 +218,7 @@ func (d *MySQLDriver) RequeueDeadLetterJob(dlqID int64) error {
 	defer tx.Rollback()
 
 	// Get the job from the dead letter queue
-	var dlqJob DeadLetterJob
+	var dlqJob deadLetterJob
 	err = tx.QueryRow(`
 		SELECT id, job_type, payload, max_retries
 		FROM dead_letter_queue WHERE id = ?

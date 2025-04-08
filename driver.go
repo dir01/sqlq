@@ -32,7 +32,7 @@ type Driver interface {
 	MoveToDeadLetterQueue(jobID int64, reason string) error
 
 	// GetDeadLetterJobs retrieves jobs from the dead letter queue
-	GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error)
+	GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error)
 
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 	RequeueDeadLetterJob(dlqID int64) error

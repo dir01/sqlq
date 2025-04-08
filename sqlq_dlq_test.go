@@ -143,7 +143,6 @@ func runDeadLetterQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 		maxRetries := 1 // Allow 1 retry (2 total attempts)
 
 		// Track job processing attempts and success
-		var failedJobID int64
 		jobAttempted := make(chan int, maxRetries+1)
 		jobSucceeded := make(chan bool, 1)
 		shouldSucceed := false
@@ -217,7 +216,6 @@ func runDeadLetterQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 
 			if payload.Count == testPayload.Count {
 				dlqJobID = dlqJob.ID
-				failedJobID = dlqJob.OriginalID
 				break
 			}
 		}

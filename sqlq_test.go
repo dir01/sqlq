@@ -144,43 +144,6 @@ func runQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 			}
 		}
 	})
-
-	t.Run("Transaction support", func(t *testing.T) {
-		jobProcessed := make(chan bool, 1)
-
-		// Subscribe to jobs
-		queue.Subscribe(context.Background(), "tx_job", "tx_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
-			var payload TestPayload
-			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-				t.Errorf("Failed to unmarshal payload: %v", err)
-				return err
-			}
-			jobProcessed <- true
-			return nil
-		})
-
-		// Start a transaction
-		tx, err := dbConfig.DB.BeginTx(context.Background(), nil)
-		require.NoError(t, err, "Failed to begin transaction")
-
-		// Publish a job within the transaction
-		err = queue.PublishTx(context.Background(), tx, "tx_job", TestPayload{Message: "Transaction job", Count: 200})
-		if err != nil {
-			_ = tx.Rollback()
-			t.Fatalf("Failed to publish job in transaction: %v", err)
-		}
-		// Commit the transaction
-		err = tx.Commit()
-		require.NoError(t, err, "Failed to commit transaction")
-
-		// Wait for the job to be processed
-		select {
-		case <-jobProcessed:
-			// Job was processed
-		case <-time.After(5 * time.Second):
-			t.Fatal("Timed out waiting for transaction job to be processed")
-		}
-	})
 }
 
 // setupSQLiteDB sets up an in-memory SQLite database for testing

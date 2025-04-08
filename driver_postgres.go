@@ -6,7 +6,7 @@ import (
 )
 
 // PostgresDriver implements the Driver interface for PostgreSQL
-type PostgresDriver struct{
+type PostgresDriver struct {
 	db *sql.DB
 }
 
@@ -27,7 +27,7 @@ func (d *PostgresDriver) InitSchema() error {
 			max_retries INTEGER DEFAULT 0,
 			last_error TEXT
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS job_consumers (
 			job_id INTEGER,
 			consumer_name TEXT,
@@ -35,10 +35,10 @@ func (d *PostgresDriver) InitSchema() error {
 			PRIMARY KEY (job_id, consumer_name),
 			FOREIGN KEY (job_id) REFERENCES jobs(id)
 		)`,
-		
+
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id SERIAL PRIMARY KEY,
 			original_job_id INTEGER,
@@ -50,11 +50,10 @@ func (d *PostgresDriver) InitSchema() error {
 			max_retries INTEGER,
 			failure_reason TEXT
 		)`,
-		
-		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`
+
+		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`,
 	}
-	}
-	
+
 	for _, query := range queries {
 		_, err := d.db.Exec(query)
 		if err != nil {
@@ -154,7 +153,7 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	return tx.Commit()
 }
 
-func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
+func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error) {
 	query := `
 		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
 		FROM dead_letter_queue
@@ -171,29 +170,29 @@ func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLet
 		`
 		return d.queryDeadLetterJobs(query, limit)
 	}
-	
+
 	return d.queryDeadLetterJobs(query, jobType, limit)
 }
 
-func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
+func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]deadLetterJob, error) {
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var jobs []DeadLetterJob
+	var jobs []deadLetterJob
 	for rows.Next() {
-		var j DeadLetterJob
+		var j deadLetterJob
 		if err := rows.Scan(
-			&j.ID, 
-			&j.OriginalID, 
-			&j.JobType, 
-			&j.Payload, 
-			&j.CreatedAt, 
-			&j.FailedAt, 
-			&j.RetryCount, 
-			&j.MaxRetries, 
+			&j.ID,
+			&j.OriginalID,
+			&j.JobType,
+			&j.Payload,
+			&j.CreatedAt,
+			&j.FailedAt,
+			&j.RetryCount,
+			&j.MaxRetries,
 			&j.FailureReason,
 		); err != nil {
 			return nil, err
@@ -216,7 +215,7 @@ func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
 	defer tx.Rollback()
 
 	// Get the job from the dead letter queue
-	var dlqJob DeadLetterJob
+	var dlqJob deadLetterJob
 	err = tx.QueryRow(`
 		SELECT id, job_type, payload, max_retries
 		FROM dead_letter_queue WHERE id = $1
