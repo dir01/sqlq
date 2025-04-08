@@ -2,6 +2,7 @@ package sqlqueue
 
 import (
 	"database/sql"
+	"time"
 )
 
 // SQLiteDriver implements the Driver interface for SQLite
