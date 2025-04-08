@@ -63,7 +63,6 @@ func (d *MySQLDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType strin
 		AND j.scheduled_at <= NOW()
 		AND jc.job_id IS NULL
 		ORDER BY j.id
-		LIMIT 10
 		LIMIT ?
 	`, consumerName, jobType, prefetchCount)
 	if err != nil {
