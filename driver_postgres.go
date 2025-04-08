@@ -53,6 +53,7 @@ func (d *PostgresDriver) InitSchema() error {
 		
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`
 	}
+	}
 	
 	for _, query := range queries {
 		_, err := d.db.Exec(query)

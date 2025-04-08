@@ -56,6 +56,7 @@ func (d *MySQLDriver) InitSchema() error {
 		
 		`CREATE INDEX idx_dlq_job_type ON dead_letter_queue(job_type(255))`
 	}
+	}
 
 	for _, query := range queries {
 		_, err := d.db.Exec(query)
