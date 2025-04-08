@@ -43,16 +43,18 @@ func (d *MySQLDriver) InitSchema(db *sql.DB) error {
 	return nil
 }
 
-func (d *MySQLDriver) GetInsertJobQuery() string {
-	return "INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)"
+func (d *MySQLDriver) InsertJob(db *sql.DB, jobType string, payload []byte, maxRetries int) error {
+	_, err := db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)", jobType, payload, maxRetries)
+	return err
 }
 
-func (d *MySQLDriver) GetInsertDelayedJobQuery() string {
-	return "INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)"
+func (d *MySQLDriver) InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
+	_, err := db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)", jobType, payload, scheduledAt, maxRetries)
+	return err
 }
 
-func (d *MySQLDriver) GetJobsForConsumerQuery() string {
-	return `
+func (d *MySQLDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string) (*sql.Rows, error) {
+	return db.Query(`
 		SELECT j.id, j.payload, j.retry_count, j.max_retries 
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
@@ -61,25 +63,26 @@ func (d *MySQLDriver) GetJobsForConsumerQuery() string {
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT 10
-	`
+	`, consumerName, jobType)
 }
 
-func (d *MySQLDriver) GetMarkJobProcessedQuery() string {
-	return "INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)"
+func (d *MySQLDriver) MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error {
+	_, err := db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)", jobID, consumerName)
+	return err
 }
 
-func (d *MySQLDriver) GetMarkJobFailedQuery() string {
-	return "UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?"
+func (d *MySQLDriver) MarkJobFailed(db *sql.DB, jobID int64, errorMsg string) error {
+	_, err := db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?", errorMsg, jobID)
+	return err
 }
 
-func (d *MySQLDriver) GetRescheduleJobQuery() string {
-	return "UPDATE jobs SET scheduled_at = ? WHERE id = ?"
+func (d *MySQLDriver) RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.Time) error {
+	_, err := db.Exec("UPDATE jobs SET scheduled_at = ? WHERE id = ?", scheduledAt, jobID)
+	return err
 }
 
-func (d *MySQLDriver) GetCurrentTimeQuery() string {
-	return "SELECT NOW()"
-}
-
-func (d *MySQLDriver) FormatQueryParams(args ...interface{}) []interface{} {
-	return args
+func (d *MySQLDriver) GetCurrentTime(db *sql.DB) (time.Time, error) {
+	var currentTime time.Time
+	err := db.QueryRow("SELECT NOW()").Scan(&currentTime)
+	return currentTime, err
 }

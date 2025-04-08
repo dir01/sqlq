@@ -35,16 +35,18 @@ func (d *PostgresDriver) InitSchema(db *sql.DB) error {
 	return err
 }
 
-func (d *PostgresDriver) GetInsertJobQuery() string {
-	return "INSERT INTO jobs (job_type, payload, max_retries) VALUES ($1, $2, $3)"
+func (d *PostgresDriver) InsertJob(db *sql.DB, jobType string, payload []byte, maxRetries int) error {
+	_, err := db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES ($1, $2, $3)", jobType, payload, maxRetries)
+	return err
 }
 
-func (d *PostgresDriver) GetInsertDelayedJobQuery() string {
-	return "INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES ($1, $2, $3, $4)"
+func (d *PostgresDriver) InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
+	_, err := db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES ($1, $2, $3, $4)", jobType, payload, scheduledAt, maxRetries)
+	return err
 }
 
-func (d *PostgresDriver) GetJobsForConsumerQuery() string {
-	return `
+func (d *PostgresDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string) (*sql.Rows, error) {
+	return db.Query(`
 		SELECT j.id, j.payload, j.retry_count, j.max_retries 
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = $1
@@ -53,25 +55,26 @@ func (d *PostgresDriver) GetJobsForConsumerQuery() string {
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT 10
-	`
+	`, consumerName, jobType)
 }
 
-func (d *PostgresDriver) GetMarkJobProcessedQuery() string {
-	return "INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)"
+func (d *PostgresDriver) MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error {
+	_, err := db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)", jobID, consumerName)
+	return err
 }
 
-func (d *PostgresDriver) GetMarkJobFailedQuery() string {
-	return "UPDATE jobs SET retry_count = retry_count + 1, last_error = $1 WHERE id = $2"
+func (d *PostgresDriver) MarkJobFailed(db *sql.DB, jobID int64, errorMsg string) error {
+	_, err := db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = $1 WHERE id = $2", errorMsg, jobID)
+	return err
 }
 
-func (d *PostgresDriver) GetRescheduleJobQuery() string {
-	return "UPDATE jobs SET scheduled_at = $1 WHERE id = $2"
+func (d *PostgresDriver) RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.Time) error {
+	_, err := db.Exec("UPDATE jobs SET scheduled_at = $1 WHERE id = $2", scheduledAt, jobID)
+	return err
 }
 
-func (d *PostgresDriver) GetCurrentTimeQuery() string {
-	return "SELECT NOW()"
-}
-
-func (d *PostgresDriver) FormatQueryParams(args ...interface{}) []interface{} {
-	return args
+func (d *PostgresDriver) GetCurrentTime(db *sql.DB) (time.Time, error) {
+	var currentTime time.Time
+	err := db.QueryRow("SELECT NOW()").Scan(&currentTime)
+	return currentTime, err
 }

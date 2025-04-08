@@ -9,29 +9,26 @@ type Driver interface {
 	// InitSchema creates the necessary tables if they don't exist
 	InitSchema(db *sql.DB) error
 
-	// GetInsertJobQuery returns the query for inserting a new job
-	GetInsertJobQuery() string
+	// InsertJob executes the query for inserting a new job
+	InsertJob(db *sql.DB, jobType string, payload []byte, maxRetries int) error
 
-	// GetInsertDelayedJobQuery returns the query for inserting a delayed job
-	GetInsertDelayedJobQuery() string
+	// InsertDelayedJob executes the query for inserting a delayed job
+	InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error
 
-	// GetJobsForConsumerQuery returns the query for finding jobs for a consumer
-	GetJobsForConsumerQuery() string
+	// GetJobsForConsumer executes the query for finding jobs for a consumer
+	GetJobsForConsumer(db *sql.DB, consumerName, jobType string) (*sql.Rows, error)
 
-	// GetMarkJobProcessedQuery returns the query for marking a job as processed
-	GetMarkJobProcessedQuery() string
+	// MarkJobProcessed executes the query for marking a job as processed
+	MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error
 
-	// GetMarkJobFailedQuery returns the query for marking a job as failed with retry info
-	GetMarkJobFailedQuery() string
+	// MarkJobFailed executes the query for marking a job as failed with retry info
+	MarkJobFailed(db *sql.DB, jobID int64, errorMsg string) error
 
-	// GetRescheduleJobQuery returns the query for rescheduling a job after a failure
-	GetRescheduleJobQuery() string
+	// RescheduleJob executes the query for rescheduling a job after a failure
+	RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.Time) error
 
-	// GetCurrentTimeQuery returns the query to get the current database time
-	GetCurrentTimeQuery() string
-
-	// FormatQueryParams formats query parameters according to the database's requirements
-	FormatQueryParams(args ...interface{}) []interface{}
+	// GetCurrentTime executes the query to get the current database time
+	GetCurrentTime(db *sql.DB) (time.Time, error)
 }
 
 // GetDriver returns the appropriate driver for the given database type
