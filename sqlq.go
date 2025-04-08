@@ -313,7 +313,7 @@ func (q *sqlq) Run() {
 
 	go func() {
 		defer q.wg.Done()
-		
+
 		// Each subscriber will be polled at their own interval
 		for {
 			select {
@@ -370,9 +370,6 @@ func (q *sqlq) processJobs() error {
 	// Process for each job type with subscribers
 	for jobType, subs := range q.subscribers {
 		for _, sub := range subs {
-			// Check if it's time to poll for this subscriber
-			now := time.Now()
-			
 			// Use a separate goroutine for each subscriber to respect their individual poll intervals
 			go func(sub *subscriber, jobType string) {
 				if err := q.processJobsForSubscriber(sub); err != nil && !errors.Is(err, context.Canceled) {
@@ -381,7 +378,7 @@ func (q *sqlq) processJobs() error {
 						sub.consumerName, jobType, err,
 					)
 				}
-				
+
 				// Sleep for the poll interval
 				time.Sleep(sub.pollInterval)
 			}(sub, jobType)
