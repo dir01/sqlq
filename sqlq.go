@@ -81,7 +81,7 @@ func New(db *sql.DB, dbType DBType, pollInterval time.Duration) (JobsQueue, erro
 		pollInterval = 1 * time.Second
 	}
 
-	driver, err := GetDriver(dbType)
+	driver, err := GetDriver(db, dbType)
 	if err != nil {
 		return nil, err
 	}
@@ -96,17 +96,13 @@ func New(db *sql.DB, dbType DBType, pollInterval time.Duration) (JobsQueue, erro
 	}
 
 	// Initialize the database schema
-	if err := q.initSchema(); err != nil {
+	if err := q.driver.InitSchema(); err != nil {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
 	return q, nil
 }
 
-// initSchema creates the necessary tables if they don't exist
-func (q *sqlq) initSchema() error {
-	return q.driver.InitSchema(q.db)
-}
 
 // Publish adds a new job to the queue
 func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
@@ -141,18 +137,18 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 
 	if options.delay > 0 {
 		// Get current database time and calculate scheduled time
-		currentTime, err := q.driver.GetCurrentTime(q.db)
+		currentTime, err := q.driver.GetCurrentTime()
 		if err != nil {
 			return fmt.Errorf("failed to get database time: %w", err)
 		}
 		scheduledAt := currentTime.Add(options.delay)
 
-		err = q.driver.InsertDelayedJob(q.db, jobType, payloadBytes, scheduledAt, options.maxRetries)
+		err = q.driver.InsertDelayedJob(jobType, payloadBytes, scheduledAt, options.maxRetries)
 		if err != nil {
 			return fmt.Errorf("failed to insert delayed job: %w", err)
 		}
 	} else {
-		err = q.driver.InsertJob(q.db, jobType, payloadBytes, options.maxRetries)
+		err = q.driver.InsertJob(jobType, payloadBytes, options.maxRetries)
 		if err != nil {
 			return fmt.Errorf("failed to insert job: %w", err)
 		}
@@ -245,7 +241,7 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 			}
 
 			// Mark as processed
-			err = q.driver.MarkJobProcessed(q.db, job.ID, sub.consumerName)
+			err = q.driver.MarkJobProcessed(job.ID, sub.consumerName)
 			if err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("Failed to mark job %d as processed: %v", job.ID, err)
 				_ = tx.Rollback()
@@ -268,7 +264,7 @@ func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 	defer tx.Rollback()
 
 	// Mark job as failed and increment retry count
-	err = q.driver.MarkJobFailed(q.db, job.ID, errorMsg)
+	err = q.driver.MarkJobFailed(job.ID, errorMsg)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed: %w", err)
 	}
@@ -277,13 +273,13 @@ func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
 
 	// Get current database time and calculate next run time with backoff
-	currentTime, err := q.driver.GetCurrentTime(q.db)
+	currentTime, err := q.driver.GetCurrentTime()
 	if err != nil {
 		return fmt.Errorf("failed to get database time: %w", err)
 	}
 	nextRunTime := currentTime.Add(backoff)
 
-	err = q.driver.RescheduleJob(q.db, job.ID, nextRunTime)
+	err = q.driver.RescheduleJob(job.ID, nextRunTime)
 	if err != nil {
 		return fmt.Errorf("failed to reschedule job: %w", err)
 	}
@@ -359,7 +355,7 @@ func (q *sqlq) processJobs() error {
 // processJobsForSubscriber fetches jobs for a specific subscriber and sends them to worker goroutines
 func (q *sqlq) processJobsForSubscriber(sub *subscriber) error {
 	// Find jobs that haven't been processed by this consumer
-	jobs, err := q.driver.GetJobsForConsumer(q.db, sub.consumerName, sub.jobType, sub.prefetchCount)
+	jobs, err := q.driver.GetJobsForConsumer(sub.consumerName, sub.jobType, sub.prefetchCount)
 	if err != nil {
 		return fmt.Errorf("failed to query jobs: %w", err)
 	}

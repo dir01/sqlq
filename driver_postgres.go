@@ -6,9 +6,16 @@ import (
 )
 
 // PostgresDriver implements the Driver interface for PostgreSQL
-type PostgresDriver struct{}
+type PostgresDriver struct{
+	db *sql.DB
+}
 
-func (d *PostgresDriver) InitSchema(db *sql.DB) error {
+// NewPostgresDriver creates a new PostgreSQL driver with the given database connection
+func NewPostgresDriver(db *sql.DB) *PostgresDriver {
+	return &PostgresDriver{db: db}
+}
+
+func (d *PostgresDriver) InitSchema() error {
 	query := `
 		CREATE TABLE IF NOT EXISTS jobs (
 			id SERIAL PRIMARY KEY,
@@ -32,22 +39,22 @@ func (d *PostgresDriver) InitSchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type);
 		CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at);
 	`
-	_, err := db.Exec(query)
+	_, err := d.db.Exec(query)
 	return err
 }
 
-func (d *PostgresDriver) InsertJob(db *sql.DB, jobType string, payload []byte, maxRetries int) error {
-	_, err := db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES ($1, $2, $3)", jobType, payload, maxRetries)
+func (d *PostgresDriver) InsertJob(jobType string, payload []byte, maxRetries int) error {
+	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES ($1, $2, $3)", jobType, payload, maxRetries)
 	return err
 }
 
-func (d *PostgresDriver) InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
-	_, err := db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES ($1, $2, $3, $4)", jobType, payload, scheduledAt, maxRetries)
+func (d *PostgresDriver) InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
+	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES ($1, $2, $3, $4)", jobType, payload, scheduledAt, maxRetries)
 	return err
 }
 
-func (d *PostgresDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string, prefetchCount int) ([]job, error) {
-	rows, err := db.Query(`
+func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error) {
+	rows, err := d.db.Query(`
 		SELECT j.id, j.payload, j.retry_count, j.max_retries 
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = $1
@@ -78,23 +85,23 @@ func (d *PostgresDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType st
 	return jobs, nil
 }
 
-func (d *PostgresDriver) MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error {
-	_, err := db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)", jobID, consumerName)
+func (d *PostgresDriver) MarkJobProcessed(jobID int64, consumerName string) error {
+	_, err := d.db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)", jobID, consumerName)
 	return err
 }
 
-func (d *PostgresDriver) MarkJobFailed(db *sql.DB, jobID int64, errorMsg string) error {
-	_, err := db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = $1 WHERE id = $2", errorMsg, jobID)
+func (d *PostgresDriver) MarkJobFailed(jobID int64, errorMsg string) error {
+	_, err := d.db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = $1 WHERE id = $2", errorMsg, jobID)
 	return err
 }
 
-func (d *PostgresDriver) RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.Time) error {
-	_, err := db.Exec("UPDATE jobs SET scheduled_at = $1 WHERE id = $2", scheduledAt, jobID)
+func (d *PostgresDriver) RescheduleJob(jobID int64, scheduledAt time.Time) error {
+	_, err := d.db.Exec("UPDATE jobs SET scheduled_at = $1 WHERE id = $2", scheduledAt, jobID)
 	return err
 }
 
-func (d *PostgresDriver) GetCurrentTime(db *sql.DB) (time.Time, error) {
+func (d *PostgresDriver) GetCurrentTime() (time.Time, error) {
 	var currentTime time.Time
-	err := db.QueryRow("SELECT NOW()").Scan(&currentTime)
+	err := d.db.QueryRow("SELECT NOW()").Scan(&currentTime)
 	return currentTime, err
 }

@@ -7,9 +7,16 @@ import (
 )
 
 // SQLiteDriver implements the Driver interface for SQLite
-type SQLiteDriver struct{}
+type SQLiteDriver struct{
+	db *sql.DB
+}
 
-func (d *SQLiteDriver) InitSchema(db *sql.DB) error {
+// NewSQLiteDriver creates a new SQLite driver with the given database connection
+func NewSQLiteDriver(db *sql.DB) *SQLiteDriver {
+	return &SQLiteDriver{db: db}
+}
+
+func (d *SQLiteDriver) InitSchema() error {
 	query := `
 		CREATE TABLE IF NOT EXISTS jobs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,22 +40,22 @@ func (d *SQLiteDriver) InitSchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type);
 		CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at);
 	`
-	_, err := db.Exec(query)
+	_, err := d.db.Exec(query)
 	return err
 }
 
-func (d *SQLiteDriver) InsertJob(db *sql.DB, jobType string, payload []byte, maxRetries int) error {
-	_, err := db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)", jobType, payload, maxRetries)
+func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, maxRetries int) error {
+	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)", jobType, payload, maxRetries)
 	return err
 }
 
-func (d *SQLiteDriver) InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
-	_, err := db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)", jobType, payload, scheduledAt, maxRetries)
+func (d *SQLiteDriver) InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
+	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)", jobType, payload, scheduledAt, maxRetries)
 	return err
 }
 
-func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string, prefetchCount int) ([]job, error) {
-	rows, err := db.Query(`
+func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error) {
+	rows, err := d.db.Query(`
 		SELECT j.id, j.payload, j.retry_count, j.max_retries 
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
@@ -79,24 +86,24 @@ func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType stri
 	return jobs, nil
 }
 
-func (d *SQLiteDriver) MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error {
-	_, err := db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)", jobID, consumerName)
+func (d *SQLiteDriver) MarkJobProcessed(jobID int64, consumerName string) error {
+	_, err := d.db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)", jobID, consumerName)
 	return err
 }
 
-func (d *SQLiteDriver) MarkJobFailed(db *sql.DB, jobID int64, errorMsg string) error {
-	_, err := db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?", errorMsg, jobID)
+func (d *SQLiteDriver) MarkJobFailed(jobID int64, errorMsg string) error {
+	_, err := d.db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?", errorMsg, jobID)
 	return err
 }
 
-func (d *SQLiteDriver) RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.Time) error {
-	_, err := db.Exec("UPDATE jobs SET scheduled_at = ? WHERE id = ?", scheduledAt, jobID)
+func (d *SQLiteDriver) RescheduleJob(jobID int64, scheduledAt time.Time) error {
+	_, err := d.db.Exec("UPDATE jobs SET scheduled_at = ? WHERE id = ?", scheduledAt, jobID)
 	return err
 }
 
-func (d *SQLiteDriver) GetCurrentTime(db *sql.DB) (time.Time, error) {
+func (d *SQLiteDriver) GetCurrentTime() (time.Time, error) {
 	var timeStr string
-	err := db.QueryRow("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").Scan(&timeStr)
+	err := d.db.QueryRow("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").Scan(&timeStr)
 	if err != nil {
 		return time.Time{}, err
 	}
