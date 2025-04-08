@@ -45,8 +45,8 @@ func TestMySQLDelayedJobs(t *testing.T) {
 func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 	t.Helper()
 
-	// Create a queue with a short poll interval for testing
-	queue, err := sqlq.New(dbConfig.DB, dbConfig.DBType, dbConfig.PollingInterval)
+	// Create a queue for testing
+	queue, err := sqlq.New(dbConfig.DB, dbConfig.DBType)
 	require.NoError(t, err, "Failed to create queue")
 
 	// Start the queue
