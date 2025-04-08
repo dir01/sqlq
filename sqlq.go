@@ -372,6 +372,9 @@ func (q *sqlq) processJobs() error {
 		for _, sub := range subs {
 			// Use a separate goroutine for each subscriber to respect their individual poll intervals
 			go func(sub *subscriber, jobType string) {
+				timer := time.NewTimer(sub.pollInterval)
+				defer timer.Stop()
+
 				if err := q.processJobsForSubscriber(sub); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf(
 						"Error processing jobs for subscriber %s of type %s: %v",
@@ -379,8 +382,14 @@ func (q *sqlq) processJobs() error {
 					)
 				}
 
-				// Sleep for the poll interval
-				time.Sleep(sub.pollInterval)
+				// Wait for poll interval or context cancellation
+				select {
+				case <-timer.C:
+					// Timer expired, continue to next poll
+				case <-sub.ctx.Done():
+					// Context was canceled
+					return
+				}
 			}(sub, jobType)
 		}
 	}
