@@ -75,7 +75,16 @@ func (d *SQLiteDriver) RescheduleJob(db *sql.DB, jobID int64, scheduledAt time.T
 }
 
 func (d *SQLiteDriver) GetCurrentTime(db *sql.DB) (time.Time, error) {
-	var currentTime time.Time
-	err := db.QueryRow("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").Scan(&currentTime)
-	return currentTime, err
+	var timeStr string
+	err := db.QueryRow("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").Scan(&timeStr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	currentTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse database time: %w", err)
+	}
+
+	return currentTime, nil
 }
