@@ -12,7 +12,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/dir01/sqlqueue"
+	"github.com/dir01/sqlq"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v4/stdlib"
@@ -27,7 +27,7 @@ type TestPayload struct {
 
 // TestDBConfig holds configuration for a test database
 type TestDBConfig struct {
-	DBType          sqlqueue.DBType
+	DBType          sqlq.DBType
 	DB              *sql.DB
 	PollingInterval time.Duration
 	Cleanup         func()
@@ -52,7 +52,7 @@ func TestPostgresQueue(t *testing.T) {
 	runQueueTests(t, dbConfig)
 }
 
-func TestMySQLQueue(t *testing.T) {
+func TestMysqlq(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping MySQL tests in short mode")
 	}
@@ -68,7 +68,7 @@ func runQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 	t.Helper()
 
 	// Create a queue with a short poll interval for testing
-	queue, err := sqlqueue.NewSQLQueue(dbConfig.DB, dbConfig.DBType, 100*time.Millisecond)
+	queue, err := sqlq.New(dbConfig.DB, dbConfig.DBType, 100*time.Millisecond)
 	require.NoError(t, err, "Failed to create queue")
 
 	// Start the queue
@@ -189,7 +189,7 @@ func setupSQLiteDB(t *testing.T) *TestDBConfig {
 	require.NoError(t, err, "Failed to open SQLite database")
 
 	return &TestDBConfig{
-		DBType:          sqlqueue.DBTypeSQLite,
+		DBType:          sqlq.DBTypeSQLite,
 		DB:              db,
 		PollingInterval: 10 * time.Millisecond,
 		Cleanup:         func() { _ = db.Close() },
@@ -201,7 +201,7 @@ func setupPostgresDB(t *testing.T) *TestDBConfig {
 	ctx := context.Background()
 
 	req := testcontainers.ContainerRequest{
-		Name:         "sqlqueue_postgres",
+		Name:         "sqlq_postgres",
 		Image:        "postgres:14",
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
@@ -258,7 +258,7 @@ func setupPostgresDB(t *testing.T) *TestDBConfig {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	return &TestDBConfig{
-		DBType:          sqlqueue.DBTypePostgres,
+		DBType:          sqlq.DBTypePostgres,
 		DB:              db,
 		Container:       container,
 		PollingInterval: 10 * time.Millisecond,
@@ -275,7 +275,7 @@ func setupMySQLDB(t *testing.T) *TestDBConfig {
 
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8",
-		Name:         "sqlqueue_mysql",
+		Name:         "sqlq_mysql",
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
 			"MYSQL_ROOT_PASSWORD": "rootpass",
@@ -316,7 +316,7 @@ func setupMySQLDB(t *testing.T) *TestDBConfig {
 	require.NoError(t, err, "Failed to ping MySQL database")
 
 	return &TestDBConfig{
-		DBType:          sqlqueue.DBTypeMySQL,
+		DBType:          sqlq.DBTypeMySQL,
 		DB:              db,
 		Container:       container,
 		PollingInterval: 10 * time.Millisecond,

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dir01/sqlqueue"
+	"github.com/dir01/sqlq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,7 +46,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 	t.Helper()
 
 	// Create a queue with a short poll interval for testing
-	queue, err := sqlqueue.NewSQLQueue(dbConfig.DB, dbConfig.DBType, dbConfig.PollingInterval)
+	queue, err := sqlq.New(dbConfig.DB, dbConfig.DBType, dbConfig.PollingInterval)
 	require.NoError(t, err, "Failed to create queue")
 
 	// Start the queue
@@ -68,7 +68,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 			t.Context(),
 			"delayed_job",
 			TestPayload{Message: "This is a delayed job", Count: 42},
-			sqlqueue.WithDelay(delay),
+			sqlq.WithDelay(delay),
 		)
 		require.NoError(t, err, "Failed to publish delayed job")
 
@@ -124,7 +124,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 		}
 
 		// Publish a job with retry configuration
-		err := queue.Publish(t.Context(), "retry_job", payload, sqlqueue.WithMaxRetries(maxRetries))
+		err := queue.Publish(t.Context(), "retry_job", payload, sqlq.WithMaxRetries(maxRetries))
 		require.NoError(t, err, "Failed to publish job with retries")
 
 		// Wait for first attempt
@@ -200,7 +200,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 		}
 
 		// Publish a job with retry configuration
-		err := queue.Publish(ctx, "max_retry_job", payload, sqlqueue.WithMaxRetries(maxRetries))
+		err := queue.Publish(ctx, "max_retry_job", payload, sqlq.WithMaxRetries(maxRetries))
 		require.NoError(t, err, "Failed to publish job with retries")
 
 		// Wait for first attempt
