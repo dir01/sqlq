@@ -56,7 +56,6 @@ func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType stri
 		AND j.scheduled_at <= datetime('now')
 		AND jc.job_id IS NULL
 		ORDER BY j.id
-		LIMIT 10
 		LIMIT ?
 	`, consumerName, jobType, prefetchCount)
 	if err != nil {
