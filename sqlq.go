@@ -17,7 +17,7 @@ type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 	Subscribe(ctx context.Context, jobType string, consumerName string, f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...SubscriptionOption)
-	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
+	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]deadLetterJob, error)
 	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
 	Shutdown()
 	Run()
@@ -78,16 +78,16 @@ type job struct {
 	MaxRetries int
 }
 
-// DeadLetterJob represents a job that has been moved to the dead letter queue
-type DeadLetterJob struct {
-	ID           int64
-	OriginalID   int64
-	JobType      string
-	Payload      []byte
-	CreatedAt    time.Time
-	FailedAt     time.Time
-	RetryCount   int
-	MaxRetries   int
+// deadLetterJob represents a job that has been moved to the dead letter queue
+type deadLetterJob struct {
+	ID            int64
+	OriginalID    int64
+	JobType       string
+	Payload       []byte
+	CreatedAt     time.Time
+	FailedAt      time.Time
+	RetryCount    int
+	MaxRetries    int
 	FailureReason string
 }
 
@@ -256,7 +256,7 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, err.Error()); moveErr != nil {
 						log.Printf("Failed to move job %d to dead letter queue: %v", job.ID, moveErr)
 					} else {
-						log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v", 
+						log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v",
 							job.ID, job.MaxRetries, err)
 					}
 				}
@@ -333,7 +333,7 @@ func (q *sqlq) Run() {
 }
 
 // GetDeadLetterJobs retrieves jobs from the dead letter queue
-func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
+func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]deadLetterJob, error) {
 	return q.driver.GetDeadLetterJobs(jobType, limit)
 }
 
