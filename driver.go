@@ -2,6 +2,7 @@ package sqlqueue
 
 import (
 	"database/sql"
+	"time"
 )
 
 // Driver defines the interface for database-specific operations
