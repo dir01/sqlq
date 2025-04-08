@@ -36,6 +36,7 @@ type PublishOption func(*publishOptions)
 type publishOptions struct {
 	delay      time.Duration
 	maxRetries int
+	dlqEnabled bool
 }
 
 // WithDelay schedules a job to run after the specified delay
@@ -53,5 +54,13 @@ func WithMaxRetries(n int) PublishOption {
 		if n >= 0 {
 			o.maxRetries = n
 		}
+	}
+}
+
+// WithDeadLetterQueue enables or disables moving to dead letter queue after max retries
+// By default, dead letter queue is enabled
+func WithDeadLetterQueue(enabled bool) PublishOption {
+	return func(o *publishOptions) {
+		o.dlqEnabled = enabled
 	}
 }

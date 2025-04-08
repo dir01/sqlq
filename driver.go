@@ -28,6 +28,15 @@ type Driver interface {
 	// RescheduleJob executes the query for rescheduling a job after a failure
 	RescheduleJob(jobID int64, scheduledAt time.Time) error
 
+	// MoveToDeadLetterQueue moves a job to the dead letter queue
+	MoveToDeadLetterQueue(jobID int64, reason string) error
+
+	// GetDeadLetterJobs retrieves jobs from the dead letter queue
+	GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error)
+
+	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
+	RequeueDeadLetterJob(dlqID int64) error
+
 	// GetCurrentTime executes the query to get the current database time
 	GetCurrentTime() (time.Time, error)
 }

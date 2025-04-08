@@ -17,6 +17,8 @@ type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 	Subscribe(ctx context.Context, jobType string, consumerName string, f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...SubscriptionOption)
+	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
+	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
 	Shutdown()
 	Run()
 }
@@ -34,6 +36,7 @@ const (
 var (
 	ErrUnsupportedDBType  = errors.New("unsupported database type")
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
+	ErrJobNotFound        = errors.New("job not found")
 )
 
 var (
@@ -73,6 +76,19 @@ type job struct {
 	CreatedAt  time.Time
 	RetryCount int
 	MaxRetries int
+}
+
+// DeadLetterJob represents a job that has been moved to the dead letter queue
+type DeadLetterJob struct {
+	ID           int64
+	OriginalID   int64
+	JobType      string
+	Payload      []byte
+	CreatedAt    time.Time
+	FailedAt     time.Time
+	RetryCount   int
+	MaxRetries   int
+	FailureReason string
 }
 
 // New creates a new SQL-backed job queue
@@ -236,7 +252,13 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 						log.Printf("Failed to schedule retry for job %d: %v", job.ID, err)
 					}
 				} else {
-					log.Printf("Job %d exceeded maximum retries (%d): %v", job.ID, job.MaxRetries, err)
+					// Move to dead letter queue
+					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, err.Error()); moveErr != nil {
+						log.Printf("Failed to move job %d to dead letter queue: %v", job.ID, moveErr)
+					} else {
+						log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v", 
+							job.ID, job.MaxRetries, err)
+					}
 				}
 				continue
 			}
@@ -308,6 +330,16 @@ func (q *sqlq) Run() {
 			}
 		}
 	}()
+}
+
+// GetDeadLetterJobs retrieves jobs from the dead letter queue
+func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
+	return q.driver.GetDeadLetterJobs(jobType, limit)
+}
+
+// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
+func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
+	return q.driver.RequeueDeadLetterJob(dlqID)
 }
 
 // Shutdown stops the job processing

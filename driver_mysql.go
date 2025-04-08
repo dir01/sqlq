@@ -40,7 +40,22 @@ func (d *MySQLDriver) InitSchema() error {
 
 		`CREATE INDEX idx_jobs_job_type ON jobs(job_type(255))`,
 
-		`CREATE INDEX idx_jobs_scheduled_at ON jobs(scheduled_at)`}
+		`CREATE INDEX idx_jobs_scheduled_at ON jobs(scheduled_at)`,
+		
+		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			original_job_id INT,
+			job_type TEXT NOT NULL,
+			payload BLOB,
+			created_at TIMESTAMP,
+			failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			retry_count INT,
+			max_retries INT,
+			failure_reason TEXT
+		)`,
+		
+		`CREATE INDEX idx_dlq_job_type ON dead_letter_queue(job_type(255))`
+	}
 
 	for _, query := range queries {
 		_, err := d.db.Exec(query)
@@ -106,6 +121,131 @@ func (d *MySQLDriver) MarkJobFailed(jobID int64, errorMsg string) error {
 func (d *MySQLDriver) RescheduleJob(jobID int64, scheduledAt time.Time) error {
 	_, err := d.db.Exec("UPDATE jobs SET scheduled_at = ? WHERE id = ?", scheduledAt, jobID)
 	return err
+}
+
+func (d *MySQLDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Get the job details
+	var job job
+	err = tx.QueryRow(`
+		SELECT id, job_type, payload, created_at, retry_count, max_retries
+		FROM jobs WHERE id = ?
+	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount, &job.MaxRetries)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ErrJobNotFound
+		}
+		return err
+	}
+
+	// Insert into dead letter queue
+	_, err = tx.Exec(`
+		INSERT INTO dead_letter_queue 
+		(original_job_id, job_type, payload, created_at, retry_count, max_retries, failure_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, job.MaxRetries, reason)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (d *MySQLDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
+	query := `
+		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+		FROM dead_letter_queue
+		WHERE job_type = ?
+		ORDER BY failed_at DESC
+		LIMIT ?
+	`
+	if jobType == "" {
+		query = `
+			SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+			FROM dead_letter_queue
+			ORDER BY failed_at DESC
+			LIMIT ?
+		`
+		return d.queryDeadLetterJobs(query, limit)
+	}
+	
+	return d.queryDeadLetterJobs(query, jobType, limit)
+}
+
+func (d *MySQLDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []DeadLetterJob
+	for rows.Next() {
+		var j DeadLetterJob
+		if err := rows.Scan(
+			&j.ID, 
+			&j.OriginalID, 
+			&j.JobType, 
+			&j.Payload, 
+			&j.CreatedAt, 
+			&j.FailedAt, 
+			&j.RetryCount, 
+			&j.MaxRetries, 
+			&j.FailureReason,
+		); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return jobs, nil
+}
+
+func (d *MySQLDriver) RequeueDeadLetterJob(dlqID int64) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Get the job from the dead letter queue
+	var dlqJob DeadLetterJob
+	err = tx.QueryRow(`
+		SELECT id, job_type, payload, max_retries
+		FROM dead_letter_queue WHERE id = ?
+	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload, &dlqJob.MaxRetries)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return ErrJobNotFound
+		}
+		return err
+	}
+
+	// Insert back into the main queue with reset retry count
+	_, err = tx.Exec(`
+		INSERT INTO jobs (job_type, payload, max_retries, retry_count)
+		VALUES (?, ?, ?, 0)
+	`, dlqJob.JobType, dlqJob.Payload, dlqJob.MaxRetries)
+	if err != nil {
+		return err
+	}
+
+	// Delete from the dead letter queue
+	_, err = tx.Exec("DELETE FROM dead_letter_queue WHERE id = ?", dlqID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (d *MySQLDriver) GetCurrentTime() (time.Time, error) {
