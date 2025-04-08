@@ -17,7 +17,7 @@ type Driver interface {
 	InsertDelayedJob(db *sql.DB, jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error
 
 	// GetJobsForConsumer executes the query for finding jobs for a consumer
-	GetJobsForConsumer(db *sql.DB, consumerName, jobType string) (*sql.Rows, error)
+	GetJobsForConsumer(db *sql.DB, consumerName, jobType string, prefetchCount int) ([]job, error)
 
 	// MarkJobProcessed executes the query for marking a job as processed
 	MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error
