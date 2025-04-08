@@ -47,8 +47,8 @@ func (d *SQLiteDriver) InsertDelayedJob(db *sql.DB, jobType string, payload []by
 	return err
 }
 
-func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string) (*sql.Rows, error) {
-	return db.Query(`
+func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType string, prefetchCount int) ([]job, error) {
+	rows, err := db.Query(`
 		SELECT j.id, j.payload, j.retry_count, j.max_retries 
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
@@ -57,7 +57,27 @@ func (d *SQLiteDriver) GetJobsForConsumer(db *sql.DB, consumerName, jobType stri
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT 10
-	`, consumerName, jobType)
+		LIMIT ?
+	`, consumerName, jobType, prefetchCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []job
+	for rows.Next() {
+		var j job
+		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &j.MaxRetries); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return jobs, nil
 }
 
 func (d *SQLiteDriver) MarkJobProcessed(db *sql.DB, jobID int64, consumerName string) error {

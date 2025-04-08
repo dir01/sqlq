@@ -413,30 +413,17 @@ func (q *SQLQueue) processJobs() error {
 // processJobsForSubscriber fetches jobs for a specific subscriber and sends them to worker goroutines
 func (q *SQLQueue) processJobsForSubscriber(sub *subscriber) error {
 	// Find jobs that haven't been processed by this consumer
-	rows, err := q.driver.GetJobsForConsumer(q.db, sub.consumerName, sub.jobType)
+	jobs, err := q.driver.GetJobsForConsumer(q.db, sub.consumerName, sub.jobType, sub.prefetchCount)
 	if err != nil {
 		return fmt.Errorf("failed to query jobs: %w", err)
 	}
-	defer rows.Close()
 
-	jobCount := 0
-	for rows.Next() && jobCount < sub.prefetchCount {
-		var job job
-		if err := rows.Scan(&job.ID, &job.Payload, &job.RetryCount, &job.MaxRetries); err != nil {
-			return fmt.Errorf("failed to scan job: %w", err)
-		}
-
-		// Send job to worker pool
+	for _, job := range jobs {
 		select {
 		case <-sub.ctx.Done():
 			return nil
 		case sub.processingJobs <- job:
-			jobCount++
 		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating jobs: %w", err)
 	}
 
 	return nil
