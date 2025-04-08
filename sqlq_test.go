@@ -1,4 +1,4 @@
-package sqlqueue_test
+package sqlq_test
 
 import (
 	"context"
@@ -27,10 +27,11 @@ type TestPayload struct {
 
 // TestDBConfig holds configuration for a test database
 type TestDBConfig struct {
-	DBType    sqlqueue.DBType
-	DB        *sql.DB
-	Cleanup   func()
-	Container testcontainers.Container
+	DBType          sqlqueue.DBType
+	DB              *sql.DB
+	PollingInterval time.Duration
+	Cleanup         func()
+	Container       testcontainers.Container
 }
 
 func TestSQLiteQueue(t *testing.T) {
@@ -188,9 +189,10 @@ func setupSQLiteDB(t *testing.T) *TestDBConfig {
 	require.NoError(t, err, "Failed to open SQLite database")
 
 	return &TestDBConfig{
-		DBType:  sqlqueue.DBTypeSQLite,
-		DB:      db,
-		Cleanup: func() { _ = db.Close() },
+		DBType:          sqlqueue.DBTypeSQLite,
+		DB:              db,
+		PollingInterval: 10 * time.Millisecond,
+		Cleanup:         func() { _ = db.Close() },
 	}
 }
 
@@ -256,9 +258,10 @@ func setupPostgresDB(t *testing.T) *TestDBConfig {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	return &TestDBConfig{
-		DBType:    sqlqueue.DBTypePostgres,
-		DB:        db,
-		Container: container,
+		DBType:          sqlqueue.DBTypePostgres,
+		DB:              db,
+		Container:       container,
+		PollingInterval: 10 * time.Millisecond,
 		Cleanup: func() {
 			_ = db.Close()
 			_ = container.Terminate(ctx)
@@ -313,9 +316,10 @@ func setupMySQLDB(t *testing.T) *TestDBConfig {
 	require.NoError(t, err, "Failed to ping MySQL database")
 
 	return &TestDBConfig{
-		DBType:    sqlqueue.DBTypeMySQL,
-		DB:        db,
-		Container: container,
+		DBType:          sqlqueue.DBTypeMySQL,
+		DB:              db,
+		Container:       container,
+		PollingInterval: 10 * time.Millisecond,
 		Cleanup: func() {
 			_ = db.Close()
 			_ = container.Terminate(ctx)

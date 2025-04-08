@@ -1,4 +1,4 @@
-module github.com/dir01/sqlqueue
+module github.com/dir01/sqlq
 
 go 1.24.1
 

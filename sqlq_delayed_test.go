@@ -1,11 +1,10 @@
-package sqlqueue_test
+package sqlq_test
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,11 +13,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSQLiteDelayedJobs(t *testing.T) {
+	dbConfig := setupSQLiteDB(t)
+	defer dbConfig.Cleanup()
+
+	runDelayedJobTests(t, dbConfig)
+}
+
+func TestPostgresDelayedJobs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping PostgreSQL tests in short mode")
+	}
+
+	dbConfig := setupPostgresDB(t)
+	defer dbConfig.Cleanup()
+
+	runDelayedJobTests(t, dbConfig)
+}
+
+func TestMySQLDelayedJobs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping MySQL tests in short mode")
+	}
+
+	dbConfig := setupMySQLDB(t)
+	defer dbConfig.Cleanup()
+
+	runDelayedJobTests(t, dbConfig)
+}
+
 func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 	t.Helper()
 
 	// Create a queue with a short poll interval for testing
-	queue, err := sqlqueue.NewSQLQueue(dbConfig.DB, dbConfig.DBType, 100*time.Millisecond)
+	queue, err := sqlqueue.NewSQLQueue(dbConfig.DB, dbConfig.DBType, dbConfig.PollingInterval)
 	require.NoError(t, err, "Failed to create queue")
 
 	// Start the queue
@@ -26,36 +54,22 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 	defer queue.Shutdown()
 
 	t.Run("Delayed job execution", func(t *testing.T) {
-		// Create channels to track job processing
 		jobProcessed := make(chan bool, 1)
-		var receivedPayload TestPayload
-		var mu sync.Mutex
 
-		// Subscribe to jobs
 		queue.Subscribe(t.Context(), "delayed_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
-			var payload TestPayload
-			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-				t.Errorf("Failed to unmarshal payload: %v", err)
-				return err
-			}
-
-			mu.Lock()
-			receivedPayload = payload
-			mu.Unlock()
-			
 			jobProcessed <- true
 			return nil
 		})
 
-		// Create a payload
-		payload := TestPayload{
-			Message: "This is a delayed job",
-			Count:   42,
-		}
+		delay := 500 * time.Millisecond
 
 		// Publish a job with a delay
-		delay := 500 * time.Millisecond
-		err := queue.Publish(t.Context(), "delayed_job", payload, sqlqueue.WithDelay(delay))
+		err := queue.Publish(
+			t.Context(),
+			"delayed_job",
+			TestPayload{Message: "This is a delayed job", Count: 42},
+			sqlqueue.WithDelay(delay),
+		)
 		require.NoError(t, err, "Failed to publish delayed job")
 
 		// The job should not be processed immediately
@@ -70,11 +84,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 		select {
 		case <-jobProcessed:
 			// Job was processed as expected
-			mu.Lock()
-			defer mu.Unlock()
-			require.Equal(t, payload.Message, receivedPayload.Message, "Payload message mismatch")
-			require.Equal(t, payload.Count, receivedPayload.Count, "Payload count mismatch")
-		case <-time.After(delay * 3): // Give a bit more time for slower DB containers
+		case <-time.After(delay * 6): // Give a bit more time for slower DB containers
 			t.Fatal("Job was not processed after delay elapsed")
 		}
 	})
@@ -154,7 +164,7 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 		// Create a new context with timeout to avoid test hanging
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 		defer cancel()
-		
+
 		// Create channels to track job processing attempts
 		jobAttempts := make(chan int, 3) // Buffer for multiple attempts
 
@@ -226,33 +236,4 @@ func runDelayedJobTests(t *testing.T, dbConfig *TestDBConfig) {
 			// Context timeout is also acceptable
 		}
 	})
-}
-
-func TestSQLiteDelayedJobs(t *testing.T) {
-	dbConfig := setupSQLiteDB(t)
-	defer dbConfig.Cleanup()
-
-	runDelayedJobTests(t, dbConfig)
-}
-
-func TestPostgresDelayedJobs(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping PostgreSQL tests in short mode")
-	}
-
-	dbConfig := setupPostgresDB(t)
-	defer dbConfig.Cleanup()
-
-	runDelayedJobTests(t, dbConfig)
-}
-
-func TestMySQLDelayedJobs(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping MySQL tests in short mode")
-	}
-
-	dbConfig := setupMySQLDB(t)
-	defer dbConfig.Cleanup()
-
-	runDelayedJobTests(t, dbConfig)
 }

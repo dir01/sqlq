@@ -1,4 +1,4 @@
-package sqlqueue
+package sqlq
 
 import "time"
 
