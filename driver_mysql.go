@@ -2,6 +2,7 @@ package sqlqueue
 
 import (
 	"database/sql"
+	"time"
 )
 
 // MySQLDriver implements the Driver interface for MySQL
@@ -21,7 +22,7 @@ func (d *MySQLDriver) InitSchema(db *sql.DB) error {
 			max_retries INT DEFAULT 0,
 			last_error TEXT
 		)`,
-		
+
 		`CREATE TABLE IF NOT EXISTS job_consumers (
 			job_id INT,
 			consumer_name VARCHAR(255),
@@ -29,11 +30,11 @@ func (d *MySQLDriver) InitSchema(db *sql.DB) error {
 			PRIMARY KEY (job_id, consumer_name),
 			FOREIGN KEY (job_id) REFERENCES jobs(id)
 		)`,
-		
+
 		`CREATE INDEX idx_jobs_job_type ON jobs(job_type(255))`,
-		
+
 		`CREATE INDEX idx_jobs_scheduled_at ON jobs(scheduled_at)`}
-	
+
 	for _, query := range queries {
 		_, err := db.Exec(query)
 		if err != nil {

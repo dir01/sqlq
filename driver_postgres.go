@@ -2,6 +2,7 @@ package sqlqueue
 
 import (
 	"database/sql"
+	"time"
 )
 
 // PostgresDriver implements the Driver interface for PostgreSQL

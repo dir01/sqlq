@@ -2,6 +2,7 @@ package sqlqueue
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 )
 
