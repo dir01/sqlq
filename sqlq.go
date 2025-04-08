@@ -103,7 +103,6 @@ func New(db *sql.DB, dbType DBType, pollInterval time.Duration) (JobsQueue, erro
 	return q, nil
 }
 
-
 // Publish adds a new job to the queue
 func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
 	tx, err := q.db.BeginTx(ctx, nil)
@@ -216,6 +215,8 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 			if !ok {
 				return
 			}
+
+			log.Printf("Took job from the channel: %d", job.ID)
 
 			tx, err := q.db.BeginTx(sub.ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 			if err != nil {
@@ -365,7 +366,7 @@ func (q *sqlq) processJobsForSubscriber(sub *subscriber) error {
 		case <-sub.ctx.Done():
 			return nil
 		case sub.processingJobs <- job:
-			log.Printf("put job for %s in the channel", sub.consumerName)
+			log.Printf("Put job %d for %s in the channel", job.ID, sub.consumerName)
 		}
 	}
 
