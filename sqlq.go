@@ -52,7 +52,6 @@ type sqlq struct {
 	driver           Driver
 	subscribers      map[string][]*subscriber
 	subscribersMutex sync.RWMutex
-	pollInterval     time.Duration
 	shutdown         chan struct{}
 	wg               sync.WaitGroup
 }
@@ -63,6 +62,7 @@ type subscriber struct {
 	handler        func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
 	concurrency    int
 	prefetchCount  int
+	pollInterval   time.Duration
 	processingJobs chan job
 	workerWg       sync.WaitGroup
 	ctx            context.Context
@@ -92,23 +92,18 @@ type deadLetterJob struct {
 }
 
 // New creates a new SQL-backed job queue
-func New(db *sql.DB, dbType DBType, pollInterval time.Duration) (JobsQueue, error) {
-	if pollInterval == 0 {
-		pollInterval = 1 * time.Second
-	}
-
+func New(db *sql.DB, dbType DBType) (JobsQueue, error) {
 	driver, err := GetDriver(db, dbType)
 	if err != nil {
 		return nil, err
 	}
 
 	q := &sqlq{
-		db:           db,
-		dbType:       dbType,
-		driver:       driver,
-		subscribers:  make(map[string][]*subscriber),
-		pollInterval: pollInterval,
-		shutdown:     make(chan struct{}),
+		db:          db,
+		dbType:      dbType,
+		driver:      driver,
+		subscribers: make(map[string][]*subscriber),
+		shutdown:    make(chan struct{}),
 	}
 
 	// Initialize the database schema
@@ -187,6 +182,7 @@ func (q *sqlq) Subscribe(
 	options := subscriptionOptions{
 		concurrency:   defaultConcurrency,
 		prefetchCount: defaultPrefetch,
+		pollInterval:  1 * time.Second, // Default poll interval
 	}
 	// Apply provided options
 	for _, opt := range opts {
@@ -205,6 +201,7 @@ func (q *sqlq) Subscribe(
 		handler:        f,
 		concurrency:    options.concurrency,
 		prefetchCount:  options.prefetchCount,
+		pollInterval:   options.pollInterval,
 		processingJobs: make(chan job, options.prefetchCount),
 		ctx:            subCtx,
 		cancel:         cancel,
@@ -316,17 +313,17 @@ func (q *sqlq) Run() {
 
 	go func() {
 		defer q.wg.Done()
-		ticker := time.NewTicker(q.pollInterval)
-		defer ticker.Stop()
-
+		
+		// Each subscriber will be polled at their own interval
 		for {
 			select {
 			case <-q.shutdown:
 				return
-			case <-ticker.C:
+			default:
 				if err := q.processJobs(); err != nil {
 					log.Printf("Error processing jobs: %v", err)
 				}
+				time.Sleep(100 * time.Millisecond) // Small sleep to prevent tight loop
 			}
 		}
 	}()
@@ -373,12 +370,21 @@ func (q *sqlq) processJobs() error {
 	// Process for each job type with subscribers
 	for jobType, subs := range q.subscribers {
 		for _, sub := range subs {
-			if err := q.processJobsForSubscriber(sub); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf(
-					"Error processing jobs for subscriber %s of type %s: %v",
-					sub.consumerName, jobType, err,
-				)
-			}
+			// Check if it's time to poll for this subscriber
+			now := time.Now()
+			
+			// Use a separate goroutine for each subscriber to respect their individual poll intervals
+			go func(sub *subscriber, jobType string) {
+				if err := q.processJobsForSubscriber(sub); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf(
+						"Error processing jobs for subscriber %s of type %s: %v",
+						sub.consumerName, jobType, err,
+					)
+				}
+				
+				// Sleep for the poll interval
+				time.Sleep(sub.pollInterval)
+			}(sub, jobType)
 		}
 	}
 

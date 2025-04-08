@@ -7,8 +7,9 @@ type SubscriptionOption func(*subscriptionOptions)
 
 // subscriptionOptions holds configuration for a subscription
 type subscriptionOptions struct {
-	concurrency   int
-	prefetchCount int
+	concurrency    int
+	prefetchCount  int
+	pollInterval   time.Duration
 }
 
 // WithConcurrency sets the number of concurrent workers for a subscription
@@ -25,6 +26,15 @@ func WithPrefetchCount(n int) SubscriptionOption {
 	return func(o *subscriptionOptions) {
 		if n > 0 {
 			o.prefetchCount = n
+		}
+	}
+}
+
+// WithPollInterval sets how frequently to check for new jobs
+func WithPollInterval(interval time.Duration) SubscriptionOption {
+	return func(o *subscriptionOptions) {
+		if interval > 0 {
+			o.pollInterval = interval
 		}
 	}
 }
