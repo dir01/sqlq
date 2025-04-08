@@ -42,8 +42,8 @@ var (
 	defaultMaxRetries  = 3
 )
 
-// SQLQueue implements the JobsQueue interface using SQL databases
-type SQLQueue struct {
+// sqlq implements the JobsQueue interface using SQL databases
+type sqlq struct {
 	db               *sql.DB
 	dbType           DBType
 	driver           Driver
@@ -75,8 +75,8 @@ type job struct {
 	MaxRetries int
 }
 
-// NewSQLQueue creates a new SQL-backed job queue
-func NewSQLQueue(db *sql.DB, dbType DBType, pollInterval time.Duration) (*SQLQueue, error) {
+// New creates a new SQL-backed job queue
+func New(db *sql.DB, dbType DBType, pollInterval time.Duration) (JobsQueue, error) {
 	if pollInterval == 0 {
 		pollInterval = 1 * time.Second
 	}
@@ -86,7 +86,7 @@ func NewSQLQueue(db *sql.DB, dbType DBType, pollInterval time.Duration) (*SQLQue
 		return nil, err
 	}
 
-	q := &SQLQueue{
+	q := &sqlq{
 		db:           db,
 		dbType:       dbType,
 		driver:       driver,
@@ -104,12 +104,12 @@ func NewSQLQueue(db *sql.DB, dbType DBType, pollInterval time.Duration) (*SQLQue
 }
 
 // initSchema creates the necessary tables if they don't exist
-func (q *SQLQueue) initSchema() error {
+func (q *sqlq) initSchema() error {
 	return q.driver.InitSchema(q.db)
 }
 
 // Publish adds a new job to the queue
-func (q *SQLQueue) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
+func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -124,7 +124,7 @@ func (q *SQLQueue) Publish(ctx context.Context, jobType string, payload any, opt
 }
 
 // PublishTx adds a new job to the queue within an existing transaction
-func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
+func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
 	options := publishOptions{
 		maxRetries: defaultMaxRetries,
 	}
@@ -162,7 +162,7 @@ func (q *SQLQueue) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, pa
 }
 
 // Subscribe registers a handler for a specific job type
-func (q *SQLQueue) Subscribe(
+func (q *sqlq) Subscribe(
 	ctx context.Context,
 	jobType string,
 	consumerName string,
@@ -209,7 +209,7 @@ func (q *SQLQueue) Subscribe(
 }
 
 // workerLoop processes jobs from the processingJobs channel
-func (q *SQLQueue) workerLoop(sub *subscriber) {
+func (q *sqlq) workerLoop(sub *subscriber) {
 	defer sub.workerWg.Done()
 
 	for {
@@ -260,7 +260,7 @@ func (q *SQLQueue) workerLoop(sub *subscriber) {
 }
 
 // retryJob increments the retry count and schedules the job to be retried after a backoff period
-func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error {
+func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -292,7 +292,7 @@ func (q *SQLQueue) retryJob(ctx context.Context, job job, errorMsg string) error
 }
 
 // Run starts the job processing loop
-func (q *SQLQueue) Run() {
+func (q *sqlq) Run() {
 	q.wg.Add(1)
 
 	go func() {
@@ -314,7 +314,7 @@ func (q *SQLQueue) Run() {
 }
 
 // Shutdown stops the job processing
-func (q *SQLQueue) Shutdown() {
+func (q *sqlq) Shutdown() {
 	close(q.shutdown)
 
 	// Cancel all subscriber contexts and wait for workers to finish
@@ -332,7 +332,7 @@ func (q *SQLQueue) Shutdown() {
 }
 
 // processJobs polls for and processes available jobs
-func (q *SQLQueue) processJobs() error {
+func (q *sqlq) processJobs() error {
 	q.subscribersMutex.RLock()
 	defer q.subscribersMutex.RUnlock()
 
@@ -357,7 +357,7 @@ func (q *SQLQueue) processJobs() error {
 }
 
 // processJobsForSubscriber fetches jobs for a specific subscriber and sends them to worker goroutines
-func (q *SQLQueue) processJobsForSubscriber(sub *subscriber) error {
+func (q *sqlq) processJobsForSubscriber(sub *subscriber) error {
 	// Find jobs that haven't been processed by this consumer
 	jobs, err := q.driver.GetJobsForConsumer(q.db, sub.consumerName, sub.jobType, sub.prefetchCount)
 	if err != nil {
@@ -369,6 +369,7 @@ func (q *SQLQueue) processJobsForSubscriber(sub *subscriber) error {
 		case <-sub.ctx.Done():
 			return nil
 		case sub.processingJobs <- job:
+			log.Printf("put job for %s in the channel", sub.consumerName)
 		}
 	}
 
