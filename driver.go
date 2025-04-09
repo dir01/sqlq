@@ -27,6 +27,9 @@ type Driver interface {
 
 	// RescheduleJob executes the query for rescheduling a job after a failure
 	RescheduleJob(jobID int64, scheduledAt time.Time) error
+	
+	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
+	MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error
 
 	// MoveToDeadLetterQueue moves a job to the dead letter queue
 	MoveToDeadLetterQueue(jobID int64, reason string) error

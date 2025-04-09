@@ -283,12 +283,6 @@ func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 	}
 	defer tx.Rollback()
 
-	// Mark job as failed and increment retry count
-	err = q.driver.MarkJobFailed(job.ID, errorMsg)
-	if err != nil {
-		return fmt.Errorf("failed to mark job as failed: %w", err)
-	}
-
 	// Calculate exponential backoff
 	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
 
@@ -299,9 +293,10 @@ func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 	}
 	nextRunTime := currentTime.Add(backoff)
 
-	err = q.driver.RescheduleJob(job.ID, nextRunTime)
+	// Mark job as failed and reschedule in a single operation
+	err = q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, nextRunTime)
 	if err != nil {
-		return fmt.Errorf("failed to reschedule job: %w", err)
+		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
 
 	return tx.Commit()

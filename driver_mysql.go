@@ -123,6 +123,14 @@ func (d *MySQLDriver) RescheduleJob(jobID int64, scheduledAt time.Time) error {
 	return err
 }
 
+func (d *MySQLDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error {
+	_, err := d.db.Exec(
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = ? WHERE id = ?",
+		errorMsg, scheduledAt, jobID,
+	)
+	return err
+}
+
 func (d *MySQLDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
 	tx, err := d.db.Begin()
 	if err != nil {
