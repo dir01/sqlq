@@ -136,8 +136,8 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	}
 
 	// Apply provided options
-	for _, opt := range opts {
-		opt(&options)
+	for _, o := range opts {
+		o(&options)
 	}
 
 	payloadBytes, err := json.Marshal(payload)
@@ -185,8 +185,8 @@ func (q *sqlq) Subscribe(
 		pollInterval:  1 * time.Second, // Default poll interval
 	}
 	// Apply provided options
-	for _, opt := range opts {
-		opt(&options)
+	for _, o := range opts {
+		o(&options)
 	}
 	// Options sanity adjustments
 	if options.prefetchCount < options.concurrency {

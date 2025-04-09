@@ -29,6 +29,10 @@ func (d *SQLiteDriver) InitSchema() error {
 			last_error TEXT
 		)`,
 
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at)`,
+
 		`CREATE TABLE IF NOT EXISTS job_consumers (
 			job_id INTEGER,
 			consumer_name TEXT,
@@ -36,9 +40,6 @@ func (d *SQLiteDriver) InitSchema() error {
 			PRIMARY KEY (job_id, consumer_name),
 			FOREIGN KEY (job_id) REFERENCES jobs(id)
 		)`,
-
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at)`,
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,8 +56,8 @@ func (d *SQLiteDriver) InitSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`,
 	}
 
-	for _, query := range queries {
-		_, err := d.db.Exec(query)
+	for _, q := range queries {
+		_, err := d.db.Exec(q)
 		if err != nil {
 			return err
 		}
@@ -65,12 +66,18 @@ func (d *SQLiteDriver) InitSchema() error {
 }
 
 func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, maxRetries int) error {
-	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)", jobType, payload, maxRetries)
+	_, err := d.db.Exec(
+		"INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)",
+		jobType, payload, maxRetries,
+	)
 	return err
 }
 
 func (d *SQLiteDriver) InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
-	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)", jobType, payload, scheduledAt, maxRetries)
+	_, err := d.db.Exec(
+		"INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)",
+		jobType, payload, scheduledAt, maxRetries,
+	)
 	return err
 }
 
@@ -107,12 +114,18 @@ func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetch
 }
 
 func (d *SQLiteDriver) MarkJobProcessed(jobID int64, consumerName string) error {
-	_, err := d.db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)", jobID, consumerName)
+	_, err := d.db.Exec(
+		"INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)",
+		jobID, consumerName,
+	)
 	return err
 }
 
 func (d *SQLiteDriver) MarkJobFailed(jobID int64, errorMsg string) error {
-	_, err := d.db.Exec("UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?", errorMsg, jobID)
+	_, err := d.db.Exec(
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ? WHERE id = ?",
+		errorMsg, jobID,
+	)
 	return err
 }
 
