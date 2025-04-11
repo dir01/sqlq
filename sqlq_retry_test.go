@@ -53,7 +53,6 @@ func runRetryTests(t *testing.T, dbConfig *TestDBConfig) {
 	queue.Run()
 	defer queue.Shutdown()
 
-
 	t.Run("Job retry mechanism", func(t *testing.T) {
 		// Create channels to track job processing attempts
 		jobAttempts := make(chan int, 5) // Buffer for multiple attempts

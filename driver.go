@@ -22,12 +22,6 @@ type Driver interface {
 	// MarkJobProcessed executes the query for marking a job as processed
 	MarkJobProcessed(jobID int64, consumerName string) error
 
-	// MarkJobFailed executes the query for marking a job as failed with retry info
-	MarkJobFailed(jobID int64, errorMsg string) error
-
-	// RescheduleJob executes the query for rescheduling a job after a failure
-	RescheduleJob(jobID int64, scheduledAt time.Time) error
-	
 	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error
 

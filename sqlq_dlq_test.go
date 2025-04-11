@@ -44,28 +44,24 @@ func TestMySQLDeadLetterQueue(t *testing.T) {
 func runDeadLetterQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 	t.Helper()
 
-	// Create a queue for testing
 	queue, err := sqlq.New(dbConfig.DB, dbConfig.DBType)
 	require.NoError(t, err, "Failed to create queue")
 
-	// Start the queue
 	queue.Run()
 	defer queue.Shutdown()
 
 	t.Run("Job moves to DLQ after max retries", func(t *testing.T) {
-		// Create a context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 
-		jobType := "dlq_test_job"
+		jobType := "job_moves_to_dlq_after_max_retries"
 		consumerName := "dlq_test_consumer"
 		maxRetries := 2 // Allow 2 retries (3 total attempts)
 
-		// Create channels to track job processing
 		jobAttempted := make(chan int, maxRetries+1)
 
-		// Subscribe to the job type
 		queue.Subscribe(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+			t.Logf("Got payload %s", string(payloadBytes))
 			var payload TestPayload
 			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 				return err
@@ -81,14 +77,9 @@ func runDeadLetterQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 
 			// Always fail the job to force it to the DLQ
 			return errors.New("simulated failure to move job to DLQ")
-		})
+		}, sqlq.WithPollInterval(10*time.Millisecond))
 
-		// Create a unique payload
-		testPayload := TestPayload{
-			Message: "This job will go to DLQ",
-			Count:   1000, // Unique identifier
-		}
-
+		testPayload := TestPayload{Message: "This job will go to DLQ"}
 		// Publish the job with max retries
 		err = queue.Publish(ctx, jobType, testPayload, sqlq.WithMaxRetries(maxRetries))
 		require.NoError(t, err, "Failed to publish job")
@@ -106,7 +97,7 @@ func runDeadLetterQueueTests(t *testing.T, dbConfig *TestDBConfig) {
 		}
 
 		// Give some time for the job to be moved to DLQ
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 
 		// Now check the DLQ
 		dlqJobs, err := queue.GetDeadLetterJobs(ctx, jobType, 10)

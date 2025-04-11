@@ -229,8 +229,6 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 				return
 			}
 
-			log.Printf("Took job from the channel: %d", job.ID)
-
 			tx, err := q.db.BeginTx(sub.ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 			if err != nil {
 				log.Printf("Failed to begin transaction for job %d: %v", job.ID, err)
@@ -244,12 +242,11 @@ func (q *sqlq) workerLoop(sub *subscriber) {
 				_ = tx.Rollback()
 
 				// Handle retry logic
-				if job.RetryCount < job.MaxRetries {
+				if job.RetryCount <= job.MaxRetries {
 					if err := q.retryJob(sub.ctx, job, err.Error()); err != nil {
 						log.Printf("Failed to schedule retry for job %d: %v", job.ID, err)
 					}
 				} else {
-					// Move to dead letter queue
 					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, err.Error()); moveErr != nil {
 						log.Printf("Failed to move job %d to dead letter queue: %v", job.ID, moveErr)
 					} else {
@@ -405,7 +402,6 @@ func (q *sqlq) processJobsForSubscriber(sub *subscriber) error {
 		case <-sub.ctx.Done():
 			return nil
 		case sub.processingJobs <- job:
-			log.Printf("Put job %d for %s in the channel", job.ID, sub.consumerName)
 		}
 	}
 
