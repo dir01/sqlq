@@ -15,7 +15,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0" // Use appropriate semantic conventions version
+	// semconv "go.opentelemetry.io/otel/semconv/v1.21.0" // Use appropriate semantic conventions version - Removed as unused in this file
 	"go.opentelemetry.io/otel/trace"
 )
 
