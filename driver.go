@@ -20,7 +20,7 @@ type Driver interface {
 	MarkJobProcessed(jobID int64, consumerName string) error
 
 	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
-	MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error
+	MarkJobFailedAndReschedule(jobID int64, errorMsg string, backoffDuration time.Duration) error
 
 	// MoveToDeadLetterQueue moves a job to the dead letter queue
 	MoveToDeadLetterQueue(jobID int64, reason string) error

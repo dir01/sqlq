@@ -2,7 +2,6 @@ package sqlq
 
 import (
 	"database/sql"
-	"fmt"
 	"sync"
 	"time"
 )

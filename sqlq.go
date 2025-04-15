@@ -297,7 +297,7 @@ func (q *sqlq) retryJob(consumer *consumer, job job, errorMsg string) error {
 	backoff := bFn(job.RetryCount)
 
 	// Mark job as failed and reschedule in a single operation
-	err := q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff)
+	err = q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
