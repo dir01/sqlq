@@ -173,7 +173,7 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		scheduledAt = time.Now().Add(options.delay)
 	}
 
-	err := q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
+	err = q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
 	if err != nil {
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
@@ -297,8 +297,7 @@ func (q *sqlq) retryJob(consumer *consumer, job job, errorMsg string) error {
 	backoff := bFn(job.RetryCount)
 
 	// Mark job as failed and reschedule in a single operation
-	err = q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff)
-	if err != nil {
+	if err := q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff); err != nil {
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
 
