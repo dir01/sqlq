@@ -73,20 +73,16 @@ func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, delay time.Dura
 
 	var query string
 	var args []interface{}
-	
+
 	if delay <= 0 {
-		// Use database's current time
 		query = "INSERT INTO jobs (job_type, payload) VALUES (?, ?)"
 		args = []interface{}{jobType, payload}
 	} else {
-		// Convert delay to seconds for SQLite datetime function
 		delaySeconds := int(delay.Seconds())
-		
-		// Use SQLite's datetime function with the delay directly in the query
 		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))"
 		args = []interface{}{jobType, payload, delaySeconds}
 	}
-	
+
 	_, err := d.db.Exec(query, args...)
 	return err
 }
@@ -143,7 +139,7 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, 
 
 	// Convert duration to seconds for SQLite datetime function
 	backoffSeconds := int(backoffDuration.Seconds())
-	
+
 	_, err := d.db.Exec(
 		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?",
 		errorMsg, backoffSeconds, jobID,
@@ -286,4 +282,3 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(dlqID int64) error {
 
 	return tx.Commit()
 }
-

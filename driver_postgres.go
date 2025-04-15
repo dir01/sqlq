@@ -64,7 +64,7 @@ func (d *PostgresDriver) InitSchema() error {
 func (d *PostgresDriver) InsertJob(jobType string, payload []byte, delay time.Duration) error {
 	var query string
 	var args []interface{}
-	
+
 	if delay <= 0 {
 		// Use database's current time
 		query = "INSERT INTO jobs (job_type, payload) VALUES ($1, $2)"
@@ -74,7 +74,7 @@ func (d *PostgresDriver) InsertJob(jobType string, payload []byte, delay time.Du
 		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, NOW() + $3)"
 		args = []interface{}{jobType, payload, delay.String()}
 	}
-	
+
 	_, err := d.db.Exec(query, args...)
 	return err
 }
@@ -93,6 +93,7 @@ func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefet
 	if err != nil {
 		return nil, err
 	}
+
 	defer rows.Close()
 
 	var jobs []job
@@ -129,6 +130,7 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	if err != nil {
 		return err
 	}
+
 	defer tx.Rollback()
 
 	// Get the job details
@@ -247,4 +249,3 @@ func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
 
 	return tx.Commit()
 }
-
