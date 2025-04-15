@@ -67,23 +67,20 @@ func (d *SQLiteDriver) InitSchema() error {
 	return nil
 }
 
-func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, scheduledAt time.Time) error {
+func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, delay time.Duration) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	var query string
 	var args []interface{}
 	
-	if scheduledAt.IsZero() {
+	if delay <= 0 {
 		// Use database's current time
 		query = "INSERT INTO jobs (job_type, payload) VALUES (?, ?)"
 		args = []interface{}{jobType, payload}
 	} else {
-		// Calculate delay in seconds from now
-		delaySeconds := int(scheduledAt.Sub(time.Now()).Seconds())
-		if delaySeconds < 0 {
-			delaySeconds = 0
-		}
+		// Convert delay to seconds for SQLite datetime function
+		delaySeconds := int(delay.Seconds())
 		
 		// Use SQLite's datetime function with the delay directly in the query
 		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))"

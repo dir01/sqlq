@@ -11,7 +11,7 @@ type Driver interface {
 	InitSchema() error
 
 	// InsertJob executes the query for inserting a job
-	InsertJob(jobType string, payload []byte, scheduledAt time.Time) error
+	InsertJob(jobType string, payload []byte, delay time.Duration) error
 
 	// GetJobsForConsumer executes the query for finding jobs for a consumer
 	GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error)

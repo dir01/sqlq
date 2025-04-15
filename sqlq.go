@@ -166,14 +166,7 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	var scheduledAt time.Time
-
-	if options.delay > 0 {
-		// Use a non-zero time to indicate a delay is needed
-		scheduledAt = time.Now().Add(options.delay)
-	}
-
-	err = q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
+	err = q.driver.InsertJob(jobType, payloadBytes, options.delay)
 	if err != nil {
 		return fmt.Errorf("failed to insert job: %w", err)
 	}

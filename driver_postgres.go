@@ -61,18 +61,18 @@ func (d *PostgresDriver) InitSchema() error {
 	return nil
 }
 
-func (d *PostgresDriver) InsertJob(jobType string, payload []byte, scheduledAt time.Time) error {
+func (d *PostgresDriver) InsertJob(jobType string, payload []byte, delay time.Duration) error {
 	var query string
 	var args []interface{}
 	
-	if scheduledAt.IsZero() {
+	if delay <= 0 {
 		// Use database's current time
 		query = "INSERT INTO jobs (job_type, payload) VALUES ($1, $2)"
 		args = []interface{}{jobType, payload}
 	} else {
-		// Use the provided scheduled time
-		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, $3)"
-		args = []interface{}{jobType, payload, scheduledAt}
+		// Use the database's time function with delay
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, NOW() + $3)"
+		args = []interface{}{jobType, payload, delay.String()}
 	}
 	
 	_, err := d.db.Exec(query, args...)
