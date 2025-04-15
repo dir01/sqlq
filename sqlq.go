@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"runtime"
 	"sync"
 	"time"
@@ -16,8 +17,8 @@ import (
 type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
-	Subscribe(ctx context.Context, jobType string, consumerName string, f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...SubscriptionOption)
-	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]deadLetterJob, error)
+	Consume(ctx context.Context, jobType string, consumerName string, f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...ConsumerOption)
+	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
 	Shutdown()
 	Run()
@@ -39,30 +40,38 @@ var (
 	ErrJobNotFound        = errors.New("job not found")
 )
 
+const (
+	defaultMaxRetries = 3
+	infiniteRetries   = -1
+)
+
 var (
 	defaultConcurrency = min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
 	defaultPrefetch    = defaultConcurrency
-	defaultMaxRetries  = 3
 )
 
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
-	db               *sql.DB
-	dbType           DBType
-	driver           Driver
-	subscribers      map[string][]*subscriber
-	subscribersMutex sync.RWMutex
-	shutdown         chan struct{}
-	wg               sync.WaitGroup
+	db                  *sql.DB
+	driver              Driver
+	consumersMap        map[string][]*consumer
+	consumersMapMutex   sync.RWMutex
+	shutdown            chan struct{}
+	wg                  sync.WaitGroup
+	backoffFunc         func(retryNum int) time.Duration
+	defaultPollInterval time.Duration
 }
 
-type subscriber struct {
-	jobType        string
-	consumerName   string
-	handler        func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
-	concurrency    int
-	prefetchCount  int
-	pollInterval   time.Duration
+type consumer struct {
+	jobType       string
+	consumerName  string
+	handler       func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
+	concurrency   int
+	prefetchCount int
+	maxRetries    int
+	backoffFunc   func(retryNum int) time.Duration
+	pollInterval  time.Duration
+
 	processingJobs chan job
 	workerWg       sync.WaitGroup
 	ctx            context.Context
@@ -75,11 +84,15 @@ type job struct {
 	Payload    []byte
 	CreatedAt  time.Time
 	RetryCount int
-	MaxRetries int
 }
 
-// deadLetterJob represents a job that has been moved to the dead letter queue
-type deadLetterJob struct {
+func (j job) String() string {
+	bytes, _ := json.MarshalIndent(j, "", " ")
+	return string(bytes)
+}
+
+// DeadLetterJob represents a job that has been moved to the dead letter queue
+type DeadLetterJob struct {
 	ID            int64
 	OriginalID    int64
 	JobType       string
@@ -92,18 +105,27 @@ type deadLetterJob struct {
 }
 
 // New creates a new SQL-backed job queue
-func New(db *sql.DB, dbType DBType) (JobsQueue, error) {
+func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	driver, err := GetDriver(db, dbType)
 	if err != nil {
 		return nil, err
 	}
 
 	q := &sqlq{
-		db:          db,
-		dbType:      dbType,
-		driver:      driver,
-		subscribers: make(map[string][]*subscriber),
-		shutdown:    make(chan struct{}),
+		db:           db,
+		driver:       driver,
+		consumersMap: make(map[string][]*consumer),
+		shutdown:     make(chan struct{}),
+		backoffFunc: func(retryNum int) time.Duration {
+			jitter := float64(rand.Intn(retryNum))
+			backoff := math.Pow(2, float64(retryNum))
+			return time.Duration(backoff+jitter) * time.Second
+		},
+		defaultPollInterval: 1 * time.Second,
+	}
+
+	for _, o := range opts {
+		o(q)
 	}
 
 	// Initialize the database schema
@@ -121,8 +143,9 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
+	defer tx.Rollback()
+
 	if err := q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
-		tx.Rollback()
 		return err
 	}
 
@@ -131,13 +154,11 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 
 // PublishTx adds a new job to the queue within an existing transaction
 func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
-	options := publishOptions{
-		maxRetries: defaultMaxRetries,
-	}
+	options := &publishOptions{}
 
 	// Apply provided options
 	for _, o := range opts {
-		o(&options)
+		o(options)
 	}
 
 	payloadBytes, err := json.Marshal(payload)
@@ -145,150 +166,149 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
+	var scheduledAt time.Time
+
 	if options.delay > 0 {
-		// Get current database time and calculate scheduled time
+		// It is important to use database time to calculate scheduledAt
 		currentTime, err := q.driver.GetCurrentTime()
 		if err != nil {
 			return fmt.Errorf("failed to get database time: %w", err)
 		}
-		scheduledAt := currentTime.Add(options.delay)
+		scheduledAt = currentTime.Add(options.delay)
+	}
 
-		err = q.driver.InsertDelayedJob(jobType, payloadBytes, scheduledAt, options.maxRetries)
-		if err != nil {
-			return fmt.Errorf("failed to insert delayed job: %w", err)
-		}
-	} else {
-		err = q.driver.InsertJob(jobType, payloadBytes, options.maxRetries)
-		if err != nil {
-			return fmt.Errorf("failed to insert job: %w", err)
-		}
+	err = q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
+	if err != nil {
+		return fmt.Errorf("failed to insert job: %w", err)
 	}
 
 	return nil
 }
 
-// Subscribe registers a handler for a specific job type
-func (q *sqlq) Subscribe(
+// Consume registers a handler for a specific job type
+func (q *sqlq) Consume(
 	ctx context.Context,
 	jobType string,
 	consumerName string,
 	f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error,
-	opts ...SubscriptionOption,
+	opts ...ConsumerOption,
 ) {
-	q.subscribersMutex.Lock()
-	defer q.subscribersMutex.Unlock()
+	q.consumersMapMutex.Lock()
+	defer q.consumersMapMutex.Unlock()
 
-	// Default options
-	options := subscriptionOptions{
+	consCtx, cancel := context.WithCancel(ctx)
+
+	cons := &consumer{
+		jobType:       jobType,
+		consumerName:  consumerName,
+		handler:       f,
 		concurrency:   defaultConcurrency,
 		prefetchCount: defaultPrefetch,
-		pollInterval:  1 * time.Second, // Default poll interval
+		maxRetries:    defaultMaxRetries,
+		ctx:           consCtx,
+		pollInterval:  q.defaultPollInterval,
+		cancel:        cancel,
 	}
+
 	// Apply provided options
 	for _, o := range opts {
-		o(&options)
+		o(cons)
 	}
+
 	// Options sanity adjustments
-	if options.prefetchCount < options.concurrency {
-		options.prefetchCount = options.concurrency
+	if cons.prefetchCount < cons.concurrency {
+		cons.prefetchCount = cons.concurrency
 	}
-
-	subCtx, cancel := context.WithCancel(ctx)
-
-	sub := &subscriber{
-		jobType:        jobType,
-		consumerName:   consumerName,
-		handler:        f,
-		concurrency:    options.concurrency,
-		prefetchCount:  options.prefetchCount,
-		pollInterval:   options.pollInterval,
-		processingJobs: make(chan job, options.prefetchCount),
-		ctx:            subCtx,
-		cancel:         cancel,
-	}
+	cons.processingJobs = make(chan job, cons.prefetchCount)
 
 	// Start worker goroutines
-	for range options.concurrency {
-		sub.workerWg.Add(1)
-		go q.workerLoop(sub)
+	for range cons.concurrency {
+		cons.workerWg.Add(1)
+		go q.workerLoop(cons)
 	}
 
-	q.subscribers[jobType] = append(q.subscribers[jobType], sub)
+	q.consumersMap[jobType] = append(q.consumersMap[jobType], cons)
 }
 
 // workerLoop processes jobs from the processingJobs channel
-func (q *sqlq) workerLoop(sub *subscriber) {
-	defer sub.workerWg.Done()
+func (q *sqlq) workerLoop(cons *consumer) {
+	defer cons.workerWg.Done()
 
 	for {
 		select {
-		case <-sub.ctx.Done():
+		case <-cons.ctx.Done():
 			return
-		case job, ok := <-sub.processingJobs:
+		case job, ok := <-cons.processingJobs:
 			if !ok {
 				return
 			}
 
-			tx, err := q.db.BeginTx(sub.ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+			tx, err := q.db.BeginTx(cons.ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
 			if err != nil {
-				log.Printf("Failed to begin transaction for job %d: %v", job.ID, err)
+				log.Printf("failed to begin transaction")
 				continue
 			}
 
 			// Process the job
-			err = sub.handler(sub.ctx, tx, job.Payload)
-			if err != nil {
-				log.Printf("Job handler failed for job %d: %v", job.ID, err)
+			log.Printf("[%s] Pre handler of job %d", time.Now().String(), job.ID)
+			consErr := cons.handler(cons.ctx, tx, job.Payload)
+			log.Printf("[%s] Post handler of job %d", time.Now().String(), job.ID)
+
+			if consErr == nil {
+				if err = q.driver.MarkJobProcessed(job.ID, cons.consumerName); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("Failed to mark job %d as processed: %v", job.ID, err)
+					_ = tx.Rollback()
+					continue
+				}
+
+				if err := tx.Commit(); err != nil {
+					log.Printf("[%s] Failed to commit transaction for job %d: %v", time.Now().String(), job.ID, err)
+				}
+			} else {
 				_ = tx.Rollback()
 
 				// Handle retry logic
-				if job.RetryCount <= job.MaxRetries {
-					if err := q.retryJob(sub.ctx, job, err.Error()); err != nil {
+				if job.RetryCount < cons.maxRetries {
+					// FIXME: delete
+					//log.Printf("Retrying job %d, RetryCount: %d", job.ID, job.RetryCount)
+					if err := q.retryJob(cons, job, consErr.Error()); err != nil {
 						log.Printf("Failed to schedule retry for job %d: %v", job.ID, err)
 					}
+					// FIXME: delete
+					//log.Printf("Retrying done for job %d", job.ID)
 				} else {
-					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, err.Error()); moveErr != nil {
+					// FIXME: delete
+					//log.Printf("Moving job %d to DLQ, RetryCount %d", job.ID, job.RetryCount)
+					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, consErr.Error()); moveErr != nil {
 						log.Printf("Failed to move job %d to dead letter queue: %v", job.ID, moveErr)
 					} else {
-						log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v",
-							job.ID, job.MaxRetries, err)
+						// FIXME: delete
+						// log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v", job.ID, cons.maxRetries, err)
 					}
 				}
-				continue
-			}
-
-			// Mark as processed
-			err = q.driver.MarkJobProcessed(job.ID, sub.consumerName)
-			if err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("Failed to mark job %d as processed: %v", job.ID, err)
-				_ = tx.Rollback()
-				continue
-			}
-
-			if err := tx.Commit(); err != nil {
-				log.Printf("Failed to commit transaction for job %d: %v", job.ID, err)
 			}
 		}
 	}
 }
 
 // retryJob increments the retry count and schedules the job to be retried after a backoff period
-func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
-	tx, err := q.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
+func (q *sqlq) retryJob(consumer *consumer, job job, errorMsg string) error {
 	// Calculate exponential backoff
-	backoff := time.Duration(math.Pow(2, float64(job.RetryCount))) * time.Second
+	bFn := q.backoffFunc
+	if consumer.backoffFunc != nil {
+		bFn = consumer.backoffFunc
+	}
+	backoff := bFn(job.RetryCount)
 
 	// Get current database time and calculate next run time with backoff
 	currentTime, err := q.driver.GetCurrentTime()
 	if err != nil {
 		return fmt.Errorf("failed to get database time: %w", err)
 	}
+
 	nextRunTime := currentTime.Add(backoff)
+	// FIXME: DELETE
+	// log.Printf("nextRunTime for job %d (%s) is %v", job.ID, consumer.consumerName, nextRunTime)
 
 	// Mark job as failed and reschedule in a single operation
 	err = q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, nextRunTime)
@@ -296,7 +316,7 @@ func (q *sqlq) retryJob(ctx context.Context, job job, errorMsg string) error {
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 // Run starts the job processing loop
@@ -306,7 +326,7 @@ func (q *sqlq) Run() {
 	go func() {
 		defer q.wg.Done()
 
-		// Each subscriber will be polled at their own interval
+		// Each consumer will be polled at their own interval
 		for {
 			select {
 			case <-q.shutdown:
@@ -322,7 +342,7 @@ func (q *sqlq) Run() {
 }
 
 // GetDeadLetterJobs retrieves jobs from the dead letter queue
-func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]deadLetterJob, error) {
+func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
 	return q.driver.GetDeadLetterJobs(jobType, limit)
 }
 
@@ -335,42 +355,42 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 func (q *sqlq) Shutdown() {
 	close(q.shutdown)
 
-	// Cancel all subscriber contexts and wait for workers to finish
-	q.subscribersMutex.Lock()
-	for _, subs := range q.subscribers {
-		for _, sub := range subs {
-			sub.cancel()
-			close(sub.processingJobs)
-			sub.workerWg.Wait()
+	// Cancel all consumer contexts and wait for workers to finish
+	q.consumersMapMutex.Lock()
+	for _, consumers := range q.consumersMap {
+		for _, cons := range consumers {
+			cons.cancel()
+			cons.workerWg.Wait()
 		}
 	}
-	q.subscribersMutex.Unlock()
+	q.consumersMapMutex.Unlock()
 
 	q.wg.Wait()
 }
 
 // processJobs polls for and processes available jobs
 func (q *sqlq) processJobs() error {
-	q.subscribersMutex.RLock()
-	defer q.subscribersMutex.RUnlock()
+	q.consumersMapMutex.RLock()
+	defer q.consumersMapMutex.RUnlock()
 
-	// If no subscribers, nothing to do
-	if len(q.subscribers) == 0 {
+	// If no consumers, nothing to do
+	if len(q.consumersMap) == 0 {
 		return nil
 	}
 
-	// Process for each job type with subscribers
-	for jobType, subs := range q.subscribers {
-		for _, sub := range subs {
-			// Use a separate goroutine for each subscriber to respect their individual poll intervals
-			go func(sub *subscriber, jobType string) {
-				timer := time.NewTimer(sub.pollInterval)
+	// Process for each job type
+	for jobType, consumers := range q.consumersMap {
+		for _, cons := range consumers {
+
+			// Use a separate goroutine for each consumer to respect their individual poll intervals
+			go func(cons *consumer, jobType string) {
+				timer := time.NewTimer(cons.pollInterval)
 				defer timer.Stop()
 
-				if err := q.processJobsForSubscriber(sub); err != nil && !errors.Is(err, context.Canceled) {
+				if err := q.fetchJobsForConsumer(cons); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf(
-						"Error processing jobs for subscriber %s of type %s: %v",
-						sub.consumerName, jobType, err,
+						"Error processing jobs for consumer %s of type %s: %v",
+						cons.consumerName, jobType, err,
 					)
 				}
 
@@ -378,30 +398,36 @@ func (q *sqlq) processJobs() error {
 				select {
 				case <-timer.C:
 					// Timer expired, continue to next poll
-				case <-sub.ctx.Done():
+				case <-cons.ctx.Done():
 					// Context was canceled
 					return
 				}
-			}(sub, jobType)
+			}(cons, jobType)
 		}
 	}
 
 	return nil
 }
 
-// processJobsForSubscriber fetches jobs for a specific subscriber and sends them to worker goroutines
-func (q *sqlq) processJobsForSubscriber(sub *subscriber) error {
+// fetchJobsForConsumer fetches jobs for a specific consumer and sends them to worker goroutines
+func (q *sqlq) fetchJobsForConsumer(cons *consumer) error {
+	// FIXME: drop this
+	// log.Printf("fetching jobs for consumer %s", cons.consumerName)
+
 	// Find jobs that haven't been processed by this consumer
-	jobs, err := q.driver.GetJobsForConsumer(sub.consumerName, sub.jobType, sub.prefetchCount)
+	jobs, err := q.driver.GetJobsForConsumer(cons.consumerName, cons.jobType, cons.prefetchCount)
 	if err != nil {
 		return fmt.Errorf("failed to query jobs: %w", err)
 	}
 
+	// FIXME: drop this
+	// log.Printf("found %d jobs for consumer %s", len(jobs), cons.consumerName)
+
 	for _, job := range jobs {
 		select {
-		case <-sub.ctx.Done():
+		case <-cons.ctx.Done():
 			return nil
-		case sub.processingJobs <- job:
+		case cons.processingJobs <- job:
 		}
 	}
 

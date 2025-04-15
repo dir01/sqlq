@@ -24,7 +24,6 @@ func (d *PostgresDriver) InitSchema() error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER DEFAULT 0,
-			max_retries INTEGER DEFAULT 0,
 			last_error TEXT
 		)`,
 
@@ -47,7 +46,6 @@ func (d *PostgresDriver) InitSchema() error {
 			created_at TIMESTAMP,
 			failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER,
-			max_retries INTEGER,
 			failure_reason TEXT
 		)`,
 
@@ -63,19 +61,14 @@ func (d *PostgresDriver) InitSchema() error {
 	return nil
 }
 
-func (d *PostgresDriver) InsertJob(jobType string, payload []byte, maxRetries int) error {
-	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, max_retries) VALUES ($1, $2, $3)", jobType, payload, maxRetries)
-	return err
-}
-
-func (d *PostgresDriver) InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
-	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES ($1, $2, $3, $4)", jobType, payload, scheduledAt, maxRetries)
+func (d *PostgresDriver) InsertJob(jobType string, payload []byte, scheduledAt time.Time) error {
+	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, $3)", jobType, payload, scheduledAt)
 	return err
 }
 
 func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error) {
 	rows, err := d.db.Query(`
-		SELECT j.id, j.payload, j.retry_count, j.max_retries 
+		SELECT j.id, j.payload, j.retry_count
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = $1
 		WHERE j.job_type = $2 
@@ -92,7 +85,7 @@ func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefet
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &j.MaxRetries); err != nil {
+		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -128,9 +121,9 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	// Get the job details
 	var job job
 	err = tx.QueryRow(`
-		SELECT id, job_type, payload, created_at, retry_count, max_retries
+		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = $1
-	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount, &job.MaxRetries)
+	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
@@ -141,9 +134,9 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	// Insert into dead letter queue
 	_, err = tx.Exec(`
 		INSERT INTO dead_letter_queue 
-		(original_job_id, job_type, payload, created_at, retry_count, max_retries, failure_reason)
+		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, job.MaxRetries, reason)
+	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason)
 	if err != nil {
 		return err
 	}
@@ -151,9 +144,9 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	return tx.Commit()
 }
 
-func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error) {
+func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
 	query := `
-		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
 		FROM dead_letter_queue
 		WHERE job_type = $1
 		ORDER BY failed_at DESC
@@ -161,7 +154,7 @@ func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLet
 	`
 	if jobType == "" {
 		query = `
-			SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+			SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
 			FROM dead_letter_queue
 			ORDER BY failed_at DESC
 			LIMIT $1
@@ -172,16 +165,16 @@ func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLet
 	return d.queryDeadLetterJobs(query, jobType, limit)
 }
 
-func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]deadLetterJob, error) {
+func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var jobs []deadLetterJob
+	var jobs []DeadLetterJob
 	for rows.Next() {
-		var j deadLetterJob
+		var j DeadLetterJob
 		if err := rows.Scan(
 			&j.ID,
 			&j.OriginalID,
@@ -190,7 +183,6 @@ func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) 
 			&j.CreatedAt,
 			&j.FailedAt,
 			&j.RetryCount,
-			&j.MaxRetries,
 			&j.FailureReason,
 		); err != nil {
 			return nil, err
@@ -213,11 +205,11 @@ func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
 	defer tx.Rollback()
 
 	// Get the job from the dead letter queue
-	var dlqJob deadLetterJob
+	var dlqJob DeadLetterJob
 	err = tx.QueryRow(`
-		SELECT id, job_type, payload, max_retries
+		SELECT id, job_type, payload
 		FROM dead_letter_queue WHERE id = $1
-	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload, &dlqJob.MaxRetries)
+	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
@@ -227,9 +219,9 @@ func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
 
 	// Insert back into the main queue with reset retry count
 	_, err = tx.Exec(`
-		INSERT INTO jobs (job_type, payload, max_retries, retry_count)
-		VALUES ($1, $2, $3, 0)
-	`, dlqJob.JobType, dlqJob.Payload, dlqJob.MaxRetries)
+		INSERT INTO jobs (job_type, payload, retry_count)
+		VALUES ($1, $2, 0)
+	`, dlqJob.JobType, dlqJob.Payload)
 	if err != nil {
 		return err
 	}

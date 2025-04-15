@@ -10,11 +10,8 @@ type Driver interface {
 	// InitSchema creates the necessary tables if they don't exist
 	InitSchema() error
 
-	// InsertJob executes the query for inserting a new job
-	InsertJob(jobType string, payload []byte, maxRetries int) error
-
-	// InsertDelayedJob executes the query for inserting a delayed job
-	InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error
+	// InsertJob executes the query for inserting a job
+	InsertJob(jobType string, payload []byte, scheduledAt time.Time) error
 
 	// GetJobsForConsumer executes the query for finding jobs for a consumer
 	GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error)
@@ -29,7 +26,7 @@ type Driver interface {
 	MoveToDeadLetterQueue(jobID int64, reason string) error
 
 	// GetDeadLetterJobs retrieves jobs from the dead letter queue
-	GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error)
+	GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error)
 
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 	RequeueDeadLetterJob(dlqID int64) error
@@ -45,8 +42,6 @@ func GetDriver(db *sql.DB, dbType DBType) (Driver, error) {
 		return NewSQLiteDriver(db), nil
 	case DBTypePostgres:
 		return NewPostgresDriver(db), nil
-	case DBTypeMySQL:
-		return NewMySQLDriver(db), nil
 	default:
 		return nil, ErrUnsupportedDBType
 	}

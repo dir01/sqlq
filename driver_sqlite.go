@@ -3,12 +3,14 @@ package sqlq
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 )
 
 // SQLiteDriver implements the Driver interface for SQLite
 type SQLiteDriver struct {
-	db *sql.DB
+	db    *sql.DB
+	mutex sync.Mutex
 }
 
 // NewSQLiteDriver creates a new SQLite driver with the given database connection
@@ -17,6 +19,9 @@ func NewSQLiteDriver(db *sql.DB) *SQLiteDriver {
 }
 
 func (d *SQLiteDriver) InitSchema() error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +30,6 @@ func (d *SQLiteDriver) InitSchema() error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER DEFAULT 0,
-			max_retries INTEGER DEFAULT 0,
 			last_error TEXT
 		)`,
 
@@ -49,7 +53,6 @@ func (d *SQLiteDriver) InitSchema() error {
 			created_at TIMESTAMP,
 			failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER,
-			max_retries INTEGER,
 			failure_reason TEXT
 		)`,
 
@@ -65,25 +68,23 @@ func (d *SQLiteDriver) InitSchema() error {
 	return nil
 }
 
-func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, maxRetries int) error {
-	_, err := d.db.Exec(
-		"INSERT INTO jobs (job_type, payload, max_retries) VALUES (?, ?, ?)",
-		jobType, payload, maxRetries,
-	)
-	return err
-}
+func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, scheduledAt time.Time) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
 
-func (d *SQLiteDriver) InsertDelayedJob(jobType string, payload []byte, scheduledAt time.Time, maxRetries int) error {
 	_, err := d.db.Exec(
-		"INSERT INTO jobs (job_type, payload, scheduled_at, max_retries) VALUES (?, ?, ?, ?)",
-		jobType, payload, scheduledAt, maxRetries,
+		"INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, ?)",
+		jobType, payload, scheduledAt,
 	)
 	return err
 }
 
 func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	rows, err := d.db.Query(`
-		SELECT j.id, j.payload, j.retry_count, j.max_retries 
+		SELECT j.id, j.payload, j.retry_count
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
@@ -100,7 +101,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetch
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &j.MaxRetries); err != nil {
+		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -114,6 +115,9 @@ func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetch
 }
 
 func (d *SQLiteDriver) MarkJobProcessed(jobID int64, consumerName string) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	_, err := d.db.Exec(
 		"INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)",
 		jobID, consumerName,
@@ -122,6 +126,9 @@ func (d *SQLiteDriver) MarkJobProcessed(jobID int64, consumerName string) error 
 }
 
 func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	_, err := d.db.Exec(
 		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = ? WHERE id = ?",
 		errorMsg, scheduledAt, jobID,
@@ -130,6 +137,9 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, 
 }
 
 func (d *SQLiteDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -139,9 +149,9 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
 	// Get the job details
 	var job job
 	err = tx.QueryRow(`
-		SELECT id, job_type, payload, created_at, retry_count, max_retries
+		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = ?
-	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount, &job.MaxRetries)
+	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
@@ -152,19 +162,25 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
 	// Insert into dead letter queue
 	_, err = tx.Exec(`
 		INSERT INTO dead_letter_queue 
-		(original_job_id, job_type, payload, created_at, retry_count, max_retries, failure_reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, job.MaxRetries, reason)
+		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason)
 	if err != nil {
 		return err
 	}
 
+	// Delete job from regular jobs
+	_, err = tx.Exec(`DELETE FROM jobs WHERE id = ?`, job.ID)
+
 	return tx.Commit()
 }
 
-func (d *SQLiteDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLetterJob, error) {
+func (d *SQLiteDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	query := `
-		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
 		FROM dead_letter_queue
 		WHERE job_type = ?
 		ORDER BY failed_at DESC
@@ -172,7 +188,7 @@ func (d *SQLiteDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLette
 	`
 	if jobType == "" {
 		query = `
-			SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, max_retries, failure_reason
+			SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
 			FROM dead_letter_queue
 			ORDER BY failed_at DESC
 			LIMIT ?
@@ -183,16 +199,16 @@ func (d *SQLiteDriver) GetDeadLetterJobs(jobType string, limit int) ([]deadLette
 	return d.queryDeadLetterJobs(query, jobType, limit)
 }
 
-func (d *SQLiteDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]deadLetterJob, error) {
+func (d *SQLiteDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var jobs []deadLetterJob
+	var jobs []DeadLetterJob
 	for rows.Next() {
-		var j deadLetterJob
+		var j DeadLetterJob
 		if err := rows.Scan(
 			&j.ID,
 			&j.OriginalID,
@@ -201,7 +217,6 @@ func (d *SQLiteDriver) queryDeadLetterJobs(query string, args ...interface{}) ([
 			&j.CreatedAt,
 			&j.FailedAt,
 			&j.RetryCount,
-			&j.MaxRetries,
 			&j.FailureReason,
 		); err != nil {
 			return nil, err
@@ -217,6 +232,9 @@ func (d *SQLiteDriver) queryDeadLetterJobs(query string, args ...interface{}) ([
 }
 
 func (d *SQLiteDriver) RequeueDeadLetterJob(dlqID int64) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -224,11 +242,11 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(dlqID int64) error {
 	defer tx.Rollback()
 
 	// Get the job from the dead letter queue
-	var dlqJob deadLetterJob
+	var dlqJob DeadLetterJob
 	err = tx.QueryRow(`
-		SELECT id, job_type, payload, max_retries
+		SELECT id, job_type, payload
 		FROM dead_letter_queue WHERE id = ?
-	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload, &dlqJob.MaxRetries)
+	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
@@ -238,9 +256,9 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(dlqID int64) error {
 
 	// Insert back into the main queue with reset retry count
 	_, err = tx.Exec(`
-		INSERT INTO jobs (job_type, payload, max_retries, retry_count)
-		VALUES (?, ?, ?, 0)
-	`, dlqJob.JobType, dlqJob.Payload, dlqJob.MaxRetries)
+		INSERT INTO jobs (job_type, payload, retry_count)
+		VALUES (?, ?, 0)
+	`, dlqJob.JobType, dlqJob.Payload)
 	if err != nil {
 		return err
 	}
