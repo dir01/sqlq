@@ -79,9 +79,15 @@ func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, scheduledAt tim
 		query = "INSERT INTO jobs (job_type, payload) VALUES (?, ?)"
 		args = []interface{}{jobType, payload}
 	} else {
-		// Use the provided scheduled time
-		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, ?)"
-		args = []interface{}{jobType, payload, scheduledAt}
+		// Calculate delay in seconds from now
+		delaySeconds := int(scheduledAt.Sub(time.Now()).Seconds())
+		if delaySeconds < 0 {
+			delaySeconds = 0
+		}
+		
+		// Use SQLite's datetime function with the delay
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))"
+		args = []interface{}{jobType, payload, delaySeconds}
 	}
 	
 	_, err := d.db.Exec(query, args...)

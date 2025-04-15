@@ -148,7 +148,7 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 	_, err = tx.Exec(`
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		VALUES ($1, $2, $3, $4, $5, $6)
 	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason)
 	if err != nil {
 		return err

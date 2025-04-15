@@ -257,7 +257,8 @@ func (q *sqlq) workerLoop(cons *consumer) {
 					continue
 				}
 
-				if err := tx.Commit(); err != nil {
+				err := tx.Commit()
+				if err != nil && !errors.Is(err, sql.ErrTxDone) {
 					log.Printf("[%s] Failed to commit transaction for job %d: %v", time.Now().String(), job.ID, err)
 				}
 			} else {
