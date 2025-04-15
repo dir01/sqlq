@@ -288,24 +288,37 @@ func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 			}
 
 			// Extract the parent trace context from the job
-			// Use context.Background() as the base, as cons.ctx might be cancelled independently.
 			parentCtx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.MapCarrier(job.TraceContext))
+			remoteSpanContext := trace.SpanContextFromContext(parentCtx)
 
-			// Start a new span for processing this specific job, linked to the parent context.
-			// Use cons.ctx as the *local* parent context for cancellation signals, etc.
-			// but link it to the *remote* parentCtx for tracing.
-			jobCtx, jobSpan := q.tracer.Start(
-				trace.ContextWithRemoteSpanContext(cons.ctx, trace.SpanContextFromContext(parentCtx)),
+			// Determine the context to use for starting the span and prepare attributes
+			startCtx := cons.ctx // Default to local context
+			spanAttributes := []attribute.KeyValue{
+				attribute.String("sqlq.job_type", cons.jobType),
+				attribute.Int64("sqlq.job_id", job.ID),
+				attribute.Int("sqlq.retry_count", job.RetryCount),
+				attribute.String("sqlq.extracted_trace_context", fmt.Sprintf("%v", job.TraceContext)),
+			}
+			linkFailed := false
+			if remoteSpanContext.IsValid() {
+				// Valid remote context found, link the span
+				startCtx = trace.ContextWithRemoteSpanContext(cons.ctx, remoteSpanContext)
+			} else {
+				// Invalid or missing remote context
+				log.Printf("[%s] Warning: Job %d received without valid trace context. Starting new trace.", workerName, job.ID)
+				linkFailed = true
+				// Add attribute to indicate link failure
+				spanAttributes = append(spanAttributes, attribute.Bool("sqlq.trace_link_failed", true))
+			}
+
+			// Start the span using the determined context and attributes
+			jobCtx, jobSpan := q.tracer.Start(startCtx,
 				fmt.Sprintf("%s.ProcessJob", workerName),
-				trace.WithAttributes(
-					attribute.String("sqlq.job_type", cons.jobType),
-					attribute.Int64("sqlq.job_id", job.ID),
-					attribute.Int("sqlq.retry_count", job.RetryCount),
-					attribute.String("sqlq.extracted_trace_context", fmt.Sprintf("%v", job.TraceContext)),
-				),
+				trace.WithAttributes(spanAttributes...),
 				trace.WithSpanKind(trace.SpanKindConsumer), // Mark this as a consumer span
 			)
 
+			// --- Proceed with the rest of the loop using jobCtx ---
 			tx, err := q.db.BeginTx(jobCtx, &sql.TxOptions{Isolation: sql.LevelDefault}) // Use jobCtx which has the correct span
 			if err != nil {
 				//log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
