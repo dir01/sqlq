@@ -8,28 +8,28 @@ import (
 // Driver defines the interface for database-specific operations
 type Driver interface {
 	// InitSchema creates the necessary tables if they don't exist
-	InitSchema() error
+	InitSchema(ctx context.Context) error
 
 	// InsertJob executes the query for inserting a job
-	InsertJob(jobType string, payload []byte, delay time.Duration) error
+	InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration) error
 
 	// GetJobsForConsumer executes the query for finding jobs for a consumer
-	GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error)
+	GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error)
 
 	// MarkJobProcessed executes the query for marking a job as processed
-	MarkJobProcessed(jobID int64, consumerName string) error
+	MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error
 
 	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
-	MarkJobFailedAndReschedule(jobID int64, errorMsg string, backoffDuration time.Duration) error
+	MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
 
 	// MoveToDeadLetterQueue moves a job to the dead letter queue
-	MoveToDeadLetterQueue(jobID int64, reason string) error
+	MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error
 
 	// GetDeadLetterJobs retrieves jobs from the dead letter queue
-	GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error)
+	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-	RequeueDeadLetterJob(dlqID int64) error
+	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
 }
 
