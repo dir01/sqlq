@@ -31,8 +31,6 @@ type Driver interface {
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 	RequeueDeadLetterJob(dlqID int64) error
 
-	// GetCurrentTime executes the query to get the current database time
-	GetCurrentTime() (time.Time, error)
 }
 
 // GetDriver returns the appropriate driver for the given database type

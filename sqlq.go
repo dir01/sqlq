@@ -169,15 +169,11 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	var scheduledAt time.Time
 
 	if options.delay > 0 {
-		// It is important to use database time to calculate scheduledAt
-		currentTime, err := q.driver.GetCurrentTime()
-		if err != nil {
-			return fmt.Errorf("failed to get database time: %w", err)
-		}
-		scheduledAt = currentTime.Add(options.delay)
+		// Use a non-zero time to indicate a delay is needed
+		scheduledAt = time.Now().Add(options.delay)
 	}
 
-	err = q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
+	err := q.driver.InsertJob(jobType, payloadBytes, scheduledAt)
 	if err != nil {
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
@@ -300,18 +296,8 @@ func (q *sqlq) retryJob(consumer *consumer, job job, errorMsg string) error {
 	}
 	backoff := bFn(job.RetryCount)
 
-	// Get current database time and calculate next run time with backoff
-	currentTime, err := q.driver.GetCurrentTime()
-	if err != nil {
-		return fmt.Errorf("failed to get database time: %w", err)
-	}
-
-	nextRunTime := currentTime.Add(backoff)
-	// FIXME: DELETE
-	// log.Printf("nextRunTime for job %d (%s) is %v", job.ID, consumer.consumerName, nextRunTime)
-
 	// Mark job as failed and reschedule in a single operation
-	err = q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, nextRunTime)
+	err := q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff)
 	if err != nil {
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}

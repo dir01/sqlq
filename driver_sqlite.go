@@ -72,10 +72,20 @@ func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, scheduledAt tim
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	_, err := d.db.Exec(
-		"INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, ?)",
-		jobType, payload, scheduledAt,
-	)
+	var query string
+	var args []interface{}
+	
+	if scheduledAt.IsZero() {
+		// Use database's current time
+		query = "INSERT INTO jobs (job_type, payload) VALUES (?, ?)"
+		args = []interface{}{jobType, payload}
+	} else {
+		// Use the provided scheduled time
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, ?)"
+		args = []interface{}{jobType, payload, scheduledAt}
+	}
+	
+	_, err := d.db.Exec(query, args...)
 	return err
 }
 
@@ -125,13 +135,13 @@ func (d *SQLiteDriver) MarkJobProcessed(jobID int64, consumerName string) error 
 	return err
 }
 
-func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error {
+func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, backoffDuration time.Duration) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	_, err := d.db.Exec(
-		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = ? WHERE id = ?",
-		errorMsg, scheduledAt, jobID,
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?",
+		errorMsg, int(backoffDuration.Seconds()), jobID,
 	)
 	return err
 }
@@ -272,17 +282,3 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(dlqID int64) error {
 	return tx.Commit()
 }
 
-func (d *SQLiteDriver) GetCurrentTime() (time.Time, error) {
-	var timeStr string
-	err := d.db.QueryRow("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").Scan(&timeStr)
-	if err != nil {
-		return time.Time{}, err
-	}
-
-	currentTime, err := time.Parse("2006-01-02 15:04:05.999", timeStr)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to parse database time: %w", err)
-	}
-
-	return currentTime, nil
-}

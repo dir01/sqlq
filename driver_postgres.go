@@ -62,7 +62,20 @@ func (d *PostgresDriver) InitSchema() error {
 }
 
 func (d *PostgresDriver) InsertJob(jobType string, payload []byte, scheduledAt time.Time) error {
-	_, err := d.db.Exec("INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, $3)", jobType, payload, scheduledAt)
+	var query string
+	var args []interface{}
+	
+	if scheduledAt.IsZero() {
+		// Use database's current time
+		query = "INSERT INTO jobs (job_type, payload) VALUES ($1, $2)"
+		args = []interface{}{jobType, payload}
+	} else {
+		// Use the provided scheduled time
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES ($1, $2, $3)"
+		args = []interface{}{jobType, payload, scheduledAt}
+	}
+	
+	_, err := d.db.Exec(query, args...)
 	return err
 }
 
@@ -103,10 +116,10 @@ func (d *PostgresDriver) MarkJobProcessed(jobID int64, consumerName string) erro
 	return err
 }
 
-func (d *PostgresDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, scheduledAt time.Time) error {
+func (d *PostgresDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, backoffDuration time.Duration) error {
 	_, err := d.db.Exec(
-		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = $2 WHERE id = $3",
-		errorMsg, scheduledAt, jobID,
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = NOW() + $2 WHERE id = $3",
+		errorMsg, backoffDuration.String(), jobID,
 	)
 	return err
 }
@@ -235,8 +248,3 @@ func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
 	return tx.Commit()
 }
 
-func (d *PostgresDriver) GetCurrentTime() (time.Time, error) {
-	var currentTime time.Time
-	err := d.db.QueryRow("SELECT NOW()").Scan(&currentTime)
-	return currentTime, err
-}
