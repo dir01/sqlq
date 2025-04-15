@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"encoding/json"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
