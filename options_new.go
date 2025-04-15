@@ -1,6 +1,10 @@
 package sqlq
 
-import "time"
+import (
+	"time"
+
+	"go.opentelemetry.io/otel/trace"
+)
 
 // NewOption is an option that is accepted by sqlq.New function
 type NewOption func(*sqlq)
@@ -17,5 +21,12 @@ func WithPollInterval(tick time.Duration) NewOption {
 func WithBackoffFunc(backoffFunc func(int) time.Duration) NewOption {
 	return func(q *sqlq) {
 		q.backoffFunc = backoffFunc
+	}
+}
+
+// WithTracer allows setting opentelemetry tracer
+func WithTracer(tracer trace.Tracer) NewOption {
+	return func(q *sqlq) {
+		q.tracer = tracer
 	}
 }

@@ -12,10 +12,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func (tc *TestCase) DLQBasic(t *testing.T) {
+func (tc *TestCase) DLQBasic(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	jobType := "job_moves_to_dlq_after_max_retries"
@@ -80,10 +80,10 @@ func (tc *TestCase) DLQBasic(t *testing.T) {
 	require.True(t, found, "Job not found in DLQ")
 }
 
-func (tc *TestCase) DLQReque(t *testing.T) {
+func (tc *TestCase) DLQReque(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	jobType := "dlq_requeue_test"
@@ -199,10 +199,10 @@ func (tc *TestCase) DLQReque(t *testing.T) {
 	}
 }
 
-func (tc *TestCase) DLQGet(t *testing.T) {
+func (tc *TestCase) DLQGet(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Create two different job types
@@ -278,10 +278,10 @@ func (tc *TestCase) DLQGet(t *testing.T) {
 	require.True(t, foundType2, "Type 2 jobs not found in unfiltered results")
 }
 
-func (tc *TestCase) DLQGetLimit(t *testing.T) {
+func (tc *TestCase) DLQGetLimit(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// Get all DLQ jobs with different limits

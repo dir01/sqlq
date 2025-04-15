@@ -20,8 +20,13 @@ func TestPostgreSQL(t *testing.T) {
 	tc, cleanup := setupPostgresTestCase(t)
 	defer cleanup()
 
-	t.Run("Basic pub/sub", tc.BasicPubSub)
-	t.Run("Multiple subscribers for same job type", tc.BasicPubMultiSub)
+	t.Run("Basic pub/sub", func(t *testing.T) {
+		tc.BasicPubSub(t.Context(), t)
+	})
+
+	t.Run("Multiple subscribers for same job type", func(t *testing.T) {
+		tc.BasicPubMultiSub(t.Context(), t)
+	})
 }
 
 func setupPostgresTestCase(t *testing.T) (*TestCase, func()) {

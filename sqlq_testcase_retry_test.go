@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func (tc *TestCase) Retry(t *testing.T) {
+func (tc *TestCase) Retry(ctx context.Context, t *testing.T) {
 	start := time.Now()
 	// Create channels to track job processing attempts
 	jobAttempts := make(chan int, 5) // Buffer for multiple attempts
@@ -23,7 +23,7 @@ func (tc *TestCase) Retry(t *testing.T) {
 	maxRetries := 2 // We'll allow 2 retries (3 total attempts)
 
 	// Consume the queue
-	tc.Q.Consume(t.Context(), "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		t.Logf("[%.2fs] Recieved payload: %s", time.Since(start).Seconds(), string(payloadBytes))
 
 		var payload TestPayload
@@ -51,7 +51,7 @@ func (tc *TestCase) Retry(t *testing.T) {
 	}
 
 	// Publish a job with retry configuration
-	err := tc.Q.Publish(t.Context(), "retry_job", payload)
+	err := tc.Q.Publish(ctx, "retry_job", payload)
 	require.NoError(t, err, "Failed to publish job with retries")
 
 	timeout := time.NewTimer(1 * time.Second)
@@ -92,9 +92,9 @@ func (tc *TestCase) Retry(t *testing.T) {
 	}
 }
 
-func (tc *TestCase) RetryMaxExceeded(t *testing.T) {
+func (tc *TestCase) RetryMaxExceeded(ctx context.Context, t *testing.T) {
 	// Create a new context with timeout to avoid test hanging
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Create channels to track job processing attempts

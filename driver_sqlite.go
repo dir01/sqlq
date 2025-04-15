@@ -15,18 +15,18 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const sqliteTracerName = "github.com/your_org/sqlq/driver/sqlite" // Replace with your actual module path
+const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 
 // SQLiteDriver implements the Driver interface for SQLite
 type SQLiteDriver struct {
 	db     *sql.DB
 	mutex  sync.Mutex
-	tracer trace.Tracer // Add tracer field
+	tracer trace.Tracer
 }
 
 // NewSQLiteDriver creates a new SQLite driver with the given database connection
 func NewSQLiteDriver(db *sql.DB) *SQLiteDriver {
-	return &SQLiteDriver{db: db, tracer: otel.Tracer(sqliteTracerName)} // Initialize tracer
+	return &SQLiteDriver{db: db, tracer: otel.Tracer(sqliteTracerName)}
 }
 
 func (d *SQLiteDriver) InitSchema(ctx context.Context) error {

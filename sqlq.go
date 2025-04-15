@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"encoding/json"
-
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -89,8 +87,8 @@ type consumer struct {
 }
 
 type job struct {
-	ID         int64
-	JobType    string
+	ID           int64
+	JobType      string
 	Payload      []byte
 	CreatedAt    time.Time
 	RetryCount   int
@@ -142,12 +140,13 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 
 	// Initialize the database schema (using background context for initialization)
 	initCtx, initSpan := q.tracer.Start(context.Background(), "sqlq.InitSchema")
+	defer initSpan.End()
+
 	if err := q.driver.InitSchema(initCtx); err != nil {
 		initSpan.RecordError(err)
 		initSpan.End()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
-	initSpan.End()
 
 	return q, nil
 }
@@ -309,7 +308,7 @@ func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 
 			tx, err := q.db.BeginTx(jobCtx, &sql.TxOptions{Isolation: sql.LevelDefault}) // Use jobCtx which has the correct span
 			if err != nil {
-				log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
+				//log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
 				jobSpan.RecordError(err)
 				jobSpan.End() // End span since we can't process further
 				continue      // Try the next job

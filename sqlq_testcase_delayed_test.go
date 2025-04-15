@@ -12,7 +12,7 @@ import (
 
 // gracefulContext wraps a cancellable context but delegates Value lookups to a parent.
 type gracefulContext struct {
-	context.Context               // The cancellable context (derived from Background)
+	context.Context                 // The cancellable context (derived from Background)
 	parentCtx       context.Context // The original parent context for value lookups
 }
 
@@ -24,29 +24,14 @@ func (gc *gracefulContext) Value(key any) any {
 // GracefulContext creates a context that inherits values from its parent
 // and cancels gracePeriod after the parent context is cancelled.
 func GracefulContext(parentCtx context.Context, gracePeriod time.Duration) context.Context {
-	// Create the base cancellable context independent of the parent's cancellation signal.
-	baseCtx, cancel := context.WithCancel(context.Background())
-
-	// Create our custom context that wraps the base context and the parent context.
-	newCtx := &gracefulContext{
-		Context:   baseCtx,   // Embed the cancellable context
-		parentCtx: parentCtx, // Keep the parent for Value lookups
-	}
+	newCtx := context.WithoutCancel(parentCtx)
+	newCtx, newCancel := context.WithCancel(newCtx)
 
 	go func() {
-		select {
-		case <-baseCtx.Done(): // If the graceful context itself is cancelled directly
-			return
-		case <-parentCtx.Done(): // If the original parent context is cancelled
-			// Wait for the grace period
-			t := time.NewTimer(gracePeriod)
-			select {
-			case <-baseCtx.Done(): // Graceful context cancelled before grace period ended
-				t.Stop()
-			case <-t.C: // Grace period elapsed
-				cancel() // Now cancel the base context
-			}
-		}
+		<-parentCtx.Done()
+		t := time.NewTimer(gracePeriod)
+		<-t.C
+		newCancel()
 	}()
 
 	return newCtx
