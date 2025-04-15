@@ -28,9 +28,10 @@ func GracefulContext(ctx context.Context, gracePeriod time.Duration) context.Con
 	return newCtx
 }
 
-func (tc *TestCase) DelayedJobExecution(t *testing.T) {
+func (tc *TestCase) DelayedJobExecution(ctx context.Context, t *testing.T) {
 	t.Helper()
-	ctx := GracefulContext(t.Context(), 10*time.Millisecond)
+
+	ctx = GracefulContext(ctx, 10*time.Millisecond)
 
 	delay := 500 * time.Millisecond
 	jobProcessed := make(chan bool, 1)
