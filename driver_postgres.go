@@ -1,21 +1,36 @@
 package sqlq
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 )
+
+const pgTracerName = "github.com/your_org/sqlq/driver/postgres" // Replace with your actual module path
 
 // PostgresDriver implements the Driver interface for PostgreSQL
 type PostgresDriver struct {
-	db *sql.DB
+	db     *sql.DB
+	tracer trace.Tracer // Add tracer field
 }
 
 // NewPostgresDriver creates a new PostgreSQL driver with the given database connection
 func NewPostgresDriver(db *sql.DB) *PostgresDriver {
-	return &PostgresDriver{db: db}
+	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)} // Initialize tracer
 }
 
-func (d *PostgresDriver) InitSchema() error {
+func (d *PostgresDriver) InitSchema(ctx context.Context) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.InitSchema", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+	))
+	defer span.End()
+
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
 			id SERIAL PRIMARY KEY,
@@ -52,16 +67,36 @@ func (d *PostgresDriver) InitSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`,
 	}
 
+	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback() // Rollback if commit fails or panics
+
 	for _, query := range queries {
-		_, err := d.db.Exec(query)
+		_, err := tx.ExecContext(ctx, query) // Use ExecContext
 		if err != nil {
-			return err
+			span.RecordError(err)
+			return fmt.Errorf("failed to execute query (%s): %w", query, err)
 		}
 	}
-	return nil
+
+	err = tx.Commit()
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
 }
 
-func (d *PostgresDriver) InsertJob(jobType string, payload []byte, delay time.Duration) error {
+func (d *PostgresDriver) InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.InsertJob", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.String("sqlq.job_type", jobType),
+		attribute.Float64("sqlq.delay_seconds", delay.Seconds()),
+	))
+	defer span.End()
+
 	var query string
 	var args []interface{}
 
@@ -75,12 +110,25 @@ func (d *PostgresDriver) InsertJob(jobType string, payload []byte, delay time.Du
 		args = []interface{}{jobType, payload, delay.String()}
 	}
 
-	_, err := d.db.Exec(query, args...)
+	_, err := d.db.ExecContext(ctx, query, args...) // Use ExecContext
+	if err != nil {
+		span.RecordError(err)
+	}
 	return err
 }
 
-func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefetchCount int) ([]job, error) {
-	rows, err := d.db.Query(`
+func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error) {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.GetJobsForConsumer", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.String("sqlq.consumer_name", consumerName),
+		attribute.String("sqlq.job_type", jobType),
+		attribute.Int("sqlq.prefetch_count", prefetchCount),
+	))
+	defer span.End()
+
+	// Use FOR UPDATE SKIP LOCKED for PostgreSQL to allow multiple consumers
+	// without selecting the same job concurrently.
+	rows, err := d.db.QueryContext(ctx, `
 		SELECT j.id, j.payload, j.retry_count
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = $1
@@ -89,8 +137,10 @@ func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefet
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT $3
+		FOR UPDATE SKIP LOCKED
 	`, consumerName, jobType, prefetchCount)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
@@ -99,35 +149,69 @@ func (d *PostgresDriver) GetJobsForConsumer(consumerName, jobType string, prefet
 	var jobs []job
 	for rows.Next() {
 		var j job
+		// Populate job type for potential tracing/logging later if needed
+		j.JobType = jobType
 		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount); err != nil {
+			span.RecordError(err)
 			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
+	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobs)))
 
 	if err := rows.Err(); err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
 	return jobs, nil
 }
 
-func (d *PostgresDriver) MarkJobProcessed(jobID int64, consumerName string) error {
-	_, err := d.db.Exec("INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)", jobID, consumerName)
+func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.MarkJobProcessed", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.Int64("sqlq.job_id", jobID),
+		attribute.String("sqlq.consumer_name", consumerName),
+	))
+	defer span.End()
+
+	_, err := d.db.ExecContext(ctx, "INSERT INTO job_consumers (job_id, consumer_name) VALUES ($1, $2)", jobID, consumerName) // Use ExecContext
+	if err != nil {
+		span.RecordError(err)
+	}
 	return err
 }
 
-func (d *PostgresDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, backoffDuration time.Duration) error {
-	_, err := d.db.Exec(
+func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.MarkJobFailedAndReschedule", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.Int64("sqlq.job_id", jobID),
+		attribute.String("sqlq.error_message", errorMsg),
+		attribute.Float64("sqlq.backoff_seconds", backoffDuration.Seconds()),
+	))
+	defer span.End()
+
+	_, err := d.db.ExecContext(ctx, // Use ExecContext
 		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = NOW() + $2 WHERE id = $3",
 		errorMsg, backoffDuration.String(), jobID,
 	)
+	if err != nil {
+		span.RecordError(err)
+	}
 	return err
 }
 
-func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error {
-	tx, err := d.db.Begin()
+func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.MoveToDeadLetterQueue", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.Int64("sqlq.job_id", jobID),
+		attribute.String("sqlq.dlq_reason", reason),
+	))
+	defer span.End()
+
+	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -135,11 +219,12 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 
 	// Get the job details
 	var job job
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = $1
-	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount)
+	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount) // Use QueryRowContext
 	if err != nil {
+		span.RecordError(err)
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
 		}
@@ -151,15 +236,34 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(jobID int64, reason string) error
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason)
+	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason) // Use ExecContext
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
-	return tx.Commit()
+	// Delete from jobs table
+	_, err = tx.ExecContext(ctx, "DELETE FROM jobs WHERE id = $1", jobID) // Use ExecContext
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to delete job from main table: %w", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
 }
 
-func (d *PostgresDriver) GetDeadLetterJobs(jobType string, limit int) ([]DeadLetterJob, error) {
+func (d *PostgresDriver) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.GetDeadLetterJobs", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.String("sqlq.job_type", jobType), // jobType might be empty
+		attribute.Int("sqlq.limit", limit),
+	))
+	defer span.End()
+
 	query := `
 		SELECT id, original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
 		FROM dead_letter_queue
@@ -200,52 +304,68 @@ func (d *PostgresDriver) queryDeadLetterJobs(query string, args ...interface{}) 
 			&j.RetryCount,
 			&j.FailureReason,
 		); err != nil {
+			// Don't record error in span here, let the caller handle it
 			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
 
 	if err := rows.Err(); err != nil {
+		// Don't record error in span here, let the caller handle it
 		return nil, err
 	}
 
 	return jobs, nil
 }
 
-func (d *PostgresDriver) RequeueDeadLetterJob(dlqID int64) error {
-	tx, err := d.db.Begin()
+func (d *PostgresDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
+	ctx, span := d.tracer.Start(ctx, "PostgresDriver.RequeueDeadLetterJob", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.Int64("sqlq.dlq_id", dlqID),
+	))
+	defer span.End()
+
+	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 	defer tx.Rollback()
 
 	// Get the job from the dead letter queue
 	var dlqJob DeadLetterJob
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload
 		FROM dead_letter_queue WHERE id = $1
-	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload)
+	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload) // Use QueryRowContext
 	if err != nil {
+		span.RecordError(err)
 		if err == sql.ErrNoRows {
 			return ErrJobNotFound
 		}
 		return err
 	}
 
-	// Insert back into the main queue with reset retry count
-	_, err = tx.Exec(`
-		INSERT INTO jobs (job_type, payload, retry_count)
-		VALUES ($1, $2, 0)
-	`, dlqJob.JobType, dlqJob.Payload)
+	// Insert back into the main queue with reset retry count and scheduled_at = NOW()
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO jobs (job_type, payload, retry_count, scheduled_at)
+		VALUES ($1, $2, 0, NOW())
+	`, dlqJob.JobType, dlqJob.Payload) // Use ExecContext
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
 	// Delete from the dead letter queue
-	_, err = tx.Exec("DELETE FROM dead_letter_queue WHERE id = $1", dlqID)
+	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE id = $1", dlqID) // Use ExecContext
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
-	return tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
 }

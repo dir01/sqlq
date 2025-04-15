@@ -12,7 +12,14 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0" // Use appropriate semantic conventions version
+	"go.opentelemetry.io/otel/trace"
 )
+
+const tracerName = "github.com/your_org/sqlq" // Replace with your actual module path
 
 type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
@@ -60,6 +67,7 @@ type sqlq struct {
 	wg                  sync.WaitGroup
 	backoffFunc         func(retryNum int) time.Duration
 	defaultPollInterval time.Duration
+	tracer              trace.Tracer
 }
 
 type consumer struct {
@@ -122,38 +130,64 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 			return time.Duration(backoff+jitter) * time.Second
 		},
 		defaultPollInterval: 1 * time.Second,
+		tracer:              otel.Tracer(tracerName), // Initialize the tracer
 	}
 
 	for _, o := range opts {
 		o(q)
 	}
 
-	// Initialize the database schema
-	if err := q.driver.InitSchema(); err != nil {
+	// Initialize the database schema (using background context for initialization)
+	initCtx, initSpan := q.tracer.Start(context.Background(), "sqlq.InitSchema")
+	if err := q.driver.InitSchema(initCtx); err != nil {
+		initSpan.RecordError(err)
+		initSpan.End()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
+	initSpan.End()
 
 	return q, nil
 }
 
 // Publish adds a new job to the queue
 func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
+	ctx, span := q.tracer.Start(ctx, "sqlq.Publish", trace.WithAttributes(
+		attribute.String("sqlq.job_type", jobType),
+	))
+	defer span.End()
+
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
+	// Note: Rollback is deferred before PublishTx, so if PublishTx fails,
+	// the rollback happens automatically. If PublishTx succeeds, we commit.
 	defer tx.Rollback()
 
 	if err := q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
-		return err
+		// PublishTx already records its internal errors in its own span
+		return err // Return the error from PublishTx
 	}
 
-	return tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
 }
 
 // PublishTx adds a new job to the queue within an existing transaction
 func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
+	// Start a new span as a child of the context passed in.
+	// It's assumed the caller (Publish or external) started a relevant parent span.
+	ctx, span := q.tracer.Start(ctx, "sqlq.PublishTx", trace.WithAttributes(
+		attribute.String("sqlq.job_type", jobType),
+	))
+	defer span.End()
+
 	options := &publishOptions{}
 
 	// Apply provided options
@@ -163,11 +197,17 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
+	span.SetAttributes(attribute.Int("sqlq.payload_size", len(payloadBytes)))
 
-	err = q.driver.InsertJob(jobType, payloadBytes, options.delay)
+	// Pass the context to the driver method
+	err = q.driver.InsertJob(ctx, jobType, payloadBytes, options.delay)
 	if err != nil {
+		// The driver method should record the specific DB error in its span.
+		// We record a higher-level error here.
+		span.RecordError(err)
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
 
@@ -210,88 +250,136 @@ func (q *sqlq) Consume(
 	}
 	cons.processingJobs = make(chan job, cons.prefetchCount)
 
-	// Start worker goroutines
-	for range cons.concurrency {
-		cons.workerWg.Add(1)
-		go q.workerLoop(cons)
-	}
-
 	q.consumersMap[jobType] = append(q.consumersMap[jobType], cons)
+
+	// Start worker goroutines
+	for i := range cons.concurrency {
+		cons.workerWg.Add(1)
+		// Pass the consumer's context and worker index to the loop
+		go q.workerLoop(cons, i)
+	}
 }
 
 // workerLoop processes jobs from the processingJobs channel
-func (q *sqlq) workerLoop(cons *consumer) {
+func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 	defer cons.workerWg.Done()
+	workerName := fmt.Sprintf("%s-worker-%d", cons.consumerName, workerID)
 
 	for {
+		// Create a root span for waiting for a job.
+		// This might be long-running if the channel is empty.
+		waitCtx, waitSpan := q.tracer.Start(cons.ctx, fmt.Sprintf("%s.WaitForJob", workerName))
+		// Use the waitCtx for the select
 		select {
-		case <-cons.ctx.Done():
+		case <-waitCtx.Done(): // Use waitCtx here
+			waitSpan.End() // End span if context is cancelled
 			return
 		case job, ok := <-cons.processingJobs:
+			waitSpan.End() // End the waiting span once a job is received
 			if !ok {
-				return
+				return // Channel closed
 			}
 
-			tx, err := q.db.BeginTx(cons.ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
+			// Start a new span for processing this specific job.
+			// Use cons.ctx as the base context for the job processing itself.
+			jobCtx, jobSpan := q.tracer.Start(cons.ctx, fmt.Sprintf("%s.ProcessJob", workerName), trace.WithAttributes(
+				attribute.String("sqlq.job_type", cons.jobType),
+				attribute.Int64("sqlq.job_id", job.ID),
+				attribute.Int("sqlq.retry_count", job.RetryCount),
+			))
+
+			tx, err := q.db.BeginTx(jobCtx, &sql.TxOptions{Isolation: sql.LevelDefault})
 			if err != nil {
-				log.Printf("failed to begin transaction")
-				continue
+				log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
+				jobSpan.RecordError(err)
+				jobSpan.End() // End span since we can't process further
+				continue    // Try the next job
 			}
 
-			// Process the job
-			log.Printf("[%s] Pre handler of job %d", time.Now().String(), job.ID)
-			consErr := cons.handler(cons.ctx, tx, job.Payload)
-			log.Printf("[%s] Post handler of job %d", time.Now().String(), job.ID)
+			// Process the job within its own span
+			processCtx, processSpan := q.tracer.Start(jobCtx, fmt.Sprintf("%s.Handler", workerName))
+			log.Printf("[%s] Pre handler of job %d", workerName, job.ID)
+			consErr := cons.handler(processCtx, tx, job.Payload) // Pass processCtx to handler
+			log.Printf("[%s] Post handler of job %d", workerName, job.ID)
+			if consErr != nil {
+				processSpan.RecordError(consErr)
+				jobSpan.SetAttributes(attribute.String("sqlq.handler_error", consErr.Error()))
+			}
+			processSpan.End()
 
+			// Handle transaction and job state based on handler result
 			if consErr == nil {
-				if err = q.driver.MarkJobProcessed(job.ID, cons.consumerName); err != nil && !errors.Is(err, context.Canceled) {
-					log.Printf("Failed to mark job %d as processed: %v", job.ID, err)
-					_ = tx.Rollback()
-					continue
-				}
+				// Mark processed within the job span
+				markCtx, markSpan := q.tracer.Start(jobCtx, fmt.Sprintf("%s.MarkProcessed", workerName))
+				markErr := q.driver.MarkJobProcessed(markCtx, job.ID, cons.consumerName) // Pass markCtx
+				markSpan.End()
 
-				err := tx.Commit()
-				if err != nil && !errors.Is(err, sql.ErrTxDone) {
-					log.Printf("[%s] Failed to commit transaction for job %d: %v", time.Now().String(), job.ID, err)
+				if markErr != nil && !errors.Is(markErr, context.Canceled) {
+					log.Printf("[%s] Failed to mark job %d as processed: %v", workerName, job.ID, markErr)
+					jobSpan.RecordError(fmt.Errorf("mark job processed failed: %w", markErr))
+					_ = tx.Rollback() // Rollback on failure to mark processed
+				} else {
+					// Commit transaction
+					commitErr := tx.Commit()
+					if commitErr != nil && !errors.Is(commitErr, sql.ErrTxDone) && !errors.Is(commitErr, context.Canceled) {
+						log.Printf("[%s] Failed to commit transaction for job %d: %v", workerName, job.ID, commitErr)
+						jobSpan.RecordError(fmt.Errorf("commit failed: %w", commitErr))
+						// Job was processed by handler, but commit failed. State is ambiguous.
+					}
 				}
 			} else {
-				_ = tx.Rollback()
+				// Handler failed, rollback transaction
+				_ = tx.Rollback() // Rollback is best-effort
 
-				// Handle retry logic
-				if job.RetryCount < cons.maxRetries {
-					// FIXME: delete
-					//log.Printf("Retrying job %d, RetryCount: %d", job.ID, job.RetryCount)
-					if err := q.retryJob(cons, job, consErr.Error()); err != nil {
-						log.Printf("Failed to schedule retry for job %d: %v", job.ID, err)
+				// Handle retry or DLQ logic within the job span
+				if cons.maxRetries == infiniteRetries || job.RetryCount < cons.maxRetries {
+					retryCtx, retrySpan := q.tracer.Start(jobCtx, fmt.Sprintf("%s.RetryJob", workerName))
+					retryErr := q.retryJob(retryCtx, cons, job, consErr.Error()) // Pass retryCtx
+					if retryErr != nil {
+						log.Printf("[%s] Failed to schedule retry for job %d: %v", workerName, job.ID, retryErr)
+						retrySpan.RecordError(retryErr)
+						jobSpan.RecordError(fmt.Errorf("retry scheduling failed: %w", retryErr))
 					}
-					// FIXME: delete
-					//log.Printf("Retrying done for job %d", job.ID)
+					retrySpan.End()
 				} else {
-					// FIXME: delete
-					//log.Printf("Moving job %d to DLQ, RetryCount %d", job.ID, job.RetryCount)
-					if moveErr := q.driver.MoveToDeadLetterQueue(job.ID, consErr.Error()); moveErr != nil {
-						log.Printf("Failed to move job %d to dead letter queue: %v", job.ID, moveErr)
+					dlqCtx, dlqSpan := q.tracer.Start(jobCtx, fmt.Sprintf("%s.MoveToDLQ", workerName))
+					moveErr := q.driver.MoveToDeadLetterQueue(dlqCtx, job.ID, consErr.Error()) // Pass dlqCtx
+					if moveErr != nil {
+						log.Printf("[%s] Failed to move job %d to dead letter queue: %v", workerName, job.ID, moveErr)
+						dlqSpan.RecordError(moveErr)
+						jobSpan.RecordError(fmt.Errorf("move to DLQ failed: %w", moveErr))
 					} else {
-						// FIXME: delete
-						// log.Printf("Job %d exceeded maximum retries (%d) and was moved to dead letter queue: %v", job.ID, cons.maxRetries, err)
+						log.Printf("[%s] Job %d exceeded max retries (%d) and moved to DLQ: %v", workerName, job.ID, cons.maxRetries, consErr)
+						jobSpan.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
 					}
+					dlqSpan.End()
 				}
 			}
+			jobSpan.End() // End the overall job processing span
 		}
 	}
 }
 
 // retryJob increments the retry count and schedules the job to be retried after a backoff period
-func (q *sqlq) retryJob(consumer *consumer, job job, errorMsg string) error {
+func (q *sqlq) retryJob(ctx context.Context, consumer *consumer, job job, errorMsg string) error {
+	ctx, span := q.tracer.Start(ctx, "sqlq.retryJob", trace.WithAttributes(
+		attribute.Int64("sqlq.job_id", job.ID),
+		attribute.Int("sqlq.retry_count", job.RetryCount),
+		attribute.String("sqlq.error_message", errorMsg),
+	))
+	defer span.End()
+
 	// Calculate exponential backoff
 	bFn := q.backoffFunc
 	if consumer.backoffFunc != nil {
 		bFn = consumer.backoffFunc
 	}
 	backoff := bFn(job.RetryCount)
+	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	// Mark job as failed and reschedule in a single operation
-	if err := q.driver.MarkJobFailedAndReschedule(job.ID, errorMsg, backoff); err != nil {
+	if err := q.driver.MarkJobFailedAndReschedule(ctx, job.ID, errorMsg, backoff); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
 
@@ -322,12 +410,33 @@ func (q *sqlq) Run() {
 
 // GetDeadLetterJobs retrieves jobs from the dead letter queue
 func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
-	return q.driver.GetDeadLetterJobs(jobType, limit)
+	ctx, span := q.tracer.Start(ctx, "sqlq.GetDeadLetterJobs", trace.WithAttributes(
+		attribute.String("sqlq.job_type", jobType),
+		attribute.Int("sqlq.limit", limit),
+	))
+	defer span.End()
+
+	jobs, err := q.driver.GetDeadLetterJobs(ctx, jobType, limit)
+	if err != nil {
+		span.RecordError(err)
+	} else {
+		span.SetAttributes(attribute.Int("sqlq.dlq_jobs_fetched", len(jobs)))
+	}
+	return jobs, err
 }
 
 // RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
-	return q.driver.RequeueDeadLetterJob(dlqID)
+	ctx, span := q.tracer.Start(ctx, "sqlq.RequeueDeadLetterJob", trace.WithAttributes(
+		attribute.Int64("sqlq.dlq_id", dlqID),
+	))
+	defer span.End()
+
+	err := q.driver.RequeueDeadLetterJob(ctx, dlqID)
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
 }
 
 // Shutdown stops the job processing
@@ -366,19 +475,29 @@ func (q *sqlq) processJobs() error {
 				timer := time.NewTimer(cons.pollInterval)
 				defer timer.Stop()
 
-				if err := q.fetchJobsForConsumer(cons); err != nil && !errors.Is(err, context.Canceled) {
+				// Fetch jobs within a span, using the consumer's context
+				fetchCtx, fetchSpan := q.tracer.Start(cons.ctx, "sqlq.fetchJobsForConsumer", trace.WithAttributes(
+					attribute.String("sqlq.consumer_name", cons.consumerName),
+					attribute.String("sqlq.job_type", jobType),
+				))
+
+				if err := q.fetchJobsForConsumer(fetchCtx, cons); err != nil && !errors.Is(err, context.Canceled) {
 					log.Printf(
-						"Error processing jobs for consumer %s of type %s: %v",
+						"Error fetching jobs for consumer %s of type %s: %v",
 						cons.consumerName, jobType, err,
 					)
+					fetchSpan.RecordError(err)
 				}
+				fetchSpan.End()
 
 				// Wait for poll interval or context cancellation
 				select {
 				case <-timer.C:
 					// Timer expired, continue to next poll
-				case <-cons.ctx.Done():
+				case <-cons.ctx.Done(): // Check consumer's context
 					// Context was canceled
+					return
+				case <-q.shutdown: // Also check global shutdown signal
 					return
 				}
 			}(cons, jobType)
@@ -389,14 +508,22 @@ func (q *sqlq) processJobs() error {
 }
 
 // fetchJobsForConsumer fetches jobs for a specific consumer and sends them to worker goroutines
-func (q *sqlq) fetchJobsForConsumer(cons *consumer) error {
+func (q *sqlq) fetchJobsForConsumer(ctx context.Context, cons *consumer) error {
+	// Span is started by the caller (processJobs)
+
 	// FIXME: drop this
 	// log.Printf("fetching jobs for consumer %s", cons.consumerName)
 
 	// Find jobs that haven't been processed by this consumer
-	jobs, err := q.driver.GetJobsForConsumer(cons.consumerName, cons.jobType, cons.prefetchCount)
+	jobs, err := q.driver.GetJobsForConsumer(ctx, cons.consumerName, cons.jobType, cons.prefetchCount) // Pass context
 	if err != nil {
+		// Let caller record error in span
 		return fmt.Errorf("failed to query jobs: %w", err)
+	}
+
+	// Add fetched count to the existing span from the caller
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobs)))
 	}
 
 	// FIXME: drop this
@@ -404,9 +531,10 @@ func (q *sqlq) fetchJobsForConsumer(cons *consumer) error {
 
 	for _, job := range jobs {
 		select {
-		case <-cons.ctx.Done():
-			return nil
+		case <-ctx.Done(): // Use the passed context which includes the span
+			return ctx.Err() // Return context error
 		case cons.processingJobs <- job:
+			// TODO: Potentially add an event/log here if needed
 		}
 	}
 
