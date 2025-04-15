@@ -307,11 +307,18 @@ func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, li
 		return d.queryDeadLetterJobs(query, limit)
 	}
 
-	return d.queryDeadLetterJobs(query, jobType, limit)
+	jobs, err := d.queryDeadLetterJobs(ctx, query, jobType, limit) // Pass context
+	if err != nil {
+		span.RecordError(err)
+	} else {
+		span.SetAttributes(attribute.Int("sqlq.dlq_jobs_fetched", len(jobs)))
+	}
+	return jobs, err
 }
 
-func (d *SQLiteDriver) queryDeadLetterJobs(query string, args ...interface{}) ([]DeadLetterJob, error) {
-	rows, err := d.db.Query(query, args...)
+// queryDeadLetterJobs is a helper, context is passed from the caller
+func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, args ...interface{}) ([]DeadLetterJob, error) {
+	rows, err := d.db.QueryContext(ctx, query, args...) // Use QueryContext
 	if err != nil {
 		return nil, err
 	}
