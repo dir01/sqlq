@@ -299,14 +299,12 @@ func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 				attribute.Int("sqlq.retry_count", job.RetryCount),
 				attribute.String("sqlq.extracted_trace_context", fmt.Sprintf("%v", job.TraceContext)),
 			}
-			linkFailed := false
 			if remoteSpanContext.IsValid() {
 				// Valid remote context found, link the span
 				startCtx = trace.ContextWithRemoteSpanContext(cons.ctx, remoteSpanContext)
 			} else {
 				// Invalid or missing remote context
 				log.Printf("[%s] Warning: Job %d received without valid trace context. Starting new trace.", workerName, job.ID)
-				linkFailed = true
 				// Add attribute to indicate link failure
 				spanAttributes = append(spanAttributes, attribute.Bool("sqlq.trace_link_failed", true))
 			}
