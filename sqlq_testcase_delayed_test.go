@@ -10,9 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// GracefulContext creates a context that cancels gracePeriod after cancellation of its parent
+// GracefulContext creates a context that inherits values from its parent
+// and cancels gracePeriod after the parent context is cancelled.
 func GracefulContext(ctx context.Context, gracePeriod time.Duration) context.Context {
-	newCtx, cancel := context.WithCancel(context.Background())
+	// Create the new context based on the parent ctx to inherit values.
+	newCtx, cancel := context.WithCancel(ctx)
 
 	go func() {
 		select {
