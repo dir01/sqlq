@@ -13,8 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -88,9 +91,10 @@ type consumer struct {
 type job struct {
 	ID         int64
 	JobType    string
-	Payload    []byte
-	CreatedAt  time.Time
-	RetryCount int
+	Payload      []byte
+	CreatedAt    time.Time
+	RetryCount   int
+	TraceContext map[string]string // Added for trace propagation
 }
 
 func (j job) String() string {
@@ -201,8 +205,13 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	}
 	span.SetAttributes(attribute.Int("sqlq.payload_size", len(payloadBytes)))
 
-	// Pass the context to the driver method
-	err = q.driver.InsertJob(ctx, jobType, payloadBytes, options.delay)
+	// Inject trace context for propagation
+	traceContextMap := make(map[string]string)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(traceContextMap))
+	span.SetAttributes(attribute.String("sqlq.injected_trace_context", fmt.Sprintf("%v", traceContextMap)))
+
+	// Pass the context and trace context map to the driver method
+	err = q.driver.InsertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
 		// The driver method should record the specific DB error in its span.
 		// We record a higher-level error here.
@@ -279,15 +288,26 @@ func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 				return // Channel closed
 			}
 
-			// Start a new span for processing this specific job.
-			// Use cons.ctx as the base context for the job processing itself.
-			jobCtx, jobSpan := q.tracer.Start(cons.ctx, fmt.Sprintf("%s.ProcessJob", workerName), trace.WithAttributes(
-				attribute.String("sqlq.job_type", cons.jobType),
-				attribute.Int64("sqlq.job_id", job.ID),
-				attribute.Int("sqlq.retry_count", job.RetryCount),
-			))
+			// Extract the parent trace context from the job
+			// Use context.Background() as the base, as cons.ctx might be cancelled independently.
+			parentCtx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.MapCarrier(job.TraceContext))
 
-			tx, err := q.db.BeginTx(jobCtx, &sql.TxOptions{Isolation: sql.LevelDefault})
+			// Start a new span for processing this specific job, linked to the parent context.
+			// Use cons.ctx as the *local* parent context for cancellation signals, etc.
+			// but link it to the *remote* parentCtx for tracing.
+			jobCtx, jobSpan := q.tracer.Start(
+				trace.ContextWithRemoteSpanContext(cons.ctx, trace.SpanContextFromContext(parentCtx)),
+				fmt.Sprintf("%s.ProcessJob", workerName),
+				trace.WithAttributes(
+					attribute.String("sqlq.job_type", cons.jobType),
+					attribute.Int64("sqlq.job_id", job.ID),
+					attribute.Int("sqlq.retry_count", job.RetryCount),
+					attribute.String("sqlq.extracted_trace_context", fmt.Sprintf("%v", job.TraceContext)),
+				),
+				trace.WithSpanKind(trace.SpanKindConsumer), // Mark this as a consumer span
+			)
+
+			tx, err := q.db.BeginTx(jobCtx, &sql.TxOptions{Isolation: sql.LevelDefault}) // Use jobCtx which has the correct span
 			if err != nil {
 				log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
 				jobSpan.RecordError(err)

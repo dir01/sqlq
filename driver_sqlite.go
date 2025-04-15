@@ -44,7 +44,8 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER DEFAULT 0,
-			last_error TEXT
+			last_error TEXT,
+			trace_context TEXT -- Added for trace propagation
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
@@ -95,10 +96,11 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
-func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration) error {
+func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error {
 	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.InsertJob", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
+		attribute.String("sqlq.trace_context", fmt.Sprintf("%v", traceContext)), // Log trace context
 		attribute.Float64("sqlq.delay_seconds", delay.Seconds()),
 	))
 	defer span.End()
@@ -106,19 +108,28 @@ func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
+	// Serialize trace context to JSON string
+	traceContextJSON, err := json.Marshal(traceContext)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to marshal trace context: %w", err))
+		// Decide if you want to proceed without trace context or return error
+		// For now, we log and proceed without it.
+		traceContextJSON = []byte("{}") // Store empty JSON object
+	}
+
 	var query string
 	var args []interface{}
 
 	if delay <= 0 {
-		query = "INSERT INTO jobs (job_type, payload) VALUES (?, ?)"
-		args = []interface{}{jobType, payload}
+		query = "INSERT INTO jobs (job_type, payload, trace_context) VALUES (?, ?, ?)"
+		args = []interface{}{jobType, payload, string(traceContextJSON)}
 	} else {
 		delaySeconds := int(delay.Seconds())
-		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))"
-		args = []interface{}{jobType, payload, delaySeconds}
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at, trace_context) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'), ?)"
+		args = []interface{}{jobType, payload, delaySeconds, string(traceContextJSON)}
 	}
 
-	_, err := d.db.ExecContext(ctx, query, args...) // Use ExecContext
+	_, err = d.db.ExecContext(ctx, query, args...) // Use ExecContext
 	if err != nil {
 		span.RecordError(err)
 	}
@@ -140,7 +151,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	// Note: SQLite doesn't support FOR UPDATE SKIP LOCKED.
 	// Locking is handled by the mutex at the driver level.
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT j.id, j.payload, j.retry_count
+		SELECT j.id, j.payload, j.retry_count, j.trace_context
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
@@ -158,12 +169,24 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	var jobs []job
 	for rows.Next() {
 		var j job
+		var traceContextJSON sql.NullString
 		// Populate job type for potential tracing/logging later if needed
 		j.JobType = jobType
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount); err != nil {
+		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
+
+		// Deserialize trace context
+		j.TraceContext = make(map[string]string)
+		if traceContextJSON.Valid && traceContextJSON.String != "" {
+			if err := json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
+				span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
+				// Continue without trace context if unmarshal fails
+				j.TraceContext = make(map[string]string)
+			}
+		}
+
 		jobs = append(jobs, j)
 	}
 	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobs)))

@@ -11,10 +11,10 @@ type Driver interface {
 	// InitSchema creates the necessary tables if they don't exist
 	InitSchema(ctx context.Context) error
 
-	// InsertJob executes the query for inserting a job
-	InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration) error
+	// InsertJob executes the query for inserting a job, including trace context
+	InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
-	// GetJobsForConsumer executes the query for finding jobs for a consumer
+	// GetJobsForConsumer executes the query for finding jobs for a consumer, returning trace context
 	GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error)
 
 	// MarkJobProcessed executes the query for marking a job as processed
