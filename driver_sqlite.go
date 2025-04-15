@@ -85,7 +85,7 @@ func (d *SQLiteDriver) InsertJob(jobType string, payload []byte, scheduledAt tim
 			delaySeconds = 0
 		}
 		
-		// Use SQLite's datetime function with the delay
+		// Use SQLite's datetime function with the delay directly in the query
 		query = "INSERT INTO jobs (job_type, payload, scheduled_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))"
 		args = []interface{}{jobType, payload, delaySeconds}
 	}
@@ -103,7 +103,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(consumerName, jobType string, prefetch
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
-		AND j.scheduled_at <= datetime('now')
+		AND j.scheduled_at <= datetime('now', 'localtime')
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT ?
@@ -144,9 +144,12 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(jobID int64, errorMsg string, 
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
+	// Convert duration to seconds for SQLite datetime function
+	backoffSeconds := int(backoffDuration.Seconds())
+	
 	_, err := d.db.Exec(
 		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?",
-		errorMsg, int(backoffDuration.Seconds()), jobID,
+		errorMsg, backoffSeconds, jobID,
 	)
 	return err
 }
