@@ -9,7 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -304,7 +304,7 @@ func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, li
 			ORDER BY failed_at DESC
 			LIMIT ?
 		`
-		return d.queryDeadLetterJobs(query, limit)
+		return d.queryDeadLetterJobs(ctx, query, limit)
 	}
 
 	jobs, err := d.queryDeadLetterJobs(ctx, query, jobType, limit) // Pass context

@@ -1,6 +1,7 @@
 package sqlq
 
 import (
+	"context"
 	"database/sql"
 	"time"
 )
@@ -30,7 +31,6 @@ type Driver interface {
 
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
-
 }
 
 // GetDriver returns the appropriate driver for the given database type

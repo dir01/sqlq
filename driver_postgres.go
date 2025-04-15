@@ -278,7 +278,7 @@ func (d *PostgresDriver) GetDeadLetterJobs(ctx context.Context, jobType string, 
 			ORDER BY failed_at DESC
 			LIMIT $1
 		`
-		return d.queryDeadLetterJobs(query, limit)
+		return d.queryDeadLetterJobs(ctx, query, limit)
 	}
 
 	jobs, err := d.queryDeadLetterJobs(ctx, query, jobType, limit) // Pass context

@@ -15,11 +15,10 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	// semconv "go.opentelemetry.io/otel/semconv/v1.21.0" // Use appropriate semantic conventions version - Removed as unused in this file
 	"go.opentelemetry.io/otel/trace"
 )
 
-const tracerName = "github.com/your_org/sqlq" // Replace with your actual module path
+const tracerName = "github.com/dir01/sqlq"
 
 type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
@@ -293,7 +292,7 @@ func (q *sqlq) workerLoop(cons *consumer, workerID int) {
 				log.Printf("[%s] Failed to begin transaction for job %d: %v", workerName, job.ID, err)
 				jobSpan.RecordError(err)
 				jobSpan.End() // End span since we can't process further
-				continue    // Try the next job
+				continue      // Try the next job
 			}
 
 			// Process the job within its own span
