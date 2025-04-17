@@ -106,6 +106,15 @@ func TestDriverSQLite(t *testing.T) {
 		require.Less(t, createdAt, nowMs+5000)    // Within 5 seconds after test
 		
 		// For a job with no delay, scheduled_at should be same as created_at
-		require.InDelta(t, createdAt, scheduledAt, 100) // Allow small delta for processing time
+		require.Equal(t, createdAt, scheduledAt, "For immediate jobs, created_at and scheduled_at should be identical")
+		
+		// Verify that SQLite's timestamp function works as expected
+		var dbTimeMs int64
+		err = db.QueryRowContext(t.Context(), "SELECT (strftime('%s','now') * 1000) as current_time").Scan(&dbTimeMs)
+		require.NoError(t, err)
+		
+		// DB time should be close to our time
+		require.Less(t, time.UnixMilli(dbTimeMs).Sub(now).Abs(), 2*time.Second, 
+			"Database time and client time should be close")
 	})
 }
