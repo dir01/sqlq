@@ -64,7 +64,6 @@ type sqlq struct {
 	consumersMap        map[string][]*consumer // jobType -> consumerList
 	consumersMapMutex   sync.RWMutex
 	shutdown            chan struct{}
-	wg                  sync.WaitGroup
 	backoffFunc         func(retryNum int) time.Duration
 	defaultPollInterval time.Duration
 	tracer              trace.Tracer
@@ -491,8 +490,6 @@ func (q *sqlq) Shutdown() {
 		}
 	}
 	q.consumersMapMutex.Unlock()
-
-	q.wg.Wait()
 }
 
 // fetchJobsForConsumer fetches jobs for a specific consumer and sends them to worker goroutines
