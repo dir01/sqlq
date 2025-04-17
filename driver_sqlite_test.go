@@ -109,13 +109,16 @@ func TestDriverSQLite(t *testing.T) {
 		require.Equal(t, createdAt, scheduledAt, "For immediate jobs, created_at and scheduled_at should be identical")
 		
 		// Verify that SQLite's timestamp function works as expected with millisecond precision
-		var dbTimeMs int64
+		var dbTimeMs float64 // Changed from int64 to float64 to match SQLite's return type
 		err = db.QueryRowContext(t.Context(), 
 			"SELECT (strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) as current_time").Scan(&dbTimeMs)
 		require.NoError(t, err)
 		
+		// Convert to int64 after scanning
+		dbTimeMsInt := int64(dbTimeMs)
+		
 		// DB time should be close to our time
-		require.Less(t, time.UnixMilli(dbTimeMs).Sub(now).Abs(), 2*time.Second, 
+		require.Less(t, time.UnixMilli(dbTimeMsInt).Sub(now).Abs(), 2*time.Second, 
 			"Database time and client time should be close")
 		
 		// Test millisecond precision by inserting multiple jobs quickly
