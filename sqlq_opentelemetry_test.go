@@ -51,7 +51,7 @@ func newTracer(ctx context.Context, otlpEndpoint string) (tracer trace.Tracer, c
 
 	otel.SetTracerProvider(traceProvider)
 
-	tracer = traceProvider.Tracer("")
+	tracer = traceProvider.Tracer("sqlq_test")
 
 	return tracer, cleanup, nil
 }

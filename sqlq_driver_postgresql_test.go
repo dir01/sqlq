@@ -21,11 +21,11 @@ func TestPostgreSQL(t *testing.T) {
 	defer cleanup()
 
 	t.Run("Basic pub/sub", func(t *testing.T) {
-		tc.BasicPubSub(t.Context(), t)
+		tc.TestBasicPubSub(t.Context(), t)
 	})
 
 	t.Run("Multiple subscribers for same job type", func(t *testing.T) {
-		tc.BasicPubMultiSub(t.Context(), t)
+		tc.TestBasicPubMultiSub(t.Context(), t)
 	})
 }
 

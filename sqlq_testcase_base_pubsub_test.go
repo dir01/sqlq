@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func (tc *TestCase) BasicPubSub(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	// Create channels to track job processing
@@ -50,7 +50,7 @@ func (tc *TestCase) BasicPubSub(ctx context.Context, t *testing.T) {
 	require.Equal(t, testPayload.Count, receivedPayload.Count, "Count mismatch")
 }
 
-func (tc *TestCase) BasicPubMultiSub(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestBasicPubMultiSub(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	// Create channels to track job processing

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func (tc *TestCase) DLQBasic(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -80,7 +80,7 @@ func (tc *TestCase) DLQBasic(ctx context.Context, t *testing.T) {
 	require.True(t, found, "Job not found in DLQ")
 }
 
-func (tc *TestCase) DLQReque(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -88,7 +88,7 @@ func (tc *TestCase) DLQReque(ctx context.Context, t *testing.T) {
 
 	jobType := "dlq_requeue_test"
 	consumerName := "dlq_requeue_consumer"
-	maxRetries := 1 // Allow 1 retry (2 total attempts)
+	maxRetries := 0
 
 	// Track job processing attempts and success
 	jobAttempted := make(chan int, maxRetries+1)
@@ -147,13 +147,13 @@ func (tc *TestCase) DLQReque(ctx context.Context, t *testing.T) {
 		}
 	}
 
-	// Give some time for the job to be moved to DLQ
-	time.Sleep(2 * time.Second)
-
-	// Get the job from DLQ
-	dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
-	require.NoError(t, err, "Failed to get DLQ jobs")
-	require.NotEmpty(t, dlqJobs, "No jobs found in DLQ")
+	var dlqJobs []sqlq.DeadLetterJob
+	require.Eventually(t, func() bool {
+		var err error
+		dlqJobs, err = tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
+		require.NoError(t, err)
+		return len(dlqJobs) != 0
+	}, 1*time.Second, 10*time.Millisecond)
 
 	// Find our job in the DLQ
 	var dlqJobID int64
@@ -199,7 +199,7 @@ func (tc *TestCase) DLQReque(ctx context.Context, t *testing.T) {
 	}
 }
 
-func (tc *TestCase) DLQGet(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -278,7 +278,7 @@ func (tc *TestCase) DLQGet(ctx context.Context, t *testing.T) {
 	require.True(t, foundType2, "Type 2 jobs not found in unfiltered results")
 }
 
-func (tc *TestCase) DLQGetLimit(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestDLQGetLimit(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)

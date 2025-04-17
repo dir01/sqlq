@@ -29,6 +29,7 @@ func TestSQLite(t *testing.T) {
 	q.Run()
 
 	t.Cleanup(func() {
+
 		t.Logf("[%s] Stop tracer", time.Now().String())
 		assert.NoError(t, stopTracer())
 
@@ -37,7 +38,6 @@ func TestSQLite(t *testing.T) {
 
 		t.Logf("[%s] Closing database", time.Now().String())
 		assert.NoError(t, db.Close())
-
 	})
 
 	tc := &TestCase{Q: q}
@@ -45,81 +45,81 @@ func TestSQLite(t *testing.T) {
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.BasicPubMultiSub")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestBasicPubSub")
 		defer span.End()
 
-		tc.BasicPubSub(ctx, t)
+		tc.TestBasicPubSub(ctx, t)
 	})
 
 	t.Run("Multiple subscribers for same job type", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.BasicPubMultiSub")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestBasicPubMultiSub")
 		defer span.End()
 
-		tc.BasicPubMultiSub(ctx, t)
+		tc.TestBasicPubMultiSub(ctx, t)
 	})
 
 	t.Run("Delayed job execution", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.DelayedJobExecution")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDelayedJobExecution")
 		defer span.End()
 
-		tc.DelayedJobExecution(ctx, t)
+		tc.TestDelayedJobExecution(ctx, t)
 	})
 
 	t.Run("Job retry", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.Retry")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestRetry")
 		defer span.End()
 
-		tc.Retry(ctx, t)
+		tc.TestRetry(ctx, t)
 	})
 
 	t.Run("Max retries exeeded", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.RetryMaxExceeded")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestRetryMaxExceeded")
 		defer span.End()
 
-		tc.RetryMaxExceeded(ctx, t)
+		tc.TestRetryMaxExceeded(ctx, t)
 	})
 
 	t.Run("Failed jobs go to Dead Letter Queue", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.DLQBasic")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQBasic")
 		defer span.End()
 
-		tc.DLQBasic(ctx, t)
+		tc.TestDLQBasic(ctx, t)
 	})
 
 	t.Run("Dead Letter Queue jobs may be requeued", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.DLQReque")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQReque")
 		defer span.End()
 
-		tc.DLQReque(ctx, t)
+		tc.TestDLQReque(ctx, t)
 	})
 
 	t.Run("Can get Dead Letter Queue jobs", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.DLQGet")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQGet")
 		defer span.End()
 
-		tc.DLQGet(ctx, t)
+		tc.TestDLQGet(ctx, t)
 	})
 
 	t.Run("Fetching Dead Letter Queue jobs respects limits", func(t *testing.T) {
 		t.Parallel()
 
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.DLQGetLimit")
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQGetLimit")
 		defer span.End()
 
-		tc.DLQGetLimit(ctx, t)
+		tc.TestDLQGetLimit(ctx, t)
 	})
 }

@@ -37,7 +37,7 @@ func GracefulContext(parentCtx context.Context, gracePeriod time.Duration) conte
 	return newCtx
 }
 
-func (tc *TestCase) DelayedJobExecution(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestDelayedJobExecution(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	ctx = GracefulContext(ctx, 10*time.Millisecond)

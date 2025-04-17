@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func (tc *TestCase) Retry(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	start := time.Now()
 	// Create channels to track job processing attempts
 	jobAttempts := make(chan int, 5) // Buffer for multiple attempts
@@ -92,7 +92,7 @@ func (tc *TestCase) Retry(ctx context.Context, t *testing.T) {
 	}
 }
 
-func (tc *TestCase) RetryMaxExceeded(ctx context.Context, t *testing.T) {
+func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	// Create a new context with timeout to avoid test hanging
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
