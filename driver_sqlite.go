@@ -30,7 +30,7 @@ func NewSQLiteDriver(db *sql.DB) *SQLiteDriver {
 }
 
 func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.InitSchema", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.init_schema", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 	))
 	defer span.End()
@@ -76,15 +76,15 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`,
 	}
 
-	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if commit fails or panics
+	defer tx.Rollback()
 
 	for _, query := range queries {
-		_, err := tx.ExecContext(ctx, query) // Use ExecContext
+		_, err := tx.ExecContext(ctx, query)
 		if err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
@@ -98,11 +98,17 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
-func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.InsertJob", trace.WithAttributes(
+func (d *SQLiteDriver) InsertJob(
+	ctx context.Context,
+	jobType string,
+	payload []byte,
+	delay time.Duration,
+	traceContext map[string]string,
+) error {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.insert_job", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.trace_context", fmt.Sprintf("%v", traceContext)), // Log trace context
+		attribute.String("sqlq.trace_context", fmt.Sprintf("%v", traceContext)),
 		attribute.Float64("sqlq.delay_seconds", delay.Seconds()),
 	))
 	defer span.End()
@@ -110,13 +116,10 @@ func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Serialize trace context to JSON string
 	traceContextJSON, err := json.Marshal(traceContext)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to marshal trace context: %w", err))
-		// Decide if you want to proceed without trace context or return error
-		// For now, we log and proceed without it.
-		traceContextJSON = []byte("{}") // Store empty JSON object
+		traceContextJSON = []byte("{}")
 	}
 
 	var query string
@@ -131,15 +134,16 @@ func (d *SQLiteDriver) InsertJob(ctx context.Context, jobType string, payload []
 		args = []interface{}{jobType, payload, delaySeconds, string(traceContextJSON)}
 	}
 
-	_, err = d.db.ExecContext(ctx, query, args...) // Use ExecContext
+	_, err = d.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		span.RecordError(err)
 	}
+
 	return err
 }
 
 func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error) {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.GetJobsForConsumer", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.consumer_name", consumerName),
 		attribute.String("sqlq.job_type", jobType),
@@ -157,15 +161,16 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
-		AND j.scheduled_at <= datetime('now', 'localtime')
+		AND j.scheduled_at <= datetime('now')
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT ?
-	`, consumerName, jobType, prefetchCount) // Use QueryContext
+	`, consumerName, jobType, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
+
 	defer rows.Close()
 
 	var jobs []job
@@ -202,43 +207,50 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 }
 
 func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.MarkJobProcessed", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.consumer_name", consumerName),
 	))
+
 	defer span.End()
 
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	_, err := d.db.ExecContext(ctx, // Use ExecContext
+	_, err := d.db.ExecContext(ctx,
 		"INSERT INTO job_consumers (job_id, consumer_name) VALUES (?, ?)",
 		jobID, consumerName,
 	)
 	if err != nil {
 		span.RecordError(err)
 	}
+
 	return err
 }
 
-func (d *SQLiteDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.MarkJobFailedAndReschedule", trace.WithAttributes(
+func (d *SQLiteDriver) MarkJobFailedAndReschedule(
+	ctx context.Context,
+	jobID int64,
+	errorMsg string,
+	backoffDuration time.Duration,
+) error {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_failed_and_reschedule", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.error_message", errorMsg),
 		attribute.Float64("sqlq.backoff_seconds", backoffDuration.Seconds()),
 	))
+
 	defer span.End()
 
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Convert duration to seconds for SQLite datetime function
 	backoffSeconds := int(backoffDuration.Seconds())
 
-	_, err := d.db.ExecContext(ctx, // Use ExecContext
-		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = datetime('now', 'localtime', '+' || ? || ' seconds') WHERE id = ?",
+	_, err := d.db.ExecContext(ctx,
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = ?, scheduled_at = datetime('now', '+' || ? || ' seconds') WHERE id = ?",
 		errorMsg, backoffSeconds, jobID,
 	)
 	if err != nil {
@@ -248,7 +260,7 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID int
 }
 
 func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.MoveToDeadLetterQueue", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.dlq_reason", reason),
@@ -258,19 +270,18 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 	defer tx.Rollback()
 
-	// Get the job details
 	var job job
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = ?
-	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount) // Use QueryRowContext
+	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount)
 	if err != nil {
 		span.RecordError(err)
 		if err == sql.ErrNoRows {
@@ -279,19 +290,17 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 		return err
 	}
 
-	// Insert into dead letter queue
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason) // Use ExecContext
+	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
-	// Delete job from regular jobs
-	_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, job.ID) // Use ExecContext
+	_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, job.ID)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)
@@ -305,7 +314,7 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 }
 
 func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.GetDeadLetterJobs", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType), // jobType might be empty
 		attribute.Int("sqlq.limit", limit),
@@ -332,7 +341,7 @@ func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, li
 		return d.queryDeadLetterJobs(ctx, query, limit)
 	}
 
-	jobs, err := d.queryDeadLetterJobs(ctx, query, jobType, limit) // Pass context
+	jobs, err := d.queryDeadLetterJobs(ctx, query, jobType, limit)
 	if err != nil {
 		span.RecordError(err)
 	} else {
@@ -341,9 +350,8 @@ func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, li
 	return jobs, err
 }
 
-// queryDeadLetterJobs is a helper, context is passed from the caller
 func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, args ...interface{}) ([]DeadLetterJob, error) {
-	rows, err := d.db.QueryContext(ctx, query, args...) // Use QueryContext
+	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +385,7 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 }
 
 func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
-	ctx, span := d.tracer.Start(ctx, "SQLiteDriver.RequeueDeadLetterJob", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.requeue_dead_letter_job", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.dlq_id", dlqID),
 	))
@@ -386,19 +394,18 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 	defer tx.Rollback()
 
-	// Get the job from the dead letter queue
 	var dlqJob DeadLetterJob
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload
 		FROM dead_letter_queue WHERE id = ?
-	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload) // Use QueryRowContext
+	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload)
 	if err != nil {
 		span.RecordError(err)
 		if err == sql.ErrNoRows {
@@ -407,18 +414,17 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 		return err
 	}
 
-	// Insert back into the main queue with reset retry count and scheduled_at = now
+	// reset retry count and scheduled_at = now
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, scheduled_at)
-		VALUES (?, ?, 0, datetime('now', 'localtime'))
-	`, dlqJob.JobType, dlqJob.Payload) // Use ExecContext
+		VALUES (?, ?, 0, datetime('now'))
+	`, dlqJob.JobType, dlqJob.Payload)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
-	// Delete from the dead letter queue
-	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE id = ?", dlqID) // Use ExecContext
+	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE id = ?", dlqID)
 	if err != nil {
 		span.RecordError(err)
 		return err
