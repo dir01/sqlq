@@ -156,14 +156,13 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Note: SQLite doesn't support FOR UPDATE SKIP LOCKED.
-	// Locking is handled by the mutex at the driver level.
+	var scheduledAt time.Time
 	rows, err := d.db.QueryContext(ctx, `
-		SELECT j.id, j.payload, j.retry_count, j.trace_context
+		SELECT j.id, j.payload, j.retry_count, j.trace_context, j.scheduled_at
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
-		AND j.scheduled_at <= datetime('now')
+		AND j.scheduled_at <= datetime('now', 'subsec')
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT ?
@@ -181,10 +180,12 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 		var traceContextJSON sql.NullString
 		// Populate job type for potential tracing/logging later if needed
 		j.JobType = jobType
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &scheduledAt); err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
+
+		fmt.Printf("JOB SCHEDULED_AT: %s\n", scheduledAt)
 
 		// Deserialize trace context
 		j.TraceContext = make(map[string]string)
