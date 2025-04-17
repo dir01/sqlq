@@ -122,9 +122,12 @@ func TestDriverSQLite(t *testing.T) {
 			"Database time and client time should be close")
 		
 		// Test millisecond precision by inserting multiple jobs quickly
+		// Add a small sleep between insertions to ensure we get different timestamps
 		for i := 0; i < 3; i++ {
 			err := driver.InsertJob(t.Context(), "precision_test", payload, 0, traceContext)
 			require.NoError(t, err)
+			// Sleep a tiny amount to ensure different timestamps
+			time.Sleep(time.Millisecond)
 		}
 		
 		// Query the jobs and verify they have different timestamps

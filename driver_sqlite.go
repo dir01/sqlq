@@ -127,30 +127,23 @@ func (d *SQLiteDriver) InsertJob(
 	var query string
 	var args []interface{}
 
+	// Get current time in milliseconds with microsecond precision
+	nowMs := time.Now().UnixMicro() / 1000 // Convert microseconds to milliseconds but keep microsecond precision
+	
 	if delay <= 0 {
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (
-				?, ?, 
-				CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER), 
-				CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER), 
-				?
-			)
+			VALUES (?, ?, ?, ?, ?)
 		`
-		args = []interface{}{jobType, payload, string(traceContextJSON)}
+		args = []interface{}{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
 	} else {
-		// For delayed jobs, calculate the scheduled time using SQLite's datetime functions
-		delaySeconds := delay.Seconds()
+		// For delayed jobs, calculate the scheduled time
+		scheduledMs := nowMs + delay.Milliseconds()
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (
-				?, ?, 
-				CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER), 
-				CAST((strftime('%s','now', '+' || ? || ' seconds') * 1000 + strftime('%f','now', '+' || ? || ' seconds') * 1000 % 1000) AS INTEGER), 
-				?
-			)
+			VALUES (?, ?, ?, ?, ?)
 		`
-		args = []interface{}{jobType, payload, delaySeconds, delaySeconds, string(traceContextJSON)}
+		args = []interface{}{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
 	}
 
 	_, err = d.db.ExecContext(ctx, query, args...)
@@ -173,16 +166,19 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
+	// Get current time in milliseconds
+	nowMs := time.Now().UnixMilli()
+	
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT j.id, j.payload, j.retry_count, j.trace_context, j.scheduled_at
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
-		AND j.scheduled_at <= CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER)
+		AND j.scheduled_at <= ?
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT ?
-	`, consumerName, jobType, prefetchCount)
+	`, consumerName, jobType, nowMs, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -239,9 +235,12 @@ func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consum
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
+	// Get current time in milliseconds with microsecond precision
+	nowMs := time.Now().UnixMicro() / 1000
+	
 	_, err := d.db.ExecContext(ctx,
-		"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER))",
-		jobID, consumerName,
+		"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, ?)",
+		jobID, consumerName, nowMs,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -268,14 +267,17 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	backoffSeconds := backoffDuration.Seconds()
+	// Calculate new scheduled time in milliseconds
+	nowMs := time.Now().UnixMicro() / 1000
+	scheduledMs := nowMs + backoffDuration.Milliseconds()
+	
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE jobs SET 
 			retry_count = retry_count + 1, 
 			last_error = ?, 
-			scheduled_at = CAST((strftime('%s','now', '+' || ? || ' seconds') * 1000 + strftime('%f','now', '+' || ? || ' seconds') * 1000 % 1000) AS INTEGER)
+			scheduled_at = ?
 		WHERE id = ?`,
-		errorMsg, backoffSeconds, backoffSeconds, jobID,
+		errorMsg, scheduledMs, jobID,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -321,11 +323,14 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 		return err
 	}
 
+	// Get current time in milliseconds with microsecond precision
+	nowMs := time.Now().UnixMicro() / 1000
+	
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		VALUES (?, ?, ?, ?, CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER), ?, ?)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAtMs, job.RetryCount, reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, job.ID, job.JobType, job.Payload, job.CreatedAtMs, nowMs, job.RetryCount, reason)
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -452,15 +457,14 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 		return err
 	}
 
+	// Get current time in milliseconds with microsecond precision
+	nowMs := time.Now().UnixMicro() / 1000
+	
 	// reset retry count and scheduled_at = now
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)
-		VALUES (
-			?, ?, 0, 
-			CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER), 
-			CAST((strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) AS INTEGER)
-		)
-	`, dlqJob.JobType, dlqJob.Payload)
+		VALUES (?, ?, 0, ?, ?)
+	`, dlqJob.JobType, dlqJob.Payload, nowMs, nowMs)
 	if err != nil {
 		span.RecordError(err)
 		return err
