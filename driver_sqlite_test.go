@@ -34,8 +34,8 @@ func TestDriverSQLite(t *testing.T) {
 			ID          int
 			JobType     string
 			Payload     []byte
-			CreatedAt   time.Time
-			ScheduledAt time.Time
+			CreatedAt   int64
+			ScheduledAt int64
 		}
 
 		err = db.QueryRowContext(t.Context(), `
@@ -46,7 +46,16 @@ func TestDriverSQLite(t *testing.T) {
 
 		require.Equal(t, payload, job.Payload)
 		require.Equal(t, jobType, job.JobType)
-		require.Less(t, job.ScheduledAt.Sub(expectedScheduledAt), 1*time.Second)
+		
+		// Convert milliseconds to time.Time for comparison
+		scheduledAtTime := time.UnixMilli(job.ScheduledAt)
+		createdAtTime := time.UnixMilli(job.CreatedAt)
+		
+		// Verify scheduled time is approximately correct (within 1 second)
+		require.Less(t, scheduledAtTime.Sub(expectedScheduledAt).Abs(), 1*time.Second)
+		
+		// Verify created time is recent
+		require.Less(t, time.Since(createdAtTime), 5*time.Second)
 	})
 
 	t.Run("GetJobsForConsumer", func(t *testing.T) {
@@ -73,5 +82,30 @@ func TestDriverSQLite(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Equal(t, 0, len(jobs))
+	})
+	
+	t.Run("Epoch milliseconds storage", func(t *testing.T) {
+		// Insert a job
+		jobType := "epoch_test"
+		now := time.Now()
+		nowMs := now.UnixMilli()
+		
+		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
+		require.NoError(t, err)
+		
+		// Directly check the database to verify timestamps are stored as milliseconds
+		var createdAt, scheduledAt int64
+		err = db.QueryRowContext(t.Context(), 
+			"SELECT created_at, scheduled_at FROM jobs WHERE job_type = ? LIMIT 1", 
+			jobType).Scan(&createdAt, &scheduledAt)
+		require.NoError(t, err)
+		
+		// Verify timestamps are stored as milliseconds since epoch
+		// They should be close to current time
+		require.Greater(t, createdAt, nowMs-5000) // Within 5 seconds before test
+		require.Less(t, createdAt, nowMs+5000)    // Within 5 seconds after test
+		
+		// For a job with no delay, scheduled_at should be same as created_at
+		require.InDelta(t, createdAt, scheduledAt, 100) // Allow small delta for processing time
 	})
 }
