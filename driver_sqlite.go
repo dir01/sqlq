@@ -130,7 +130,12 @@ func (d *SQLiteDriver) InsertJob(
 	if delay <= 0 {
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (?, ?, (strftime('%s','now') * 1000), (strftime('%s','now') * 1000), ?)
+			VALUES (
+				?, ?, 
+				(strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000), 
+				(strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000), 
+				?
+			)
 		`
 		args = []interface{}{jobType, payload, string(traceContextJSON)}
 	} else {
@@ -140,13 +145,12 @@ func (d *SQLiteDriver) InsertJob(
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
 			VALUES (
 				?, ?, 
-				(strftime('%s','now') * 1000), 
-				(strftime('%s','now', '+' || ? || ' seconds') * 1000), 
+				(strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000), 
+				(strftime('%s','now', '+' || ? || ' seconds') * 1000 + strftime('%f','now', '+' || ? || ' seconds') * 1000 % 1000), 
 				?
 			)
 		`
-		args = []interface{}{jobType, payload, delaySeconds, string(traceContextJSON)}
-		fmt.Printf("QUERY: %s", query)
+		args = []interface{}{jobType, payload, delaySeconds, delaySeconds, string(traceContextJSON)}
 	}
 
 	_, err = d.db.ExecContext(ctx, query, args...)
@@ -174,7 +178,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 		FROM jobs j
 		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
-		AND j.scheduled_at <= (strftime('%s','now') * 1000)
+		AND j.scheduled_at <= (strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000)
 		AND jc.job_id IS NULL
 		ORDER BY j.id
 		LIMIT ?
@@ -236,7 +240,7 @@ func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consum
 	defer d.mutex.Unlock()
 
 	_, err := d.db.ExecContext(ctx,
-		"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, (strftime('%s','now') * 1000))",
+		"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, (strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000))",
 		jobID, consumerName,
 	)
 	if err != nil {
@@ -269,9 +273,9 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 		`UPDATE jobs SET 
 			retry_count = retry_count + 1, 
 			last_error = ?, 
-			scheduled_at = (strftime('%s','now', '+' || ? || ' seconds') * 1000) 
+			scheduled_at = (strftime('%s','now', '+' || ? || ' seconds') * 1000 + strftime('%f','now', '+' || ? || ' seconds') * 1000 % 1000) 
 		WHERE id = ?`,
-		errorMsg, backoffSeconds, jobID,
+		errorMsg, backoffSeconds, backoffSeconds, jobID,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -320,7 +324,7 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		VALUES (?, ?, ?, ?, (strftime('%s','now') * 1000), ?, ?)
+		VALUES (?, ?, ?, ?, (strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000), ?, ?)
 	`, job.ID, job.JobType, job.Payload, job.CreatedAtMs, job.RetryCount, reason)
 	if err != nil {
 		span.RecordError(err)
@@ -451,7 +455,11 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 	// reset retry count and scheduled_at = now
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)
-		VALUES (?, ?, 0, (strftime('%s','now') * 1000), (strftime('%s','now') * 1000))
+		VALUES (
+			?, ?, 0, 
+			(strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000), 
+			(strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000)
+		)
 	`, dlqJob.JobType, dlqJob.Payload)
 	if err != nil {
 		span.RecordError(err)
