@@ -129,7 +129,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 			backoff := math.Pow(2, float64(retryNum))
 			return time.Duration(backoff+jitter) * time.Second
 		},
-		defaultPollInterval: 1 * time.Second,
+		defaultPollInterval: 100 * time.Millisecond, // Reduced for faster polling
 		tracer:              otel.Tracer(tracerName), // Initialize the tracer
 	}
 
