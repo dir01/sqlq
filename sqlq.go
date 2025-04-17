@@ -352,8 +352,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 		),
 		trace.WithSpanKind(trace.SpanKindConsumer),
 	)
-
-	defer consumeSpan.End()
+	defer consumeSpan.End() // Ensure span is always ended
 
 	tx, err := q.db.BeginTx(consumeCtx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
