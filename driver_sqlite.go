@@ -129,9 +129,11 @@ func (d *SQLiteDriver) InsertJob(
 		query = "INSERT INTO jobs (job_type, payload, trace_context) VALUES (?, ?, ?)"
 		args = []interface{}{jobType, payload, string(traceContextJSON)}
 	} else {
-		delaySeconds := int(delay.Seconds())
+		// Use float64 for seconds to support sub-second precision in SQLite datetime modifier
+		delaySecondsFloat := delay.Seconds()
 		query = "INSERT INTO jobs (job_type, payload, scheduled_at, trace_context) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'), ?)"
-		args = []interface{}{jobType, payload, delaySeconds, string(traceContextJSON)}
+		// Pass the float64 directly; SQLite's '+' modifier handles fractional seconds.
+		args = []interface{}{jobType, payload, delaySecondsFloat, string(traceContextJSON)}
 	}
 
 	_, err = d.db.ExecContext(ctx, query, args...)
