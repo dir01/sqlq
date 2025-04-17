@@ -126,7 +126,7 @@ func (d *SQLiteDriver) InsertJob(
 	// and calculate scheduled time based on delay
 	var query string
 	var args []interface{}
-	
+
 	if delay <= 0 {
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
@@ -146,6 +146,7 @@ func (d *SQLiteDriver) InsertJob(
 			)
 		`
 		args = []interface{}{jobType, payload, delaySeconds, string(traceContextJSON)}
+		fmt.Printf("QUERY: %s", query)
 	}
 
 	_, err = d.db.ExecContext(ctx, query, args...)
@@ -190,15 +191,15 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 		var j job
 		var traceContextJSON sql.NullString
 		var scheduledAtMs int64
-		// Populate job type for potential tracing/logging later if needed
 		j.JobType = jobType
 		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &scheduledAtMs); err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 
-		scheduledAt := time.UnixMilli(scheduledAtMs)
-		fmt.Printf("JOB SCHEDULED_AT: %s\n", scheduledAt)
+		ms := time.Now().UnixNano() / int64(time.Millisecond)
+		fmt.Printf("NOW MS: %d\n", ms)
+		fmt.Printf("JOB SCHEDULED_AT: %d\n", scheduledAtMs)
 
 		// Deserialize trace context
 		j.TraceContext = make(map[string]string)
@@ -297,13 +298,13 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	defer tx.Rollback()
 
 	var job struct {
-		ID         int64
-		JobType    string
-		Payload    []byte
+		ID          int64
+		JobType     string
+		Payload     []byte
 		CreatedAtMs int64
-		RetryCount int
+		RetryCount  int
 	}
-	
+
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = ?
@@ -387,7 +388,7 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 	for rows.Next() {
 		var j DeadLetterJob
 		var createdAtMs, failedAtMs int64
-		
+
 		if err := rows.Scan(
 			&j.ID,
 			&j.OriginalID,
@@ -401,11 +402,11 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 			// Don't record error in span here, let the caller handle it
 			return nil, err
 		}
-		
+
 		// Convert milliseconds to time.Time
 		j.CreatedAt = time.UnixMilli(createdAtMs)
 		j.FailedAt = time.UnixMilli(failedAtMs)
-		
+
 		jobs = append(jobs, j)
 	}
 
