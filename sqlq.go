@@ -94,11 +94,6 @@ type job struct {
 	TraceContext map[string]string // For trace propagation
 }
 
-func (j job) String() string {
-	bytes, _ := json.MarshalIndent(j, "", " ")
-	return string(bytes)
-}
-
 // DeadLetterJob represents a job that has been moved to the dead letter queue
 type DeadLetterJob struct {
 	ID            int64
@@ -129,7 +124,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 			backoff := math.Pow(2, float64(retryNum))
 			return time.Duration(backoff+jitter) * time.Second
 		},
-		defaultPollInterval: 100 * time.Millisecond, // Reduced for faster polling
+		defaultPollInterval: 100 * time.Millisecond,  // Reduced for faster polling
 		tracer:              otel.Tracer(tracerName), // Initialize the tracer
 	}
 
@@ -279,8 +274,8 @@ func (q *sqlq) Consume(
 }
 
 func (q *sqlq) pollConsumer(cons *consumer) {
-	timer := time.NewTimer(cons.pollInterval)
-	defer timer.Stop()
+	ticker := time.NewTicker(cons.pollInterval)
+	defer ticker.Stop()
 	defer cons.workerWg.Done()
 
 	var attempt uint
@@ -313,7 +308,7 @@ func (q *sqlq) pollConsumer(cons *consumer) {
 		case <-q.shutdown:
 			// Check global shutdown signal
 			return
-		case <-timer.C:
+		case <-ticker.C:
 			// Timer expired, continue to next poll
 			continue
 		}

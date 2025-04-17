@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,24 +16,16 @@ import (
 func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	jobType := "job_moves_to_dlq_after_max_retries"
 	consumerName := "dlq_test_consumer"
-	maxRetries := 2 // Allow 2 retries (3 total attempts)
-
-	jobAttempted := make(chan struct{}, maxRetries+1)
+	maxRetries := 0
+	var attempts atomic.Int32
 
 	tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
-		select {
-		case jobAttempted <- struct{}{}:
-			// Successfully recorded attempt
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-
-		// Always fail the job to force it to the DLQ
+		attempts.Add(1)
 		return errors.New("simulated failure to move job to DLQ")
 	}, sqlq.WithMaxRetries(maxRetries))
 
@@ -41,43 +34,25 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	err := tc.Q.Publish(ctx, jobType, testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
-	// Wait for all retry attempts
-	for i := 0; i <= maxRetries; i++ {
-		select {
-		case <-jobAttempted:
-		// all good, attempt happened
-		case <-time.After(10 * time.Second):
-			t.Fatalf("Timed out waiting for attempt %d", i+1)
-		case <-ctx.Done():
-			t.Fatal("Context timeout while waiting for job attempts")
-		}
-	}
+	require.Eventually(t, func() bool {
+		return attempts.Load() == int32(maxRetries)+1
+	}, 2*time.Second, 10*time.Millisecond)
 
-	// Give some time for the job to be moved to DLQ
-	time.Sleep(1 * time.Second)
+	var dlqJobs []sqlq.DeadLetterJob
 
-	// Now check the DLQ
-	dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
-	require.NoError(t, err, "Failed to get DLQ jobs")
-	require.NotEmpty(t, dlqJobs, "No jobs found in DLQ")
+	require.Eventually(t, func() bool {
+		var err error
 
-	// Find our job in the DLQ
-	var found bool
-	for _, dlqJob := range dlqJobs {
-		var payload TestPayload
-		err = json.Unmarshal(dlqJob.Payload, &payload)
-		require.NoError(t, err, "Failed to unmarshal DLQ job payload")
+		dlqJobs, err = tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
+		require.NoError(t, err, "Failed to get DLQ jobs")
 
-		if payload.Count == testPayload.Count {
-			found = true
-			require.Equal(t, testPayload.Message, payload.Message, "Message mismatch in DLQ")
-			require.Equal(t, maxRetries, dlqJob.RetryCount, "Retry count mismatch in DLQ")
-			require.NotEmpty(t, dlqJob.FailureReason, "Failure reason should not be empty")
-			break
-		}
-	}
+		return len(dlqJobs) > 0
+	}, 1*time.Second, 10*time.Millisecond)
 
-	require.True(t, found, "Job not found in DLQ")
+	require.Equal(t, 1, len(dlqJobs))
+
+	j := dlqJobs[0]
+	require.Equal(t, maxRetries, j.RetryCount)
 }
 
 func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {

@@ -14,47 +14,34 @@ import (
 )
 
 func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
-	start := time.Now()
-	// Create channels to track job processing attempts
-	jobAttempts := make(chan int, 5) // Buffer for multiple attempts
-
-	// Use atomic counter to avoid race conditions
-	var attemptCount int32 = 0
+	var attemptCount atomic.Int32
+	jobAttempts := make(chan int, 5)
 	maxRetries := 2 // We'll allow 2 retries (3 total attempts)
 
 	// Consume the queue
 	tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
-		t.Logf("[%.2fs] Recieved payload: %s", time.Since(start).Seconds(), string(payloadBytes))
-
-		var payload TestPayload
-		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-			t.Errorf("Failed to unmarshal payload: %v", err)
-			return err
-		}
-
-		count := atomic.AddInt32(&attemptCount, 1)
+		count := attemptCount.Add(1)
 		jobAttempts <- int(count)
 
-		// Fail the job for the first two attempts
+		// For first attempt, count is 1 (since .Add has already happened)
+		// For first retry, count is 2
 		if count <= int32(maxRetries) {
+			// failed on first attempt and first retry
 			return errors.New("simulated failure")
 		}
 
-		// Succeed on the third attempt
 		return nil
 	}, sqlq.WithMaxRetries(maxRetries))
 
 	// Create a payload
-	payload := TestPayload{
-		Message: "This job will be retried",
-		Count:   100,
-	}
+	payload := TestPayload{Message: "This job will be retried", Count: 100}
 
 	// Publish a job with retry configuration
 	err := tc.Q.Publish(ctx, "retry_job", payload)
-	require.NoError(t, err, "Failed to publish job with retries")
+	require.NoError(t, err)
 
 	timeout := time.NewTimer(1 * time.Second)
+	start := time.Now()
 
 	// Wait for first attempt
 	select {
@@ -74,7 +61,7 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	}
 
 	// Wait for third attempt (second retry)
-	timeout.Reset(2 * time.Second)
+	timeout.Reset(1 * time.Second)
 	select {
 	case attempt := <-jobAttempts:
 		require.Equal(t, 3, attempt, "Expected third attempt")
@@ -83,7 +70,8 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	}
 
 	// Make sure we don't get a fourth attempt
-	timeout.Reset(1 * time.Second)
+	totalTimeSoFar := time.Since(start)
+	timeout.Reset(totalTimeSoFar * 4)
 	select {
 	case attempt := <-jobAttempts:
 		t.Fatalf("Unexpected fourth attempt: %d", attempt)
@@ -163,9 +151,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	timeout.Reset(1 * time.Second)
 	select {
 	case <-jobAttempts:
-		// If we get here, it means we got an unexpected third attempt
-		// But we won't fail the test because this is flaky in containers
-		t.Log("Note: Got unexpected third attempt, but this can happen due to timing issues")
+		t.Fatal("Got unexpected third attempt")
 	case <-timeout.C:
 		// This is the expected path - no more retries
 	case <-ctx.Done():

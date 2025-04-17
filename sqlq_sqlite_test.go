@@ -21,7 +21,7 @@ func TestSQLite(t *testing.T) {
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithBackoffFunc(func(i int) time.Duration { return 0 }),
-		sqlq.WithPollInterval(1*time.Millisecond),
+		sqlq.WithPollInterval(25*time.Millisecond),
 		sqlq.WithTracer(tracer),
 	)
 	require.NoError(t, err)
@@ -29,14 +29,8 @@ func TestSQLite(t *testing.T) {
 	q.Run()
 
 	t.Cleanup(func() {
-
-		t.Logf("[%s] Stop tracer", time.Now().String())
 		assert.NoError(t, stopTracer())
-
-		t.Logf("[%s] Shutting down queue", time.Now().String())
 		q.Shutdown()
-
-		t.Logf("[%s] Closing database", time.Now().String())
 		assert.NoError(t, db.Close())
 	})
 

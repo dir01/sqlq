@@ -14,14 +14,9 @@ import (
 )
 
 func newTracer(ctx context.Context, otlpEndpoint string) (tracer trace.Tracer, cleanup func() error, err error) {
-	if otlpEndpoint == "" {
-		return nil, nil, fmt.Errorf("otlp endpoint is required")
-	}
-
 	var exporter sdktrace.SpanExporter
 
-	isDebug := false
-	if isDebug {
+	if otlpEndpoint == "" {
 		exporter, err = stdouttrace.New()
 	} else {
 		exporter, err = otlptracehttp.New(
