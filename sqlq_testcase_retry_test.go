@@ -34,7 +34,7 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	}, sqlq.WithMaxRetries(maxRetries))
 
 	// Create a payload
-	payload := TestPayload{Message: "This job will be retried", Count: 100}
+	payload := TestPayload{Message: "TestRetry"}
 
 	// Publish a job with retry configuration
 	err := tc.Q.Publish(ctx, "retry_job", payload)
@@ -71,6 +71,8 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 
 	// Make sure we don't get a fourth attempt
 	totalTimeSoFar := time.Since(start)
+	// The idea is that if we take all the time that it took to complete previous 3 attempts
+	// Then 4 times as long should be more than enough to make sure that 4th attempt does not happen
 	timeout.Reset(totalTimeSoFar * 4)
 	select {
 	case attempt := <-jobAttempts:
