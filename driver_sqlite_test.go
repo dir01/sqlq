@@ -154,4 +154,46 @@ func TestDriverSQLite(t *testing.T) {
 		require.Greater(t, len(uniqueTimestamps), 1, 
 			"Should have at least 2 different timestamps, indicating millisecond precision")
 	})
+
+	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
+		jobType := "concurrent_race_test"
+		consumerName := "race-consumer"
+		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
+		require.NoError(t, err, "Failed to insert job for race test")
+
+		// Simulate first consumer fetching the job
+		jobs1, err := driver.GetJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		require.NoError(t, err, "First GetJobsForConsumer call failed")
+		require.Len(t, jobs1, 1, "First GetJobsForConsumer should fetch 1 job")
+		jobID1 := jobs1[0].ID
+
+		// Simulate second consumer (or same consumer polling again quickly)
+		// *before* the first one marks the job as processed
+		jobs2, err := driver.GetJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		require.NoError(t, err, "Second GetJobsForConsumer call failed")
+
+		// *** This is the assertion that should FAIL with the current driver logic ***
+		// It demonstrates that the job was fetched again before being marked processed.
+		require.Len(t, jobs2, 0, "Second GetJobsForConsumer should fetch 0 jobs as it's already fetched by the first")
+
+		// If the above assertion passes (meaning the bug is fixed),
+		// we can proceed to mark the first job processed.
+		// If the assertion failed (current state), the following lines might
+		// not be reached, or jobs2 might contain the same job.
+
+		err = driver.MarkJobProcessed(t.Context(), jobID1, consumerName)
+		require.NoError(t, err, "Marking job processed for the first time failed")
+
+		// If jobs2 incorrectly contained the job, attempting to mark it
+		// processed again would cause the UNIQUE constraint error.
+		// This check is secondary to the len(jobs2) == 0 check above.
+		if len(jobs2) > 0 {
+			jobID2 := jobs2[0].ID
+			require.NotEqual(t, jobID1, jobID2, "If second fetch got a job, it shouldn't be the same ID (this indicates a deeper issue or test setup problem)")
+			// Or, if we expect the *same* job ID due to the race:
+			// require.Equal(t, jobID1, jobID2, "Second fetch got the same job ID due to race condition")
+			// err = driver.MarkJobProcessed(t.Context(), jobID2, consumerName)
+			// require.Error(t, err, "Marking the *same* job processed a second time should fail due to UNIQUE constraint")
+		}
+	})
 }
