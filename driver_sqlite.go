@@ -164,7 +164,6 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Get current time in milliseconds
 	nowMs := time.Now().UnixMilli()
 
 	rows, err := d.db.QueryContext(ctx, `
