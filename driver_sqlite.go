@@ -184,7 +184,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 
 	defer rows.Close()
 
-	var jobs []job
+	var potentialJobs []job // Store potential jobs first
 	for rows.Next() {
 		var j job
 		var traceContextJSON sql.NullString
@@ -204,17 +204,57 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 				j.TraceContext = make(map[string]string)
 			}
 		}
-
-		jobs = append(jobs, j)
+		potentialJobs = append(potentialJobs, j)
 	}
-	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobs)))
-
 	if err := rows.Err(); err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
+	rows.Close() // Close rows explicitly before starting transaction
 
-	return jobs, nil
+	// Now, try to "lock" the potential jobs by inserting into job_consumers
+	var jobsToReturn []job
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
+		return nil, err
+	}
+	defer tx.Rollback() // Rollback if commit fails or not reached
+
+	processedAtPlaceholder := 0 // Use 0 to indicate "processing" state
+
+	for _, j := range potentialJobs {
+		// Attempt to insert a placeholder row to lock the job for this consumer
+		_, err := tx.ExecContext(ctx,
+			"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, ?)",
+			j.ID, consumerName, processedAtPlaceholder,
+		)
+		if err == nil {
+			// Successfully inserted placeholder, job is now "locked" for us
+			jobsToReturn = append(jobsToReturn, j)
+			if len(jobsToReturn) >= prefetchCount {
+				break // Reached prefetch limit
+			}
+		} else {
+			// Check if the error is a UNIQUE constraint violation
+			// We need to import "github.com/mattn/go-sqlite3" to check the error type robustly
+			// For simplicity here, we assume any error means we couldn't lock it.
+			// A production system might check sqlite3.ErrConstraintUnique specifically.
+			span.AddEvent("Failed to acquire lock for job", trace.WithAttributes(
+				attribute.Int64("sqlq.job_id", j.ID),
+				attribute.String("error", err.Error()),
+			))
+			// Job likely locked or processed by another consumer, skip it.
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		span.RecordError(fmt.Errorf("failed to commit transaction for locking jobs: %w", err))
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobsToReturn)))
+	return jobsToReturn, nil
 }
 
 func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
@@ -229,15 +269,36 @@ func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consum
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	// Get current time in milliseconds with microsecond precision
-	nowMs := time.Now().UnixMicro() / 1000
+	// Get current time in milliseconds
+	nowMs := time.Now().UnixMilli()
+	processedAtPlaceholder := 0 // Must match the placeholder used in GetJobsForConsumer
 
-	_, err := d.db.ExecContext(ctx,
-		"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, ?)",
-		jobID, consumerName, nowMs,
+	res, err := d.db.ExecContext(ctx,
+		`UPDATE job_consumers 
+		 SET processed_at = ? 
+		 WHERE job_id = ? AND consumer_name = ? AND processed_at = ?`,
+		nowMs, jobID, consumerName, processedAtPlaceholder,
 	)
 	if err != nil {
 		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to update job_consumers")
+		return err
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		// This could happen if:
+		// 1. The job was already marked processed (processed_at != 0).
+		// 2. The job failed and was rescheduled (placeholder row deleted).
+		// 3. The job ID or consumer name is incorrect.
+		// Log this as it might indicate an unexpected state or double processing attempt.
+		span.AddEvent("MarkJobProcessed found no matching 'processing' row to update", trace.WithAttributes(
+			attribute.Int64("sqlq.job_id", jobID),
+			attribute.String("sqlq.consumer_name", consumerName),
+		))
+		// Depending on desired strictness, you might return an error here.
+		// return fmt.Errorf("no processing job found for job_id %d and consumer %s to mark as processed", jobID, consumerName)
+	} else {
 		span.SetStatus(codes.Error, "failed to mark job as processed")
 	}
 
@@ -262,11 +323,19 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
+		return err
+	}
+	defer tx.Rollback()
+
 	// Calculate new scheduled time in milliseconds
-	nowMs := time.Now().UnixMicro() / 1000
+	nowMs := time.Now().UnixMilli()
 	scheduledMs := nowMs + backoffDuration.Milliseconds()
 
-	_, err := d.db.ExecContext(ctx,
+	// Update the job itself
+	_, err = tx.ExecContext(ctx,
 		`UPDATE jobs SET 
 			retry_count = retry_count + 1, 
 			last_error = ?, 
@@ -275,7 +344,26 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 		errorMsg, scheduledMs, jobID,
 	)
 	if err != nil {
-		span.RecordError(err)
+		span.RecordError(fmt.Errorf("failed to update jobs table on reschedule: %w", err))
+		return err
+	}
+
+	// Remove the "processing" placeholder from job_consumers
+	processedAtPlaceholder := 0 // Must match the placeholder used in GetJobsForConsumer
+	_, err = tx.ExecContext(ctx,
+		"DELETE FROM job_consumers WHERE job_id = ? AND processed_at = ?",
+		jobID, processedAtPlaceholder,
+	)
+	if err != nil {
+		// Log the error but don't necessarily fail the whole operation,
+		// as the job update is the critical part. The placeholder might be missing
+		// if something went wrong previously.
+		span.RecordError(fmt.Errorf("failed to delete placeholder from job_consumers on reschedule (job_id: %d): %w", jobID, err))
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to commit transaction for reschedule: %w", err))
 	}
 	return err
 }
