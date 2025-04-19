@@ -70,10 +70,10 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	}
 
 	// Make sure we don't get a fourth attempt
-	totalTimeSoFar := time.Since(start)
+	enoughTime := time.Since(start) * 4
 	// The idea is that if we take all the time that it took to complete previous 3 attempts
 	// Then 4 times as long should be more than enough to make sure that 4th attempt does not happen
-	timeout.Reset(totalTimeSoFar * 4)
+	timeout.Reset(enoughTime)
 	select {
 	case attempt := <-jobAttempts:
 		t.Fatalf("Unexpected fourth attempt: %d", attempt)
@@ -126,6 +126,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	require.NoError(t, err, "Failed to publish job with retries")
 
 	timeout := time.NewTimer(1 * time.Second)
+	start := time.Now()
 
 	// Wait for first attempt
 	select {
@@ -150,7 +151,8 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 
 	// We should not get a third attempt (max retries exceeded)
 	// But we'll wait a reasonable time to be sure
-	timeout.Reset(1 * time.Second)
+	enoughTime := time.Since(start) * 4
+	timeout.Reset(enoughTime)
 	select {
 	case <-jobAttempts:
 		t.Fatal("Got unexpected third attempt")

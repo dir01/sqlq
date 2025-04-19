@@ -46,14 +46,14 @@ func TestDriverSQLite(t *testing.T) {
 
 		require.Equal(t, payload, job.Payload)
 		require.Equal(t, jobType, job.JobType)
-		
+
 		// Convert milliseconds to time.Time for comparison
 		scheduledAtTime := time.UnixMilli(job.ScheduledAt)
 		createdAtTime := time.UnixMilli(job.CreatedAt)
-		
+
 		// Verify scheduled time is approximately correct (within 1 second)
 		require.Less(t, scheduledAtTime.Sub(expectedScheduledAt).Abs(), 1*time.Second)
-		
+
 		// Verify created time is recent
 		require.Less(t, time.Since(createdAtTime), 5*time.Second)
 	})
@@ -83,44 +83,43 @@ func TestDriverSQLite(t *testing.T) {
 
 		require.Equal(t, 0, len(jobs))
 	})
-	
-	t.Run("Epoch milliseconds storage", func(t *testing.T) {
-		// Insert a job
+
+	t.Run("Millisecond time precision", func(t *testing.T) {
 		jobType := "epoch_test"
 		now := time.Now()
 		nowMs := now.UnixMilli()
-		
+
 		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
 		require.NoError(t, err)
-		
+
 		// Directly check the database to verify timestamps are stored as milliseconds
 		var createdAt, scheduledAt int64
-		err = db.QueryRowContext(t.Context(), 
-			"SELECT created_at, scheduled_at FROM jobs WHERE job_type = ? LIMIT 1", 
+		err = db.QueryRowContext(t.Context(),
+			"SELECT created_at, scheduled_at FROM jobs WHERE job_type = ? LIMIT 1",
 			jobType).Scan(&createdAt, &scheduledAt)
 		require.NoError(t, err)
-		
+
 		// Verify timestamps are stored as milliseconds since epoch
 		// They should be close to current time
 		require.Greater(t, createdAt, nowMs-5000) // Within 5 seconds before test
 		require.Less(t, createdAt, nowMs+5000)    // Within 5 seconds after test
-		
+
 		// For a job with no delay, scheduled_at should be same as created_at
 		require.Equal(t, createdAt, scheduledAt, "For immediate jobs, created_at and scheduled_at should be identical")
-		
+
 		// Verify that SQLite's timestamp function works as expected with millisecond precision
 		var dbTimeMs float64 // Changed from int64 to float64 to match SQLite's return type
-		err = db.QueryRowContext(t.Context(), 
+		err = db.QueryRowContext(t.Context(),
 			"SELECT (strftime('%s','now') * 1000 + strftime('%f','now') * 1000 % 1000) as current_time").Scan(&dbTimeMs)
 		require.NoError(t, err)
-		
+
 		// Convert to int64 after scanning
 		dbTimeMsInt := int64(dbTimeMs)
-		
+
 		// DB time should be close to our time
-		require.Less(t, time.UnixMilli(dbTimeMsInt).Sub(now).Abs(), 2*time.Second, 
+		require.Less(t, time.UnixMilli(dbTimeMsInt).Sub(now).Abs(), 2*time.Second,
 			"Database time and client time should be close")
-		
+
 		// Test millisecond precision by inserting multiple jobs quickly
 		// Add a small sleep between insertions to ensure we get different timestamps
 		for i := 0; i < 3; i++ {
@@ -129,29 +128,29 @@ func TestDriverSQLite(t *testing.T) {
 			// Sleep a tiny amount to ensure different timestamps
 			time.Sleep(time.Millisecond)
 		}
-		
+
 		// Query the jobs and verify they have different timestamps
-		rows, err := db.QueryContext(t.Context(), 
+		rows, err := db.QueryContext(t.Context(),
 			"SELECT created_at FROM jobs WHERE job_type = 'precision_test' ORDER BY created_at")
 		require.NoError(t, err)
 		defer rows.Close()
-		
+
 		var timestamps []int64
 		for rows.Next() {
 			var ts int64
 			require.NoError(t, rows.Scan(&ts))
 			timestamps = append(timestamps, ts)
 		}
-		
+
 		require.Len(t, timestamps, 3, "Should have 3 precision test jobs")
-		
+
 		// At least some of the timestamps should be different if we have millisecond precision
 		// (This is a probabilistic test, but with millisecond precision it's extremely likely to pass)
 		uniqueTimestamps := make(map[int64]bool)
 		for _, ts := range timestamps {
 			uniqueTimestamps[ts] = true
 		}
-		require.Greater(t, len(uniqueTimestamps), 1, 
+		require.Greater(t, len(uniqueTimestamps), 1,
 			"Should have at least 2 different timestamps, indicating millisecond precision")
 	})
 
