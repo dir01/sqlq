@@ -21,19 +21,20 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 	// Consume the queue
 	tc.Q.Consume(ctx, "test_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
+
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			t.Errorf("Failed to unmarshal payload: %v", err)
 			return err
 		}
 
 		receivedPayload = payload
-
 		jobProcessed <- true
+
 		return nil
 	})
 
-	// Publish a job
-	testPayload := TestPayload{Message: "Hello, World!", Count: 42}
+	testPayload := TestPayload{Message: "Hello, World!"}
+
 	err := tc.Q.Publish(ctx, "test_job", testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
@@ -41,7 +42,7 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 	select {
 	case <-jobProcessed:
 		// Job was processed
-	case <-time.After(5 * time.Second):
+	case <-time.After(1 * time.Second):
 		t.Fatal("Timed out waiting for job to be processed")
 	}
 

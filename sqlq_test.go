@@ -1,6 +1,9 @@
 package sqlq_test
 
 import (
+	"context"
+	"time"
+
 	"github.com/dir01/sqlq"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
@@ -18,4 +21,20 @@ type TestPayload struct {
 // This solution aims at providing an easy way to run and debug individual tests while sharing test logic
 type TestCase struct {
 	Q sqlq.JobsQueue
+}
+
+// GracefulContext creates a context that inherits values from its parent
+// and cancels gracePeriod after the parent context is cancelled.
+func GracefulContext(parentCtx context.Context, gracePeriod time.Duration) context.Context {
+	newCtx := context.WithoutCancel(parentCtx)
+	newCtx, newCancel := context.WithCancel(newCtx)
+
+	go func() {
+		<-parentCtx.Done()
+		t := time.NewTimer(gracePeriod)
+		<-t.C
+		newCancel()
+	}()
+
+	return newCtx
 }

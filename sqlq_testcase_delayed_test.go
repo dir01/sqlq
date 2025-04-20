@@ -10,22 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// GracefulContext creates a context that inherits values from its parent
-// and cancels gracePeriod after the parent context is cancelled.
-func GracefulContext(parentCtx context.Context, gracePeriod time.Duration) context.Context {
-	newCtx := context.WithoutCancel(parentCtx)
-	newCtx, newCancel := context.WithCancel(newCtx)
-
-	go func() {
-		<-parentCtx.Done()
-		t := time.NewTimer(gracePeriod)
-		<-t.C
-		newCancel()
-	}()
-
-	return newCtx
-}
-
 func (tc *TestCase) TestDelayedJobExecution(ctx context.Context, t *testing.T) {
 	t.Helper()
 
