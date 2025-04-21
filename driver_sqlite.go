@@ -48,7 +48,8 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 			scheduled_at INTEGER NOT NULL, -- Milliseconds since epoch
 			retry_count INTEGER DEFAULT 0,
 			last_error TEXT,
-			trace_context TEXT -- Added for trace propagation
+			trace_context TEXT, -- Added for trace propagation
+			consumed_at INTEGER -- Milliseconds since epoch, indicates when the job was consumed
 		)`,
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
@@ -170,13 +171,12 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT j.id, j.payload, j.retry_count, j.trace_context, j.scheduled_at
 		FROM jobs j
-		LEFT JOIN job_consumers jc ON j.id = jc.job_id AND jc.consumer_name = ?
 		WHERE j.job_type = ? 
 		AND j.scheduled_at <= ?
-		AND jc.job_id IS NULL
+		AND j.consumed_at IS NULL
 		ORDER BY j.id
 		LIMIT ?
-	`, consumerName, jobType, nowMs, prefetchCount)
+	`, jobType, nowMs, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -221,13 +221,11 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	}
 	defer tx.Rollback() // Rollback if commit fails or not reached
 
-	processedAtPlaceholder := 0 // Use 0 to indicate "processing" state
-
 	for _, j := range potentialJobs {
-		// Attempt to insert a placeholder row to lock the job for this consumer
+		// Attempt to update the job to lock it for this consumer
 		_, err := tx.ExecContext(ctx,
-			"INSERT INTO job_consumers (job_id, consumer_name, processed_at) VALUES (?, ?, ?)",
-			j.ID, consumerName, processedAtPlaceholder,
+			"UPDATE jobs SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+			nowMs, j.ID,
 		)
 		if err == nil {
 			// Successfully inserted placeholder, job is now "locked" for us
@@ -339,6 +337,7 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 		`UPDATE jobs SET 
 			retry_count = retry_count + 1, 
 			last_error = ?, 
+			consumed_at = NULL,
 			scheduled_at = ?
 		WHERE id = ?`,
 		errorMsg, scheduledMs, jobID,

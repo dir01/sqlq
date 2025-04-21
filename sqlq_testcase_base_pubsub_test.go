@@ -4,10 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
+	"github.com/dir01/sqlq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,29 +59,16 @@ func (tc *TestCase) TestBasicPubMultiSub(ctx context.Context, t *testing.T) {
 	consumer2Processed := make(chan bool, 1)
 
 	// Consume the first queue
-	tc.Q.Consume(ctx, "shared_job", "consumer1", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "shared_job", "consumer1", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		consumer1Processed <- true
 		return nil
 	})
+	require.NoError(t, err)
 
 	// Consume the second queue
-	tc.Q.Consume(ctx, "shared_job", "consumer2", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err = tc.Q.Consume(ctx, "shared_job", "consumer2", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		consumer2Processed <- true
 		return nil
 	})
-
-	// Publish a job
-	err := tc.Q.Publish(ctx, "shared_job", TestPayload{Message: "Shared job", Count: 100})
-	require.NoError(t, err, "Failed to publish shared job")
-
-	// Wait for both consumers to process the job
-	for i, ch := range []chan bool{consumer1Processed, consumer2Processed} {
-		consumerName := fmt.Sprintf("consumer%d", i+1)
-		select {
-		case <-ch:
-			// Job was processed by this consumer
-		case <-time.After(5 * time.Second):
-			t.Fatalf("Timed out waiting for job to be processed by %s", consumerName)
-		}
-	}
+	require.ErrorIs(t, err, sqlq.ErrDuplicateConsumer)
 }

@@ -42,7 +42,8 @@ func (d *PostgresDriver) InitSchema(ctx context.Context) error {
 			scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER DEFAULT 0,
 			last_error TEXT,
-			trace_context JSONB -- Added for trace propagation (using JSONB for efficiency)
+			trace_context JSONB, -- Added for trace propagation (using JSONB for efficiency)
+			consumed_at TIMESTAMP NULL -- Indicates when the job was consumed
 		)`,
 
 		`CREATE TABLE IF NOT EXISTS job_consumers (
@@ -146,15 +147,12 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	rows, err := d.db.QueryContext(ctx, `
 		SELECT j.id, j.payload, j.retry_count, j.trace_context
 		FROM jobs j
-		LEFT JOIN job_consumers jc 
-		ON j.id = jc.job_id 
-			AND jc.consumer_name = $1
-		WHERE j.job_type = $2
+		WHERE j.job_type = $1
 			AND j.scheduled_at <= NOW()
-			AND jc.job_id IS NULL
+			AND j.consumed_at IS NULL
 		ORDER BY j.id
-		LIMIT $3
-	`, consumerName, jobType, prefetchCount)
+		LIMIT $2
+	`, jobType, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("failed to select potential jobs: %w", err)
@@ -199,17 +197,17 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO job_consumers (job_id, consumer_name, processed_at) 
-		VALUES ($1, $2, NULL) 
-		ON CONFLICT (job_id, consumer_name) DO NOTHING`)
+		UPDATE jobs
+		SET consumed_at = NOW()
+		WHERE id = $1 AND consumed_at IS NULL`)
 	if err != nil {
-		span.RecordError(fmt.Errorf("failed to prepare insert statement for locking: %w", err))
+		span.RecordError(fmt.Errorf("failed to prepare update statement for locking: %w", err))
 		return nil, err
 	}
 	defer stmt.Close()
 
 	for _, j := range potentialJobs {
-		res, err := stmt.ExecContext(ctx, j.ID, consumerName)
+		res, err := stmt.ExecContext(ctx, j.ID)
 		if err != nil {
 			// This shouldn't happen with ON CONFLICT DO NOTHING unless there's another issue
 			span.RecordError(fmt.Errorf("failed executing insert for job lock (job_id: %d): %w", j.ID, err))
@@ -297,7 +295,7 @@ func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID i
 
 	// Update the job itself
 	_, err = tx.ExecContext(ctx,
-		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = NOW() + $2 WHERE id = $3",
+		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = NOW() + $2, consumed_at = NULL WHERE id = $3",
 		errorMsg, backoffDuration.String(), jobID,
 	)
 	if err != nil {

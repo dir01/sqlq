@@ -81,15 +81,6 @@ func TestSQLite(t *testing.T) {
 		tc.TestRetryMaxExceeded(ctx, t)
 	})
 
-	t.Run("Retries are counted per-consumer", func(t *testing.T) {
-		t.Parallel()
-
-		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestRetryPerConsumer")
-		defer span.End()
-
-		tc.TestMultiConsumerRetry(ctx, t)
-	})
-
 	t.Run("Failed jobs go to Dead Letter Queue", func(t *testing.T) {
 		t.Parallel()
 

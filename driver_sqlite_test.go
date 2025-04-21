@@ -59,11 +59,13 @@ func TestDriverSQLite(t *testing.T) {
 	})
 
 	t.Run("GetJobsForConsumer", func(t *testing.T) {
+		ctx := t.Context()
 		jobType := "GetJobsForConsumer"
-		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
+
+		err := driver.InsertJob(ctx, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.GetJobsForConsumer(t.Context(), "some-consumer-name", jobType, 10)
+		jobs, err := driver.GetJobsForConsumer(ctx, "some-consumer-name", jobType, 10)
 		require.NoError(t, err)
 
 		require.Equal(t, 1, len(jobs))

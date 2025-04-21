@@ -24,7 +24,12 @@ const tracerName = "github.com/dir01/sqlq"
 type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
-	Consume(ctx context.Context, jobType string, consumerName string, f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...ConsumerOption)
+	Consume(
+		ctx context.Context,
+		jobType string,
+		consumerName string,
+		f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...ConsumerOption,
+	) error
 	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
 	Shutdown()
@@ -42,6 +47,7 @@ const (
 
 // Error definitions
 var (
+	ErrDuplicateConsumer  = errors.New(".Consume was called twice for same job type")
 	ErrUnsupportedDBType  = errors.New("unsupported database type")
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
 	ErrJobNotFound        = errors.New("job not found")
@@ -61,7 +67,7 @@ var (
 type sqlq struct {
 	db                  *sql.DB
 	driver              Driver
-	consumersMap        map[string][]*consumer // jobType -> consumerList
+	consumersMap        map[string]*consumer // jobType -> consumer
 	consumersMapMutex   sync.RWMutex
 	shutdown            chan struct{}
 	backoffFunc         func(retryNum int) time.Duration
@@ -117,7 +123,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	q := &sqlq{
 		db:           db,
 		driver:       driver,
-		consumersMap: make(map[string][]*consumer),
+		consumersMap: make(map[string]*consumer),
 		shutdown:     make(chan struct{}),
 		backoffFunc: func(retryNum int) time.Duration {
 			jitter := float64(rand.Intn(retryNum))
@@ -222,20 +228,22 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	return nil
 }
 
-// Consume registers a handler for a specific job type
+// Consume registers a handler for a specific job type.
+// ctx passed to handler will be a child of ctx passed to Consume.
+// Registering multiple handlers for same jobType will cause ErrDuplicateConsumer.
 func (q *sqlq) Consume(
 	ctx context.Context,
 	jobType string,
 	consumerName string,
-	f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error,
+	handler func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error,
 	opts ...ConsumerOption,
-) {
+) error {
 	consCtx, cancel := context.WithCancel(ctx)
 
 	cons := &consumer{
 		jobType:       jobType,
 		consumerName:  consumerName,
-		handler:       f,
+		handler:       handler,
 		concurrency:   defaultConcurrency,
 		prefetchCount: defaultPrefetch,
 		maxRetries:    defaultMaxRetries,
@@ -259,7 +267,11 @@ func (q *sqlq) Consume(
 	cons.processingJobs = make(chan job, cons.prefetchCount)
 
 	q.consumersMapMutex.Lock()
-	q.consumersMap[jobType] = append(q.consumersMap[jobType], cons)
+	if _, exists := q.consumersMap[jobType]; exists {
+		q.consumersMapMutex.Unlock()
+		return fmt.Errorf("%w: %s", ErrDuplicateConsumer, jobType)
+	}
+	q.consumersMap[jobType] = cons
 	q.consumersMapMutex.Unlock()
 
 	// Start one poller that will query database and post to channel
@@ -271,6 +283,8 @@ func (q *sqlq) Consume(
 		cons.workerWg.Add(1)
 		go q.workerLoop(cons)
 	}
+
+	return nil
 }
 
 func (q *sqlq) pollConsumer(cons *consumer) {
@@ -477,11 +491,9 @@ func (q *sqlq) Shutdown() {
 
 	// Cancel all consumer contexts and wait for workers to finish
 	q.consumersMapMutex.Lock()
-	for _, consumers := range q.consumersMap {
-		for _, cons := range consumers {
-			cons.cancel()
-			cons.workerWg.Wait()
-		}
+	for _, cons := range q.consumersMap {
+		cons.cancel()
+		cons.workerWg.Wait()
 	}
 	q.consumersMapMutex.Unlock()
 }
