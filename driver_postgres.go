@@ -14,21 +14,21 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const pgTracerName = "github.com/your_org/sqlq/driver/postgres" // Replace with your actual module path
+const pgTracerName = "github.com/dir01/sqlq/driver/postgres"
 
 // PostgresDriver implements the Driver interface for PostgreSQL
 type PostgresDriver struct {
 	db     *sql.DB
-	tracer trace.Tracer // Add tracer field
+	tracer trace.Tracer
 }
 
 // NewPostgresDriver creates a new PostgreSQL driver with the given database connection
 func NewPostgresDriver(db *sql.DB) *PostgresDriver {
-	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)} // Initialize tracer
+	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)}
 }
 
 func (d *PostgresDriver) InitSchema(ctx context.Context) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.InitSchema", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.init_schema", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 	))
 	defer span.End()
@@ -72,15 +72,15 @@ func (d *PostgresDriver) InitSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`,
 	}
 
-	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback if commit fails or panics
+	defer tx.Rollback()
 
 	for _, query := range queries {
-		_, err := tx.ExecContext(ctx, query) // Use ExecContext
+		_, err := tx.ExecContext(ctx, query)
 		if err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
@@ -101,10 +101,10 @@ func (d *PostgresDriver) InsertJob(
 	delay time.Duration,
 	traceContext map[string]string,
 ) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.InsertJob", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.insert_job", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.trace_context", fmt.Sprintf("%v", traceContext)), // Log trace context
+		attribute.String("sqlq.trace_context", fmt.Sprintf("%v", traceContext)),
 		attribute.Float64("sqlq.delay_seconds", delay.Seconds()),
 	))
 	defer span.End()
@@ -134,7 +134,7 @@ func (d *PostgresDriver) InsertJob(
 }
 
 func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error) {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.GetJobsForConsumer", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.consumer_name", consumerName),
 		attribute.String("sqlq.job_type", jobType),
@@ -161,25 +161,24 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	}
 	defer rows.Close()
 
-	var potentialJobs []job // Store potential jobs first
+	var potentialJobs []job
 	for rows.Next() {
 		var j job
-		var traceContextJSON sql.NullString // Use sql.NullString for potentially null JSONB
-		j.JobType = jobType // Assign job type
+		var traceContextJSON sql.NullString
+		j.JobType = jobType
 
 		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
 			span.RecordError(fmt.Errorf("failed to scan potential job details: %w", err))
-			// Consider returning partial results or skipping the job
+			// TODO: Consider returning partial results or skipping the job
 			return nil, fmt.Errorf("failed to scan potential job details: %w", err)
 		}
 
-		// Deserialize trace context
 		j.TraceContext = make(map[string]string)
 		if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {
 			if err := json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
 				span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
 				// Continue without trace context if unmarshal fails
-				j.TraceContext = make(map[string]string) // Ensure it's initialized
+				j.TraceContext = make(map[string]string)
 			}
 		}
 		potentialJobs = append(potentialJobs, j)
@@ -197,7 +196,7 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
 		return nil, err
 	}
-	defer tx.Rollback() // Rollback if commit fails or not reached
+	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO job_consumers (job_id, consumer_name, processed_at) 
@@ -244,7 +243,7 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 }
 
 func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.MarkJobProcessed", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.consumer_name", consumerName),
@@ -254,7 +253,7 @@ func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, cons
 	res, err := d.db.ExecContext(ctx,
 		`UPDATE job_consumers 
 		 SET processed_at = NOW() 
-		 WHERE job_id = $1 AND consumer_name = $2 AND processed_at IS NULL`, // Only update if processing (NULL)
+		 WHERE job_id = $1 AND consumer_name = $2 AND processed_at IS NULL`, // Only update if processing
 		jobID, consumerName,
 	)
 	if err != nil {
@@ -273,7 +272,7 @@ func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, cons
 			attribute.Int64("sqlq.job_id", jobID),
 			attribute.String("sqlq.consumer_name", consumerName),
 		))
-		// Depending on desired strictness, you might return an error here.
+		// Depending on desired strictness, we might return an error here.
 		// return fmt.Errorf("no processing job found for job_id %d and consumer %s to mark as processed", jobID, consumerName)
 	}
 
@@ -281,7 +280,7 @@ func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, cons
 }
 
 func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.MarkJobFailedAndReschedule", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_failed_and_reschedule", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.error_message", errorMsg),
@@ -326,7 +325,7 @@ func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID i
 }
 
 func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.MoveToDeadLetterQueue", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
 		attribute.String("sqlq.dlq_reason", reason),
@@ -381,7 +380,7 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64,
 }
 
 func (d *PostgresDriver) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.GetDeadLetterJobs", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType), // jobType might be empty
 		attribute.Int("sqlq.limit", limit),
@@ -450,7 +449,7 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 }
 
 func (d *PostgresDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.RequeueDeadLetterJob", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.requeue_dlq_job", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.dlq_id", dlqID),
 	))

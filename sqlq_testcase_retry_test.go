@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,6 +81,72 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	case <-timeout.C:
 		// This is expected - no more retries
 	}
+}
+
+func (tc *TestCase) TestMultiConsumerRetry(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	jobType := "multi_consumer_retry_job"
+	consumerA := "consumer_A"
+	consumerB := "consumer_B"
+	maxRetriesA := 3 // 2 total attempts allowed for the job
+	maxRetriesB := 1 // 4 total attempts allowed for the job
+
+	consumerAttempts := make(map[string]int)
+	mu := sync.Mutex{} // Mutex to protect the map
+
+	handler := func(consumerName string, maxRetries int) func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+		return func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+			mu.Lock()
+			attemptNum := consumerAttempts[consumerName]
+			consumerAttempts[consumerName]++
+			mu.Unlock()
+
+			// Fail on all but last attmpts
+			if attemptNum <= maxRetries {
+				t.Logf("Consumer %s failing attempt %d", consumerName, attemptNum)
+				return errors.New("simulated failure")
+			}
+
+			// Succeed on the third attempt
+			t.Logf("Consumer %s succeeding on attempt %d", consumerName, attemptNum)
+			return nil
+		}
+	}
+
+	// Register consumer A
+	tc.Q.Consume(ctx, jobType, consumerA, handler(consumerA, maxRetriesA), sqlq.WithMaxRetries(maxRetriesA))
+	// Register consumer B
+	tc.Q.Consume(ctx, jobType, consumerB, handler(consumerB, maxRetriesB), sqlq.WithMaxRetries(maxRetriesB))
+
+	// Publish the job
+	payload := TestPayload{Message: "MultiConsumerRetry"}
+	err := tc.Q.Publish(ctx, jobType, payload)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		switch {
+		case len(consumerAttempts) != 2:
+			return false
+		case consumerAttempts[consumerA] != maxRetriesA+1:
+			return false
+		case consumerAttempts[consumerB] != maxRetriesB+1:
+			return false
+		default:
+			return true
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Verify job is not in DLQ (since it should have succeeded)
+	dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, jobType, 1)
+	require.NoError(t, err, "Failed to check DLQ")
+	require.Empty(t, dlqJobs, "Job should not have ended up in the DLQ")
 }
 
 func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {

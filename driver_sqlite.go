@@ -126,7 +126,7 @@ func (d *SQLiteDriver) InsertJob(
 	// Use SQLite's built-in functions to get current time in milliseconds
 	// and calculate scheduled time based on delay
 	var query string
-	var args []interface{}
+	var args []any
 
 	nowMs := time.Now().UnixMilli()
 
@@ -135,14 +135,14 @@ func (d *SQLiteDriver) InsertJob(
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
 			VALUES (?, ?, ?, ?, ?)
 		`
-		args = []interface{}{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
+		args = []any{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
 	} else {
 		scheduledMs := nowMs + delay.Milliseconds()
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
 			VALUES (?, ?, ?, ?, ?)
 		`
-		args = []interface{}{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
+		args = []any{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
 	}
 
 	_, err = d.db.ExecContext(ctx, query, args...)
@@ -469,7 +469,7 @@ func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, li
 	return jobs, err
 }
 
-func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, args ...interface{}) ([]DeadLetterJob, error) {
+func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, args ...any) ([]DeadLetterJob, error) {
 	rows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
