@@ -167,7 +167,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 			break
 		}
 
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	require.NoError(t, connectErr, "Failed to ping Postgres database after multiple attempts")
@@ -184,8 +184,8 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	q, err := sqlq.New(
 		db,
 		sqlq.DBTypePostgres,
-		sqlq.WithPollInterval(50*time.Millisecond),
-		sqlq.WithBackoffFunc(func(i int) time.Duration { return 0 }),
+		sqlq.WithDefaultPollInterval(50*time.Millisecond),
+		sqlq.WithDefaultBackoffFunc(func(i int) time.Duration { return 0 }),
 		sqlq.WithTracer(tracer),
 	)
 	require.NoError(t, err)

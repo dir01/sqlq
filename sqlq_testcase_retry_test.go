@@ -31,7 +31,7 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 		}
 
 		return nil
-	}, sqlq.WithMaxRetries(maxRetries))
+	}, sqlq.WithConsumerMaxRetries(maxRetries))
 
 	// Create a payload
 	payload := TestPayload{Message: "TestRetry"}
@@ -113,7 +113,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 
 		// Always fail the job
 		return errors.New("simulated failure")
-	}, sqlq.WithMaxRetries(maxRetries))
+	}, sqlq.WithConsumerMaxRetries(maxRetries))
 
 	// Create a payload
 	payload := TestPayload{

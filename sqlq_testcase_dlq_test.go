@@ -27,7 +27,7 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		attempts.Add(1)
 		return errors.New("simulated failure to move job to DLQ")
-	}, sqlq.WithMaxRetries(maxRetries))
+	}, sqlq.WithConsumerMaxRetries(maxRetries))
 
 	testPayload := TestPayload{Message: "test_dlq_job_payload"}
 	// Publish the job with max retries
@@ -98,7 +98,7 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 
 		// Fail the job to force it to the DLQ
 		return errors.New("simulated failure for requeue test")
-	}, sqlq.WithMaxRetries(maxRetries))
+	}, sqlq.WithConsumerMaxRetries(maxRetries))
 
 	// Create a unique payload
 	testPayload := TestPayload{
@@ -191,7 +191,7 @@ func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 		tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 			// Always fail to move to DLQ
 			return errors.New("simulated failure for filter test")
-		}, sqlq.WithMaxRetries(maxRetries))
+		}, sqlq.WithConsumerMaxRetries(maxRetries))
 	}
 
 	// Publish jobs of both types

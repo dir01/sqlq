@@ -59,20 +59,25 @@ const (
 )
 
 var (
-	defaultConcurrency = min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-	defaultPrefetch    = defaultConcurrency
+	defaultConcurrency   = min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
+	defaultPrefetchCount = defaultConcurrency
+	defaultJobTimeout    = 15 * time.Minute
 )
 
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
-	db                  *sql.DB
-	driver              Driver
-	consumersMap        map[string]*consumer // jobType -> consumer
-	consumersMapMutex   sync.RWMutex
-	shutdown            chan struct{}
-	backoffFunc         func(retryNum int) time.Duration
-	defaultPollInterval time.Duration
-	tracer              trace.Tracer
+	db                   *sql.DB
+	driver               Driver
+	consumersMap         map[string]*consumer // jobType -> consumer
+	consumersMapMutex    sync.RWMutex
+	shutdown             chan struct{}
+	defaultBackoffFunc   func(retryNum int) time.Duration
+	defaultPollInterval  time.Duration
+	defaultConcurrency   int
+	defaultPrefetchCount int
+	defaultJobTimeout    time.Duration
+	defaultMaxRetries    int
+	tracer               trace.Tracer
 }
 
 type consumer struct {
@@ -122,17 +127,21 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	}
 
 	q := &sqlq{
-		db:           db,
-		driver:       driver,
-		consumersMap: make(map[string]*consumer),
-		shutdown:     make(chan struct{}),
-		backoffFunc: func(retryNum int) time.Duration {
+		db:                   db,
+		driver:               driver,
+		consumersMap:         make(map[string]*consumer),
+		shutdown:             make(chan struct{}),
+		defaultPollInterval:  100 * time.Millisecond,
+		defaultConcurrency:   defaultConcurrency,
+		defaultPrefetchCount: defaultPrefetchCount,
+		defaultMaxRetries:    defaultMaxRetries,
+		defaultJobTimeout:    defaultJobTimeout,
+		defaultBackoffFunc: func(retryNum int) time.Duration {
 			jitter := float64(rand.Intn(retryNum))
 			backoff := math.Pow(2, float64(retryNum))
 			return time.Duration(backoff+jitter) * time.Second
 		},
-		defaultPollInterval: 100 * time.Millisecond,
-		tracer:              otel.Tracer(tracerName),
+		tracer: otel.Tracer(tracerName),
 	}
 
 	for _, o := range opts {
@@ -245,11 +254,13 @@ func (q *sqlq) Consume(
 		jobType:       jobType,
 		consumerName:  consumerName,
 		handler:       handler,
-		concurrency:   defaultConcurrency,
-		prefetchCount: defaultPrefetch,
-		maxRetries:    defaultMaxRetries,
-		ctx:           consCtx,
+		concurrency:   q.defaultConcurrency,
+		prefetchCount: q.defaultPrefetchCount,
+		maxRetries:    q.defaultMaxRetries,
 		pollInterval:  q.defaultPollInterval,
+		jobTimeout:    q.defaultJobTimeout,
+		backoffFunc:   q.defaultBackoffFunc,
+		ctx:           consCtx,
 		cancel:        cancel,
 	}
 
@@ -308,7 +319,7 @@ func (q *sqlq) pollConsumer(cons *consumer) {
 			)
 			span.End()
 
-			backoffTimeout := q.backoffFunc(int(attempt))
+			backoffTimeout := q.defaultBackoffFunc(int(attempt))
 			attempt++
 			<-time.After(backoffTimeout)
 			continue
@@ -481,7 +492,7 @@ func (q *sqlq) retryJob(ctx context.Context, consumer *consumer, job *job, error
 	defer span.End()
 
 	// Calculate exponential backoff
-	bFn := q.backoffFunc
+	bFn := q.defaultBackoffFunc
 	if consumer.backoffFunc != nil {
 		bFn = consumer.backoffFunc
 	}

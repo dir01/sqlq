@@ -41,8 +41,8 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 				return ctx.Err() // Propagate the context cancellation error
 			}
 		},
-		sqlq.WithMaxRetries(0), // Ensure it goes to DLQ immediately on failure
-		sqlq.WithJobTimeout(jobTimeout), // Enable the job timeout
+		sqlq.WithConsumerMaxRetries(0), // Ensure it goes to DLQ immediately on failure
+		sqlq.WithConsumerJobTimeout(jobTimeout), // Enable the job timeout
 	)
 	require.NoError(t, err, "Failed to start consumer")
 
