@@ -79,11 +79,12 @@ type consumer struct {
 	jobType       string
 	consumerName  string
 	handler       func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
+	maxRetries    int
+	pollInterval  time.Duration
+	jobTimeout    time.Duration
 	concurrency   int
 	prefetchCount int
-	maxRetries    int
 	backoffFunc   func(retryNum int) time.Duration
-	pollInterval  time.Duration
 
 	processingJobs chan job
 	workerWg       sync.WaitGroup
@@ -366,65 +367,108 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 	tx, err := q.db.BeginTx(consumeCtx, &sql.TxOptions{Isolation: sql.LevelDefault})
 	if err != nil {
 		consumeSpan.RecordError(err)
+		consumeSpan.RecordError(err)
+		consumeSpan.SetStatus(codes.Error, "failed to begin transaction")
+		_ = tx.Rollback() // Ensure rollback on begin error
 		return
 	}
+	// Defer rollback; it will be ignored if tx.Commit() is called later.
+	defer tx.Rollback()
 
-	handlerCtx, handlerSpan := q.tracer.Start(consumeCtx, "sqlq.handle")
-
-	// THE MEAT
-	handlerErr := cons.handler(handlerCtx, tx, job.Payload)
-	if handlerErr != nil {
-		handlerSpan.RecordError(handlerErr)
-		consumeSpan.SetAttributes(attribute.String("sqlq.handler_error", handlerErr.Error()))
+	// Prepare handler context, potentially with timeout
+	handlerCtx := consumeCtx
+	var handlerCancel context.CancelFunc
+	if cons.jobTimeout > 0 {
+		handlerCtx, handlerCancel = context.WithTimeout(consumeCtx, cons.jobTimeout)
+		defer handlerCancel() // Ensure cancellation resource is released
+		consumeSpan.SetAttributes(attribute.Int64("sqlq.job_timeout_ms", cons.jobTimeout.Milliseconds()))
 	}
-	handlerSpan.End()
 
-	// happy path, mark as done and bail
-	if handlerErr == nil {
-		markCtx, markSpan := q.tracer.Start(consumeCtx, "sqlq.mark_processed")
-		defer markSpan.End()
+	handlerCtx, handlerSpan := q.tracer.Start(handlerCtx, "sqlq.handle") // Start span with potentially timed-out context
 
-		markErr := q.driver.MarkJobProcessed(markCtx, job.ID, cons.consumerName)
+	// --- THE MEAT: Call the user-provided handler ---
+	handlerErr := cons.handler(handlerCtx, tx, job.Payload)
+	// --- Handler finished or timed out ---
 
-		if markErr != nil && !errors.Is(markErr, context.Canceled) {
-			markSpan.RecordError(markErr)
-			_ = tx.Rollback()
-		} else {
-			commitErr := tx.Commit()
-			if commitErr != nil && !errors.Is(commitErr, sql.ErrTxDone) && !errors.Is(commitErr, context.Canceled) {
-				markSpan.RecordError(commitErr)
-			}
+	// Check for handler error *or* context error (like timeout)
+	finalErr := handlerErr // Start with the explicit handler error
+	if finalErr == nil && handlerCtx.Err() != nil {
+		// If handler returned nil but context has an error (e.g., timeout), use the context error.
+		finalErr = handlerCtx.Err()
+		handlerSpan.SetAttributes(attribute.Bool("sqlq.job_timed_out", true))
+	}
+
+	if finalErr != nil {
+		handlerSpan.RecordError(finalErr)
+		handlerSpan.SetStatus(codes.Error, "handler failed or timed out")
+	} else {
+		handlerSpan.SetStatus(codes.Ok, "handler succeeded")
+	}
+	handlerSpan.End() // End handler span here
+
+	// --- Decide action based on finalErr ---
+
+	// Happy path: Handler succeeded without error or timeout
+	if finalErr == nil {
+		// Commit the transaction first
+		commitErr := tx.Commit()
+		if commitErr != nil {
+			// If commit fails, we can't reliably mark processed. Record error and return.
+			consumeSpan.RecordError(fmt.Errorf("failed to commit transaction after successful handle: %w", commitErr))
+			consumeSpan.SetStatus(codes.Error, "commit failed after handle")
+			// Rollback was already deferred.
+			return
 		}
 
+		// Transaction committed successfully, now mark the job processed
+		markCtx, markSpan := q.tracer.Start(consumeCtx, "sqlq.mark_processed") // Use original consumeCtx
+		markErr := q.driver.MarkJobProcessed(markCtx, job.ID, cons.consumerName)
+		if markErr != nil {
+			// Log or trace the error, but the job is technically processed as the TX committed.
+			markSpan.RecordError(fmt.Errorf("failed to mark job processed after commit: %w", markErr))
+			markSpan.SetStatus(codes.Error, "mark processed failed after commit")
+		} else {
+			markSpan.SetStatus(codes.Ok, "job processed successfully")
+		}
+		markSpan.End()
+
+		// Successfully processed and marked
+		consumeSpan.SetStatus(codes.Ok, "job processed successfully")
 		return
 	}
 
-	// Handler failed, rollback transaction
-	_ = tx.Rollback()
+	// --- Handler failed or timed out ---
+	// Rollback is handled by the deferred call earlier.
 
-	// retry
+	// Add handler error details to the main consume span
+	consumeSpan.SetAttributes(attribute.String("sqlq.handler_error", finalErr.Error()))
+	consumeSpan.SetStatus(codes.Error, "handler failed or timed out")
+
+	// Decide whether to retry or move to DLQ
 	if cons.maxRetries == infiniteRetries || job.RetryCount < cons.maxRetries {
-		retryCtx, retrySpan := q.tracer.Start(consumeCtx, "sqlq.retry")
-		defer retrySpan.End()
-
-		retryErr := q.retryJob(retryCtx, cons, job, handlerErr.Error())
+		retryCtx, retrySpan := q.tracer.Start(consumeCtx, "sqlq.retry") // Use original consumeCtx
+		retryErr := q.retryJob(retryCtx, cons, job, finalErr.Error())
 		if retryErr != nil {
 			retrySpan.RecordError(retryErr)
+			retrySpan.SetStatus(codes.Error, "retry failed")
+		} else {
+			retrySpan.SetStatus(codes.Ok, "job scheduled for retry")
 		}
-
-		return
+		retrySpan.End()
+		return // Job scheduled for retry
 	}
 
-	// dead letter queue
-	dlqCtx, dlqSpan := q.tracer.Start(consumeCtx, "sqlq.move_to_dlq")
-	defer dlqSpan.End()
-
-	moveErr := q.driver.MoveToDeadLetterQueue(dlqCtx, job.ID, handlerErr.Error())
+	// Max retries exceeded or retries disabled, move to Dead Letter Queue
+	dlqCtx, dlqSpan := q.tracer.Start(consumeCtx, "sqlq.move_to_dlq") // Use original consumeCtx
+	moveErr := q.driver.MoveToDeadLetterQueue(dlqCtx, job.ID, finalErr.Error())
 	if moveErr != nil {
 		dlqSpan.RecordError(moveErr)
+		dlqSpan.SetStatus(codes.Error, "failed to move job to DLQ")
 	} else {
 		consumeSpan.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
+		dlqSpan.SetStatus(codes.Ok, "job moved to DLQ")
 	}
+	dlqSpan.End()
 }
 
 // retryJob increments the retry count and schedules the job to be retried after a backoff period
@@ -441,7 +485,8 @@ func (q *sqlq) retryJob(ctx context.Context, consumer *consumer, job *job, error
 	if consumer.backoffFunc != nil {
 		bFn = consumer.backoffFunc
 	}
-	backoff := bFn(job.RetryCount)
+	// Increment retry count *before* calculating backoff for the *next* attempt's delay
+	backoff := bFn(job.RetryCount + 1)
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	// Mark job as failed and reschedule in a single operation
@@ -473,7 +518,7 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 
 // RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
-	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_jobs", trace.WithAttributes(
+	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes( // Corrected span name
 		attribute.Int64("sqlq.dlq_id", dlqID),
 	))
 	defer span.End()

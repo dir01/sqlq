@@ -54,6 +54,15 @@ func TestSQLite(t *testing.T) {
 		tc.TestBasicPubMultiSub(ctx, t)
 	})
 
+	t.Run("Job execution timeout", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestJobExecutionTimeout")
+		defer span.End()
+
+		tc.TestJobExecutionTimeout(ctx, t)
+	})
+
 	t.Run("Delayed job execution", func(t *testing.T) {
 		t.Parallel()
 

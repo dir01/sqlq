@@ -39,11 +39,24 @@ func WithConsumerBackoffFunc(fn func(int) time.Duration) ConsumerOption {
 	}
 }
 
-// WithMaxRetries sets the maximum number of retries for a job
+// WithMaxRetries sets the maximum number of retries for a job.
+// Use -1 for infinite retries.
 func WithMaxRetries(n int) ConsumerOption {
 	return func(o *consumer) {
-		if n >= 0 {
+		// Allow -1 for infinite retries
+		if n >= -1 {
 			o.maxRetries = n
+		}
+	}
+}
+
+// WithJobTimeout sets a maximum execution duration for a single job handler invocation.
+// If the handler exceeds this duration, its context will be canceled.
+// A timeout is treated as a job failure.
+func WithJobTimeout(timeout time.Duration) ConsumerOption {
+	return func(o *consumer) {
+		if timeout > 0 { // Only set positive timeouts
+			o.jobTimeout = timeout
 		}
 	}
 }
