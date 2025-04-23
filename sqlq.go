@@ -12,10 +12,13 @@ import (
 	"sync"
 	"time"
 
+	"log"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
+
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -36,16 +39,13 @@ type JobsQueue interface {
 	Run()
 }
 
-// DBType represents the type of database being used
 type DBType string
 
 const (
 	DBTypeSQLite   DBType = "sqlite"
 	DBTypePostgres DBType = "postgres"
-	DBTypeMySQL    DBType = "mysql"
 )
 
-// Error definitions
 var (
 	ErrDuplicateConsumer  = errors.New(".Consume was called twice for same job type")
 	ErrUnsupportedDBType  = errors.New("unsupported database type")
@@ -53,75 +53,116 @@ var (
 	ErrJobNotFound        = errors.New("job not found")
 )
 
-const (
-	defaultMaxRetries = 3
-	infiniteRetries   = -1
-)
-
 var (
-	defaultConcurrency   = min(runtime.NumCPU(), runtime.GOMAXPROCS(0))
-	defaultPrefetchCount = defaultConcurrency
-	defaultJobTimeout    = 15 * time.Minute
+	defaultMaxRetries      int32  = 3
+	infiniteRetries        int32  = -1
+	defaultConcurrency     uint16 = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
+	defaultPrefetchCount   uint16 = defaultConcurrency
+	defaultJobTimeout             = 15 * time.Minute
+	defaultCleanupInterval        = 1 * time.Hour
+	defaultCleanupAge             = 7 * 24 * time.Hour
+	defaultCleanupDLQAge          = 30 * 24 * time.Hour
+	defaultCleanupBatch    uint16 = 500
 )
 
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
-	db                   *sql.DB
-	driver               Driver
-	consumersMap         map[string]*consumer // jobType -> consumer
-	consumersMapMutex    sync.RWMutex
-	shutdown             chan struct{}
-	defaultBackoffFunc   func(retryNum int) time.Duration
-	defaultPollInterval  time.Duration
-	defaultConcurrency   int
-	defaultPrefetchCount int
-	defaultJobTimeout    time.Duration
-	defaultMaxRetries    int
-	tracer               trace.Tracer
+	db                *sql.DB
+	driver            Driver
+	consumersMap      map[string]*consumer // jobType -> consumer
+	consumersMapMutex sync.RWMutex         // guard consumersMap
+	shutdown          chan struct{}
+	tracer            trace.Tracer
+
+	// Function for calculating how much of a delay to use when rescheduling a failed job.
+	// This is a default that will be used for all consumers
+	// unless they define their own backoff function using WithConsumerBackoffFunc.
+	defaultBackoffFunc func(retryNum uint16) time.Duration
+
+	// How often to poll database for new jobs. Default is 100ms.
+	// Individual consumers may override this using WithConsumerPollInteval.
+	defaultPollInterval time.Duration
+
+	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
+	// Individual consumers may override this using WithConsumerJobTimeout.
+	defaultJobTimeout time.Duration
+
+	// Default number of concurrent workers per consumer. Default is min(runtime.NumCPU(), runtime.GOMAXPROCS(0)).
+	// Individual consumers may override this using WithConsumerConcurrency.
+	defaultConcurrency uint16
+
+	// Default number of jobs to fetch in advance per consumer. Default matches defaultConcurrency.
+	// Individual consumers may override this using WithConsumerPrefetchCount.
+	defaultPrefetchCount uint16
+
+	// Default maximum number of retries for a failed job. Default is 3.
+	// Individual consumers may override this using WithConsumerMaxRetries.
+	defaultMaxRetries int32
+
+	// Default interval for running cleanup tasks per consumer. Default is 1 hour.
+	// Individual consumers may override this using WithConsumerCleanupInterval.
+	defaultCleanupInterval time.Duration
+
+	// Default maximum age for successfully processed jobs before deletion. Default is 7 days.
+	// Individual consumers may override this using WithConsumerCleanupAge.
+	defaultCleanupAge time.Duration
+
+	// Default maximum age for dead-letter queue jobs before deletion. Default is 30 days.
+	// Individual consumers may override this using WithConsumerCleanupDLQAge.
+	defaultCleanupDLQAge time.Duration
+
+	// Default number of jobs to delete in a single cleanup batch. Default is 1000.
+	// Individual consumers may override this using WithConsumerCleanupBatch.
+	defaultCleanupBatch uint16
 }
 
 type consumer struct {
-	jobType       string
-	consumerName  string
-	handler       func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
-	maxRetries    int
-	pollInterval  time.Duration
-	jobTimeout    time.Duration
-	concurrency   int
-	prefetchCount int
-	backoffFunc   func(retryNum int) time.Duration
+	jobType      string
+	consumerName string
+	handler      func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
+	jobsChan     chan job           // Written to by a db poller, consumed by worker goroutines
+	ctx          context.Context    // context that was passed to .Consume, but with cancelation
+	cancel       context.CancelFunc // cancel() cancels ctx
+	workerWg     sync.WaitGroup     // Wait to make sure all scheduled goroutines stopped
 
-	processingJobs chan job
-	workerWg       sync.WaitGroup
-	ctx            context.Context
-	cancel         context.CancelFunc
+	pollInterval    time.Duration                       // How often should db poller run
+	jobTimeout      time.Duration                       // After this amount a time, job context will be canceled
+	backoffFunc     func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with
+	maxRetries      int32                               // Total attempts is maxRetries+1. -1 means unlimited
+	prefetchCount   uint16                              // LIMIT when fetching jobs from database into jobsChan
+	concurrency     uint16                              // How many goroutines will process jobsChan
+	cleanupBatch    uint16                              // Number of jobs to delete per cleanup batch
+	cleanupInterval time.Duration                       // How often this consumer cleans up its job type
+	cleanupAge      *time.Duration                      // Max age for processed jobs of this type
+	cleanupDLQAge   *time.Duration                      // Max age for DLQ jobs of this type
+
 }
 
 type job struct {
+	CreatedAt    time.Time
 	ID           int64
 	JobType      string
 	Payload      []byte
-	CreatedAt    time.Time
-	RetryCount   int
 	TraceContext map[string]string // For trace propagation
+	RetryCount   uint16
 }
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue
 type DeadLetterJob struct {
 	ID            int64
 	OriginalID    int64
-	JobType       string
-	Payload       []byte
 	CreatedAt     time.Time
 	FailedAt      time.Time
-	RetryCount    int
-	MaxRetries    int
+	JobType       string
+	Payload       []byte
 	FailureReason string
+	MaxRetries    int32
+	RetryCount    uint16
 }
 
 // New creates a new SQL-backed job queue
 func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
-	driver, err := GetDriver(db, dbType)
+	driver, err := getDriver(db, dbType)
 	if err != nil {
 		return nil, err
 	}
@@ -136,12 +177,16 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultPrefetchCount: defaultPrefetchCount,
 		defaultMaxRetries:    defaultMaxRetries,
 		defaultJobTimeout:    defaultJobTimeout,
-		defaultBackoffFunc: func(retryNum int) time.Duration {
-			jitter := float64(rand.Intn(retryNum))
+		defaultBackoffFunc: func(retryNum uint16) time.Duration {
+			jitter := float64(rand.Intn(int(retryNum)))
 			backoff := math.Pow(2, float64(retryNum))
 			return time.Duration(backoff+jitter) * time.Second
 		},
-		tracer: otel.Tracer(tracerName),
+		defaultCleanupInterval: defaultCleanupInterval,
+		defaultCleanupAge:      defaultCleanupAge,
+		defaultCleanupDLQAge:   defaultCleanupDLQAge,
+		defaultCleanupBatch:    defaultCleanupBatch,
+		tracer:                 otel.Tracer(tracerName),
 	}
 
 	for _, o := range opts {
@@ -157,6 +202,7 @@ func (q *sqlq) Run() {
 
 	if err := q.driver.InitSchema(initCtx); err != nil {
 		initSpan.RecordError(err)
+		// Consider if initialization failure should prevent startup
 	}
 }
 
@@ -224,8 +270,8 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		attribute.Int("sqlq.delay_ms", int(options.delay.Milliseconds())),
 	)
 
-	traceContextMap := make(map[string]string)
-	otel.GetTextMapPropagator().Inject(ctx, propagation.MapCarrier(traceContextMap))
+	traceContextMap := propagation.MapCarrier(make(map[string]string))
+	otel.GetTextMapPropagator().Inject(ctx, traceContextMap) // Use the context returned by Start
 
 	err = q.driver.InsertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
@@ -251,17 +297,20 @@ func (q *sqlq) Consume(
 	consCtx, cancel := context.WithCancel(ctx)
 
 	cons := &consumer{
-		jobType:       jobType,
-		consumerName:  consumerName,
-		handler:       handler,
-		concurrency:   q.defaultConcurrency,
-		prefetchCount: q.defaultPrefetchCount,
-		maxRetries:    q.defaultMaxRetries,
-		pollInterval:  q.defaultPollInterval,
-		jobTimeout:    q.defaultJobTimeout,
-		backoffFunc:   q.defaultBackoffFunc,
-		ctx:           consCtx,
-		cancel:        cancel,
+		jobType:         jobType,
+		consumerName:    consumerName,
+		handler:         handler,
+		concurrency:     q.defaultConcurrency,
+		prefetchCount:   q.defaultPrefetchCount,
+		maxRetries:      q.defaultMaxRetries,
+		pollInterval:    q.defaultPollInterval,
+		jobTimeout:      q.defaultJobTimeout,
+		backoffFunc:     q.defaultBackoffFunc,
+		cleanupInterval: q.defaultCleanupInterval, // Use default from sqlq struct
+		cleanupBatch:    q.defaultCleanupBatch,    // Use default from sqlq struct
+		// cleanupAge and cleanupDLQAge start as nil, consumer options can override
+		ctx:    consCtx,
+		cancel: cancel,
 	}
 
 	for _, o := range opts {
@@ -276,7 +325,7 @@ func (q *sqlq) Consume(
 	// It makes sense to have channel be of size `prefetchCount`
 	// since it allows channel to essentially never be empty
 	// in cases where `prefetchCount` > `concurrency`
-	cons.processingJobs = make(chan job, cons.prefetchCount)
+	cons.jobsChan = make(chan job, cons.prefetchCount)
 
 	q.consumersMapMutex.Lock()
 	if _, exists := q.consumersMap[jobType]; exists {
@@ -287,24 +336,29 @@ func (q *sqlq) Consume(
 	q.consumersMapMutex.Unlock()
 
 	// Start one poller that will query database and post to channel
-	cons.workerWg.Add(1)
 	go q.pollConsumer(cons)
 
 	// Start `concurrency` worker goroutines that will read the channel and do work
 	for range cons.concurrency {
-		cons.workerWg.Add(1)
 		go q.workerLoop(cons)
+	}
+
+	// Start the consumer-specific cleanup loop if interval is positive
+	if cons.cleanupInterval > 0 {
+		go cons.runCleanupLoop(q.driver, q.tracer)
 	}
 
 	return nil
 }
 
 func (q *sqlq) pollConsumer(cons *consumer) {
-	ticker := time.NewTicker(cons.pollInterval)
-	defer ticker.Stop()
+	cons.workerWg.Add(1)
 	defer cons.workerWg.Done()
 
-	var attempt uint
+	ticker := time.NewTicker(cons.pollInterval)
+	defer ticker.Stop()
+
+	var attempt uint16
 	for {
 		if err := q.fetchJobsForConsumer(cons.ctx, cons); err != nil && !errors.Is(err, context.Canceled) {
 			// only start span in case of error since we don't want
@@ -319,7 +373,7 @@ func (q *sqlq) pollConsumer(cons *consumer) {
 			)
 			span.End()
 
-			backoffTimeout := q.defaultBackoffFunc(int(attempt))
+			backoffTimeout := q.defaultBackoffFunc(attempt)
 			attempt++
 			<-time.After(backoffTimeout)
 			continue
@@ -343,13 +397,14 @@ func (q *sqlq) pollConsumer(cons *consumer) {
 
 // workerLoop processes jobs from the processingJobs channel
 func (q *sqlq) workerLoop(cons *consumer) {
+	cons.workerWg.Add(1)
 	defer cons.workerWg.Done()
 
 	for {
 		select {
 		case <-cons.ctx.Done():
 			return
-		case job, ok := <-cons.processingJobs:
+		case job, ok := <-cons.jobsChan:
 			if !ok {
 				return // Channel closed
 			}
@@ -362,6 +417,7 @@ func (q *sqlq) workerLoop(cons *consumer) {
 func (q *sqlq) processJob(cons *consumer, job *job) {
 	parentCtx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.MapCarrier(job.TraceContext))
 
+	traceContextBytes, _ := json.Marshal(job.TraceContext)
 	consumeCtx, consumeSpan := q.tracer.Start(parentCtx, "sqlq.consume",
 		trace.WithLinks(trace.Link{
 			SpanContext: trace.SpanContextFromContext(parentCtx),
@@ -369,7 +425,8 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", cons.jobType),
 			attribute.Int64("sqlq.job_id", job.ID),
-			attribute.Int("sqlq.retry_count", job.RetryCount),
+			attribute.Int("sqlq.retry_count", int(job.RetryCount)),
+			attribute.String("sqlq.trace_context", string(traceContextBytes)),
 		),
 		trace.WithSpanKind(trace.SpanKindConsumer),
 	)
@@ -456,7 +513,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 	consumeSpan.SetStatus(codes.Error, "handler failed or timed out")
 
 	// Decide whether to retry or move to DLQ
-	if cons.maxRetries == infiniteRetries || job.RetryCount < cons.maxRetries {
+	if cons.maxRetries == infiniteRetries || int32(job.RetryCount) < cons.maxRetries {
 		retryCtx, retrySpan := q.tracer.Start(consumeCtx, "sqlq.retry") // Use original consumeCtx
 		retryErr := q.retryJob(retryCtx, cons, job, finalErr.Error())
 		if retryErr != nil {
@@ -486,7 +543,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 func (q *sqlq) retryJob(ctx context.Context, consumer *consumer, job *job, errorMsg string) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.retry_job", trace.WithAttributes(
 		attribute.Int64("sqlq.job_id", job.ID),
-		attribute.Int("sqlq.retry_count", job.RetryCount),
+		attribute.Int("sqlq.retry_count", int(job.RetryCount)),
 		attribute.String("sqlq.error_message", errorMsg),
 	))
 	defer span.End()
@@ -554,6 +611,65 @@ func (q *sqlq) Shutdown() {
 	q.consumersMapMutex.Unlock()
 }
 
+// runCleanupLoop periodically cleans up old jobs for a specific consumer/jobType
+func (cons *consumer) runCleanupLoop(driver Driver, tracer trace.Tracer) {
+	cons.workerWg.Add(1)       // Track the cleanup goroutine in the consumer's WaitGroup
+	defer cons.workerWg.Done() // Signal completion to the consumer's WaitGroup
+
+	// Use the consumer's specific interval
+	ticker := time.NewTicker(cons.cleanupInterval)
+	defer ticker.Stop()
+
+	// Determine effective cleanup ages, using consumer's configured defaults (which came from sqlq initially)
+	// These are pointers, so we need to dereference them if set, otherwise use the package-level defaults.
+	processedAge := defaultCleanupAge // Fallback to package default if not set via options
+	if cons.cleanupAge != nil {
+		processedAge = *cons.cleanupAge
+	}
+	dlqAge := defaultCleanupDLQAge // Fallback to package default if not set via options
+	if cons.cleanupDLQAge != nil {
+		dlqAge = *cons.cleanupDLQAge
+	}
+
+	for {
+		select {
+		case <-cons.ctx.Done(): // Use consumer's context for shutdown
+			return
+		case <-ticker.C:
+			cons.performCleanup(driver, tracer, processedAge, dlqAge)
+		}
+	}
+}
+
+// performCleanup calls the driver to delete old jobs for this consumer's job type
+func (c *consumer) performCleanup(driver Driver, tracer trace.Tracer, processedMaxAge, dlqMaxAge time.Duration) {
+	// Create a background context for the cleanup operation itself
+	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup", trace.WithAttributes(
+		attribute.String("sqlq.job_type", c.jobType),
+		attribute.String("sqlq.consumer_name", c.consumerName),
+		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
+		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.Int("sqlq.cleanup.batch_size", int(c.cleanupBatch)),
+	))
+	defer span.End()
+
+	processedDeleted, dlqDeleted, err := driver.CleanupJobs(ctx, c.jobType, processedMaxAge, dlqMaxAge, c.cleanupBatch)
+
+	span.SetAttributes(
+		attribute.Int64("sqlq.cleanup.processed_deleted", processedDeleted),
+		attribute.Int64("sqlq.cleanup.dlq_deleted", dlqDeleted),
+	)
+
+	if err != nil {
+		// Use a standard logger or integrate with a proper logging library
+		log.Printf("sqlq: cleanup failed for job_type %s: %v", c.jobType, err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "cleanup failed")
+	} else {
+		span.SetStatus(codes.Ok, "cleanup completed")
+	}
+}
+
 // fetchJobsForConsumer fetches jobs for a specific consumer and sends them to worker goroutines
 func (q *sqlq) fetchJobsForConsumer(ctx context.Context, cons *consumer) error {
 	jobs, err := q.driver.GetJobsForConsumer(ctx, cons.consumerName, cons.jobType, cons.prefetchCount)
@@ -565,7 +681,7 @@ func (q *sqlq) fetchJobsForConsumer(ctx context.Context, cons *consumer) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case cons.processingJobs <- job:
+		case cons.jobsChan <- job:
 		}
 	}
 

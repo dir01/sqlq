@@ -22,8 +22,8 @@ type PostgresDriver struct {
 	tracer trace.Tracer
 }
 
-// NewPostgresDriver creates a new PostgreSQL driver with the given database connection
-func NewPostgresDriver(db *sql.DB) *PostgresDriver {
+// newPostgresDriver creates a new PostgreSQL driver with the given database connection
+func newPostgresDriver(db *sql.DB) *PostgresDriver {
 	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)}
 }
 
@@ -95,6 +95,143 @@ func (d *PostgresDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
+func (d *PostgresDriver) CleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.String("sqlq.job_type", jobType),
+		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
+		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
+	))
+	defer span.End()
+
+	var totalProcessedDeleted int64
+	var totalDlqDeleted int64
+
+	// --- Cleanup Processed Jobs (Batched) ---
+	processedThreshold := time.Now().Add(-processedMaxAge)
+	for {
+		var batchDeleted int64
+		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+			// 1. Find a batch of job IDs to delete
+			rows, err := tx.QueryContext(ctx, `
+				SELECT jc.job_id
+				FROM job_consumers jc
+				JOIN jobs j ON jc.job_id = j.id
+				WHERE j.job_type = $1 AND jc.processed_at < $2
+				LIMIT $3
+			`, jobType, processedThreshold, batchSize)
+			if err != nil {
+				return fmt.Errorf("failed to query batch of old job_consumers for type %s: %w", jobType, err)
+			}
+
+			var jobIDsToDelete []int64
+			for rows.Next() {
+				var jobID int64
+				if err := rows.Scan(&jobID); err != nil {
+					rows.Close()
+					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
+				}
+				jobIDsToDelete = append(jobIDsToDelete, jobID)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, err)
+			}
+			rows.Close()
+
+			if len(jobIDsToDelete) == 0 {
+				return nil // No more jobs in this batch
+			}
+
+			// 2. Delete from job_consumers (using IDs for precision)
+			_, err = tx.ExecContext(ctx, `DELETE FROM job_consumers WHERE job_id = ANY($1::bigint[])`, jobIDsToDelete)
+			if err != nil {
+				return fmt.Errorf("failed to delete batch of old job_consumers for type %s: %w", jobType, err)
+			}
+
+			// 3. Delete from jobs using the collected IDs
+			resJobs, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ANY($1::bigint[])`, jobIDsToDelete)
+			if err != nil {
+				return fmt.Errorf("failed to delete batch of old jobs for type %s: %w", jobType, err)
+			}
+			count, _ := resJobs.RowsAffected()
+			batchDeleted = count
+			return nil
+		})
+
+		if err != nil {
+			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
+			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+		}
+
+		totalProcessedDeleted += batchDeleted
+		if batchDeleted < int64(batchSize) {
+			break // Last batch processed
+		}
+		// Optional: Add a small delay between batches if needed
+		// time.Sleep(10 * time.Millisecond)
+	}
+
+	// --- Cleanup DLQ Jobs (Batched) ---
+	dlqThreshold := time.Now().Add(-dlqMaxAge)
+	for {
+		var batchDeleted int64
+		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+			// Efficiently delete a batch using ctid in PostgreSQL
+			resDLQ, err := tx.ExecContext(ctx, `
+				DELETE FROM dead_letter_queue
+				WHERE ctid IN (
+					SELECT ctid
+					FROM dead_letter_queue
+					WHERE job_type = $1 AND failed_at < $2
+					LIMIT $3
+				)
+			`, jobType, dlqThreshold, batchSize)
+			if err != nil {
+				return fmt.Errorf("failed to delete batch of old dlq jobs for type %s: %w", jobType, err)
+			}
+			count, _ := resDLQ.RowsAffected()
+			batchDeleted = count
+			return nil
+		})
+
+		if err != nil {
+			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
+			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+		}
+
+		totalDlqDeleted += batchDeleted
+		if batchDeleted < int64(batchSize) {
+			break // Last batch processed
+		}
+		// Optional: Add a small delay between batches if needed
+		// time.Sleep(10 * time.Millisecond)
+	}
+
+	span.SetAttributes(
+		attribute.Int64("sqlq.db.rows_deleted.jobs", totalProcessedDeleted),
+		attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted),
+	)
+
+	return totalProcessedDeleted, totalDlqDeleted, nil
+}
+
+// runInTx is a helper to execute a function within a transaction
+func (d *PostgresDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := fn(tx); err != nil {
+		return err // Error occurred, rollback will happen
+	}
+
+	return tx.Commit() // Commit if fn succeeded
+}
+
 func (d *PostgresDriver) InsertJob(
 	ctx context.Context,
 	jobType string,
@@ -134,12 +271,12 @@ func (d *PostgresDriver) InsertJob(
 	return err
 }
 
-func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error) {
+func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.consumer_name", consumerName),
 		attribute.String("sqlq.job_type", jobType),
-		attribute.Int("sqlq.prefetch_count", prefetchCount),
+		attribute.Int("sqlq.prefetch_count", int(prefetchCount)),
 	))
 	defer span.End()
 
@@ -219,7 +356,7 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 		if rowsAffected > 0 {
 			// Successfully inserted placeholder, job is now "locked" for us
 			jobsToReturn = append(jobsToReturn, j)
-			if len(jobsToReturn) >= prefetchCount {
+			if len(jobsToReturn) >= int(prefetchCount) {
 				break // Reached prefetch limit
 			}
 		} else {

@@ -20,7 +20,7 @@ func TestSQLite(t *testing.T) {
 
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
-		sqlq.WithDefaultBackoffFunc(func(i int) time.Duration { return 0 }),
+		sqlq.WithDefaultBackoffFunc(func(i uint16) time.Duration { return 0 }),
 		sqlq.WithDefaultPollInterval(25*time.Millisecond),
 		sqlq.WithTracer(tracer),
 	)

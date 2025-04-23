@@ -46,9 +46,7 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 		t.Fatal("Timed out waiting for job to be processed")
 	}
 
-	// Verify the payload was correctly received
 	require.Equal(t, testPayload.Message, receivedPayload.Message, "Message mismatch")
-	require.Equal(t, testPayload.Count, receivedPayload.Count, "Count mismatch")
 }
 
 func (tc *TestCase) TestBasicPubMultiSub(ctx context.Context, t *testing.T) {

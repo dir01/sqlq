@@ -27,7 +27,7 @@ func (tc *TestCase) TestDelayedJobExecution(ctx context.Context, t *testing.T) {
 	err := tc.Q.Publish(
 		ctx,
 		"delayed_job",
-		TestPayload{Message: "This is a delayed job", Count: 42},
+		TestPayload{Message: "This is a delayed job"},
 		sqlq.WithDelay(delay),
 	)
 	require.NoError(t, err, "Failed to publish delayed job")

@@ -25,8 +25,8 @@ type SQLiteDriver struct {
 	tracer trace.Tracer
 }
 
-// NewSQLiteDriver creates a new SQLite driver with the given database connection
-func NewSQLiteDriver(db *sql.DB) *SQLiteDriver {
+// newSQLiteDriver creates a new SQLite driver with the given database connection
+func newSQLiteDriver(db *sql.DB) *SQLiteDriver {
 	return &SQLiteDriver{db: db, tracer: otel.Tracer(sqliteTracerName)}
 }
 
@@ -100,6 +100,158 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
+func (d *SQLiteDriver) CleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
+		semconv.DBSystemSqlite,
+		attribute.String("sqlq.job_type", jobType),
+		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
+		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
+	))
+	defer span.End()
+
+	var totalProcessedDeleted int64
+	var totalDlqDeleted int64
+
+	// --- Cleanup Processed Jobs (Batched) ---
+	processedThresholdMs := time.Now().Add(-processedMaxAge).UnixMilli()
+	for {
+		var batchDeleted int64
+		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+			// 1. Find a batch of job IDs to delete
+			rows, err := tx.QueryContext(ctx, `
+				SELECT jc.job_id
+				FROM job_consumers jc
+				JOIN jobs j ON jc.job_id = j.id
+				WHERE j.job_type = ? AND jc.processed_at < ?
+				LIMIT ?
+			`, jobType, processedThresholdMs, batchSize)
+			if err != nil {
+				return fmt.Errorf("failed to query batch of old job_consumers for type %s: %w", jobType, err)
+			}
+
+			var jobIDsToDelete []int64
+			for rows.Next() {
+				var jobID int64
+				if err := rows.Scan(&jobID); err != nil {
+					rows.Close()
+					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
+				}
+				jobIDsToDelete = append(jobIDsToDelete, jobID)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, err)
+			}
+			rows.Close()
+
+			if len(jobIDsToDelete) == 0 {
+				return nil // No more jobs in this batch
+			}
+
+			// Prepare statements for batch deletion
+			stmtConsumers, err := tx.PrepareContext(ctx, `DELETE FROM job_consumers WHERE job_id = ?`)
+			if err != nil {
+				return fmt.Errorf("failed to prepare delete statement for job_consumers: %w", err)
+			}
+			defer stmtConsumers.Close()
+
+			stmtJobs, err := tx.PrepareContext(ctx, `DELETE FROM jobs WHERE id = ?`)
+			if err != nil {
+				return fmt.Errorf("failed to prepare delete statement for jobs: %w", err)
+			}
+			defer stmtJobs.Close()
+
+			// 2 & 3. Delete from job_consumers and jobs one by one within the batch transaction
+			for _, jobID := range jobIDsToDelete {
+				_, err := stmtConsumers.ExecContext(ctx, jobID)
+				if err != nil {
+					// Rollback will happen due to error return
+					return fmt.Errorf("failed to delete from job_consumers for job id %d: %w", jobID, err)
+				}
+
+				resJobs, err := stmtJobs.ExecContext(ctx, jobID)
+				if err != nil {
+					// Rollback will happen due to error return
+					return fmt.Errorf("failed to delete from jobs for job id %d: %w", jobID, err)
+				}
+				affectedJobs, _ := resJobs.RowsAffected()
+				batchDeleted += affectedJobs
+			}
+			return nil
+		})
+
+		if err != nil {
+			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
+			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+		}
+
+		totalProcessedDeleted += batchDeleted
+		if batchDeleted < int64(batchSize) {
+			break // Last batch processed
+		}
+	}
+
+	// --- Cleanup DLQ Jobs (Batched) ---
+	dlqThresholdMs := time.Now().Add(-dlqMaxAge).UnixMilli()
+	for {
+		var batchDeleted int64
+		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+			// Efficiently delete a batch using rowid in SQLite
+			resDLQ, err := tx.ExecContext(ctx, `
+				DELETE FROM dead_letter_queue
+				WHERE rowid IN (
+					SELECT rowid
+					FROM dead_letter_queue
+					WHERE job_type = ? AND failed_at < ?
+					LIMIT ?
+				)
+			`, jobType, dlqThresholdMs, batchSize)
+			if err != nil {
+				return fmt.Errorf("failed to delete batch of old dlq jobs for type %s: %w", jobType, err)
+			}
+			count, _ := resDLQ.RowsAffected()
+			batchDeleted = count
+			return nil
+		})
+
+		if err != nil {
+			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
+			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+		}
+
+		totalDlqDeleted += batchDeleted
+		if batchDeleted < int64(batchSize) {
+			break // Last batch processed
+		}
+	}
+
+	span.SetAttributes(
+		attribute.Int64("sqlq.db.rows_deleted.jobs", totalProcessedDeleted),
+		attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted),
+	)
+
+	return totalProcessedDeleted, totalDlqDeleted, nil
+}
+
+// runInTx is a helper to execute a function within a transaction, acquiring the driver mutex
+func (d *SQLiteDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := fn(tx); err != nil {
+		return err // Error occurred, rollback will happen
+	}
+
+	return tx.Commit() // Commit if fn succeeded
+}
+
 func (d *SQLiteDriver) InsertJob(
 	ctx context.Context,
 	jobType string,
@@ -154,12 +306,12 @@ func (d *SQLiteDriver) InsertJob(
 	return err
 }
 
-func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount int) ([]job, error) {
+func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.consumer_name", consumerName),
 		attribute.String("sqlq.job_type", jobType),
-		attribute.Int("sqlq.prefetch_count", prefetchCount),
+		attribute.Int("sqlq.prefetch_count", int(prefetchCount)),
 	))
 	defer span.End()
 
@@ -230,7 +382,7 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 		if err == nil {
 			// Successfully inserted placeholder, job is now "locked" for us
 			jobsToReturn = append(jobsToReturn, j)
-			if len(jobsToReturn) >= prefetchCount {
+			if len(jobsToReturn) >= int(prefetchCount) {
 				break // Reached prefetch limit
 			}
 		} else {

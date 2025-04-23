@@ -15,8 +15,8 @@ import (
 
 func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	var attemptCount atomic.Int32
+	var maxRetries int32 = 2 // We'll allow 2 retries (3 total attempts)
 	jobAttempts := make(chan int, 5)
-	maxRetries := 2 // We'll allow 2 retries (3 total attempts)
 
 	// Consume the queue
 	tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
@@ -92,7 +92,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 
 	// Use atomic counter to avoid race conditions
 	var attemptCount int32 = 0
-	maxRetries := 1 // We'll allow 1 retry (2 total attempts)
+	var maxRetries int32 = 1 // We'll allow 1 retry (2 total attempts)
 
 	// Consume the queue
 	tc.Q.Consume(ctx, "max_retry_job", "max_retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
@@ -116,11 +116,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
 
 	// Create a payload
-	payload := TestPayload{
-		Message: "This job will exceed max retries",
-		Count:   200,
-	}
-
+	payload := TestPayload{Message: "This job will exceed max retries"}
 	// Publish a job with retry configuration
 	err := tc.Q.Publish(ctx, "max_retry_job", payload)
 	require.NoError(t, err, "Failed to publish job with retries")

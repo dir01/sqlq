@@ -41,13 +41,13 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 				return ctx.Err() // Propagate the context cancellation error
 			}
 		},
-		sqlq.WithConsumerMaxRetries(0), // Ensure it goes to DLQ immediately on failure
+		sqlq.WithConsumerMaxRetries(0),          // Ensure it goes to DLQ immediately on failure
 		sqlq.WithConsumerJobTimeout(jobTimeout), // Enable the job timeout
 	)
 	require.NoError(t, err, "Failed to start consumer")
 
 	// Publish a job
-	testPayload := TestPayload{Message: "timeout test", Count: 1}
+	testPayload := TestPayload{Message: "timeout test"}
 	err = tc.Q.Publish(ctx, jobType, testPayload)
 	require.NoError(t, err, "Failed to publish job")
 

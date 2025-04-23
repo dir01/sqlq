@@ -185,7 +185,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 		db,
 		sqlq.DBTypePostgres,
 		sqlq.WithDefaultPollInterval(50*time.Millisecond),
-		sqlq.WithDefaultBackoffFunc(func(i int) time.Duration { return 0 }),
+		sqlq.WithDefaultBackoffFunc(func(i uint16) time.Duration { return 0 }),
 		sqlq.WithTracer(tracer),
 	)
 	require.NoError(t, err)

@@ -13,7 +13,6 @@ import (
 // TestPayload is the test data structure used across all tests
 type TestPayload struct {
 	Message string `json:"message"`
-	Count   int    `json:"count"`
 }
 
 // TestCase contains actual logic of tests that will work across all the different drivers
