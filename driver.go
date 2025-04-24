@@ -9,18 +9,22 @@ import (
 // Driver defines the interface for database-specific operations
 type Driver interface {
 	// InitSchema creates the necessary tables if they don't exist
+	// It should be safe to call multiple times, even though there is no reason to do so
 	InitSchema(ctx context.Context) error
 
-	// InsertJob executes the query for inserting a job, including trace context
+	// InsertJob executes the query for inserting a job
 	InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
-	// GetJobsForConsumer executes the query for finding jobs for a consumer, returning trace context
+	// GetJobsForConsumer executes the query for finding jobs for a consumer
+	// Jobs returned once should not be returned unless they were explicitly rescheduled
 	GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error)
 
 	// MarkJobProcessed executes the query for marking a job as processed
+	// Processed jobs are not returned to consumers and are eligible for cleanup
 	MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error
 
 	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
+	// Rescheduled jobs can be returned to consumers again
 	MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
 
 	// MoveToDeadLetterQueue moves a job to the dead letter queue
