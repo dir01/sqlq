@@ -19,7 +19,7 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 	var receivedPayload TestPayload
 
 	// Consume the queue
-	tc.Q.Consume(ctx, "test_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "test_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
@@ -32,10 +32,11 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 
 		return nil
 	})
+	require.NoError(t, err, "Failed to start consumer for test_job")
 
 	testPayload := TestPayload{Message: "Hello, World!"}
 
-	err := tc.Q.Publish(ctx, "test_job", testPayload)
+	err = tc.Q.Publish(ctx, "test_job", testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
 	// Wait for the job to be processed with a longer timeout

@@ -3,6 +3,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -81,9 +82,15 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	// Defer rollback and check error
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during InitSchema", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	for _, query := range queries {
 		_, err := tx.ExecContext(ctx, query)
@@ -134,16 +141,21 @@ func (d *SQLiteDriver) CleanupJobs(ctx context.Context, jobType string, processe
 			for rows.Next() {
 				var jobID int64
 				if err := rows.Scan(&jobID); err != nil {
-					rows.Close()
+					// Check close error here as well
+					if closeErr := rows.Close(); closeErr != nil {
+						span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+					}
 					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
 				}
 				jobIDsToDelete = append(jobIDsToDelete, jobID)
 			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, err)
+			rowsErr := rows.Err()
+			if closeErr := rows.Close(); closeErr != nil { // Close should happen before checking rows.Err()
+				span.AddEvent("Failed to close rows after job ID scan", trace.WithAttributes(attribute.String("error", closeErr.Error())))
 			}
-			rows.Close()
+			if rowsErr != nil {
+				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, rowsErr)
+			}
 
 			if len(jobIDsToDelete) == 0 {
 				return nil // No more jobs in this batch
@@ -154,13 +166,23 @@ func (d *SQLiteDriver) CleanupJobs(ctx context.Context, jobType string, processe
 			if err != nil {
 				return fmt.Errorf("failed to prepare delete statement for job_consumers: %w", err)
 			}
-			defer stmtConsumers.Close()
+			// Defer close and check error
+			defer func() {
+				if closeErr := stmtConsumers.Close(); closeErr != nil {
+					span.AddEvent("Failed to close job_consumers delete statement", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+				}
+			}()
 
 			stmtJobs, err := tx.PrepareContext(ctx, `DELETE FROM jobs WHERE id = ?`)
 			if err != nil {
 				return fmt.Errorf("failed to prepare delete statement for jobs: %w", err)
 			}
-			defer stmtJobs.Close()
+			// Defer close and check error
+			defer func() {
+				if closeErr := stmtJobs.Close(); closeErr != nil {
+					span.AddEvent("Failed to close jobs delete statement", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+				}
+			}()
 
 			// 2 & 3. Delete from job_consumers and jobs one by one within the batch transaction
 			for _, jobID := range jobIDsToDelete {
@@ -243,7 +265,13 @@ func (d *SQLiteDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) e
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	// Defer rollback and check error
+	defer func() {
+		// Note: No span available here. Log simply or ignore.
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			fmt.Printf("WARN: Failed to rollback transaction in runInTx helper: %v\n", rErr)
+		}
+	}()
 
 	if err := fn(tx); err != nil {
 		return err // Error occurred, rollback will happen
@@ -331,10 +359,15 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	`, jobType, nowMs, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return nil, err
 	}
-
-	defer rows.Close()
+	// Defer close and check error
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			span.AddEvent("Failed to close rows after selecting potential jobs", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+		}
+	}()
 
 	var potentialJobs []job // Store potential jobs first
 	for rows.Next() {
@@ -360,18 +393,25 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	}
 	if err := rows.Err(); err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return nil, err
 	}
-	rows.Close() // Close rows explicitly before starting transaction
+	// rows are closed by the defer func() added earlier
 
 	// Now, try to "lock" the potential jobs by inserting into job_consumers
 	var jobsToReturn []job
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
+		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
 		return nil, err
 	}
-	defer tx.Rollback() // Rollback if commit fails or not reached
+	// Defer rollback and check error
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during job locking", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	for _, j := range potentialJobs {
 		// Attempt to update the job to lock it for this consumer
@@ -478,7 +518,12 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
 		return err
 	}
-	defer tx.Rollback()
+	// Defer rollback and check error
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during reschedule", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	// Calculate new scheduled time in milliseconds
 	nowMs := time.Now().UnixMilli()
@@ -535,7 +580,12 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 		span.RecordError(err)
 		return err
 	}
-	defer tx.Rollback()
+	// Defer rollback and check error
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during DLQ move", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	var job struct {
 		ID          int64
@@ -625,7 +675,13 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	// Defer close and check error
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			// Cannot add to span here as it's not available, log instead or ignore.
+			fmt.Printf("WARN: Failed to close rows in queryDeadLetterJobs helper: %v\n", closeErr)
+		}
+	}()
 
 	var jobs []DeadLetterJob
 	for rows.Next() {
@@ -676,7 +732,12 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 		span.RecordError(err)
 		return err
 	}
-	defer tx.Rollback()
+	// Defer rollback and check error
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during DLQ requeue", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	var dlqJob DeadLetterJob
 	err = tx.QueryRowContext(ctx, `

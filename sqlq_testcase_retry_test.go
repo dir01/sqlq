@@ -19,7 +19,7 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	jobAttempts := make(chan int, 5)
 
 	// Consume the queue
-	tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		count := attemptCount.Add(1)
 		jobAttempts <- int(count)
 
@@ -32,12 +32,13 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 
 		return nil
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
+	require.NoError(t, err, "Failed to start consumer for retry_job")
 
 	// Create a payload
 	payload := TestPayload{Message: "TestRetry"}
 
 	// Publish a job with retry configuration
-	err := tc.Q.Publish(ctx, "retry_job", payload)
+	err = tc.Q.Publish(ctx, "retry_job", payload)
 	require.NoError(t, err)
 
 	timeout := time.NewTimer(1 * time.Second)
@@ -95,7 +96,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	var maxRetries int32 = 1 // We'll allow 1 retry (2 total attempts)
 
 	// Consume the queue
-	tc.Q.Consume(ctx, "max_retry_job", "max_retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "max_retry_job", "max_retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			t.Errorf("Failed to unmarshal payload: %v", err)
@@ -114,11 +115,12 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 		// Always fail the job
 		return errors.New("simulated failure")
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
+	require.NoError(t, err, "Failed to start consumer for max_retry_job")
 
 	// Create a payload
 	payload := TestPayload{Message: "This job will exceed max retries"}
 	// Publish a job with retry configuration
-	err := tc.Q.Publish(ctx, "max_retry_job", payload)
+	err = tc.Q.Publish(ctx, "max_retry_job", payload)
 	require.NoError(t, err, "Failed to publish job with retries")
 
 	timeout := time.NewTimer(1 * time.Second)

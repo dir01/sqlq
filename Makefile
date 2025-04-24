@@ -6,6 +6,10 @@ test:
 	go test -timeout 3m -race -v ./...
 .PHONY: test
 
+lint:
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run
+.PHONY: lint
+
 test-short:
 	go test -timeout 1m -race -short -failfast -v ./...
 .PHONY: test-short

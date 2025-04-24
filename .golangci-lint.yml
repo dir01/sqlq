@@ -1,0 +1,8 @@
+linters:
+  settings:
+    asasalint:
+      exclude:
+        - Append
+        - \.Wrapf
+
+

@@ -3,6 +3,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -78,7 +79,13 @@ func (d *PostgresDriver) InitSchema(ctx context.Context) error {
 		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction", trace.WithAttributes(attribute.String("error", rErr.Error())))
+			// Log or handle the rollback error appropriately
+			// If the main function error 'err' is nil, you might want to assign rErr to it here.
+		}
+	}()
 
 	for _, query := range queries {
 		_, err := tx.ExecContext(ctx, query)
@@ -129,16 +136,21 @@ func (d *PostgresDriver) CleanupJobs(ctx context.Context, jobType string, proces
 			for rows.Next() {
 				var jobID int64
 				if err := rows.Scan(&jobID); err != nil {
-					rows.Close()
+					// Check close error here as well
+					if closeErr := rows.Close(); closeErr != nil {
+						span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+					}
 					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
 				}
 				jobIDsToDelete = append(jobIDsToDelete, jobID)
 			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, err)
+			rowsErr := rows.Err()
+			if closeErr := rows.Close(); closeErr != nil { // Close should happen before checking rows.Err()
+				span.AddEvent("Failed to close rows after job ID scan", trace.WithAttributes(attribute.String("error", closeErr.Error())))
 			}
-			rows.Close()
+			if rowsErr != nil {
+				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, rowsErr)
+			}
 
 			if len(jobIDsToDelete) == 0 {
 				return nil // No more jobs in this batch
@@ -223,7 +235,16 @@ func (d *PostgresDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	// Defer rollback, checking for errors unless it's sql.ErrTxDone (already committed/rolled back)
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			// Log or handle the rollback error appropriately.
+			// Since this helper doesn't have access to a span, we can't easily add events.
+			// We could potentially pass a logger or span down, but for now, just log simply.
+			// This satisfies staticcheck. A more robust solution might involve refactoring.
+			fmt.Printf("WARN: Failed to rollback transaction in runInTx helper: %v\n", rErr)
+		}
+	}()
 
 	if err := fn(tx); err != nil {
 		return err // Error occurred, rollback will happen
@@ -292,9 +313,15 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	`, jobType, prefetchCount)
 	if err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return nil, fmt.Errorf("failed to select potential jobs: %w", err)
 	}
-	defer rows.Close()
+	// Defer close and check error
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			span.AddEvent("Failed to close rows after selecting potential jobs", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+		}
+	}()
 
 	var potentialJobs []job
 	for rows.Next() {
@@ -320,18 +347,24 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	}
 	if err := rows.Err(); err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return nil, fmt.Errorf("error iterating potential job rows: %w", err)
 	}
-	rows.Close() // Close rows explicitly before starting transaction
+	// rows are closed by the defer func() added earlier
 
 	// 2. Try to "lock" the potential jobs by inserting into job_consumers
 	var jobsToReturn []job
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
+		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during job locking", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE jobs
@@ -341,7 +374,11 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 		span.RecordError(fmt.Errorf("failed to prepare update statement for locking: %w", err))
 		return nil, err
 	}
-	defer stmt.Close()
+	defer func() {
+		if closeErr := stmt.Close(); closeErr != nil {
+			span.AddEvent("Failed to close prepared statement for job locking", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+		}
+	}()
 
 	for _, j := range potentialJobs {
 		res, err := stmt.ExecContext(ctx, j.ID)
@@ -426,9 +463,14 @@ func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID i
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
+		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
 		return err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during reschedule", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	// Update the job itself
 	_, err = tx.ExecContext(ctx,
@@ -470,10 +512,14 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64,
 	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return err
 	}
-
-	defer tx.Rollback()
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during DLQ move", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	// Get the job details
 	var job job
@@ -554,7 +600,12 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			// Cannot add to span here as it's not available, log instead or ignore.
+			fmt.Printf("WARN: Failed to close rows in queryDeadLetterJobs helper: %v\n", closeErr)
+		}
+	}()
 
 	var jobs []DeadLetterJob
 	for rows.Next() {
@@ -593,9 +644,14 @@ func (d *PostgresDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) 
 	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
 		span.RecordError(err)
+		span.RecordError(err)
 		return err
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction during DLQ requeue", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	// Get the job from the dead letter queue
 	var dlqJob DeadLetterJob

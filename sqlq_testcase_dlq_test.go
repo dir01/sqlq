@@ -24,14 +24,15 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	var maxRetries int32 = 0
 	var attempts atomic.Int32
 
-	tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		attempts.Add(1)
 		return errors.New("simulated failure to move job to DLQ")
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
+	require.NoError(t, err, "Failed to start consumer for DLQ test")
 
 	testPayload := TestPayload{Message: "test_dlq_job_payload"}
 	// Publish the job with max retries
-	err := tc.Q.Publish(ctx, jobType, testPayload)
+	err = tc.Q.Publish(ctx, jobType, testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
 	require.Eventually(t, func() bool {
@@ -70,7 +71,7 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 	shouldSucceed := false
 
 	// Consume job type
-	tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			return err
@@ -96,10 +97,11 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 
 		return nil
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
+	require.NoError(t, err, "Failed to start consumer for DLQ requeue test")
 
 	testPayload := TestPayload{Message: "This job will be requeued from DLQ"}
 
-	err := tc.Q.Publish(ctx, jobType, testPayload)
+	err = tc.Q.Publish(ctx, jobType, testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
 	select {
@@ -177,10 +179,11 @@ func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 
 	// Consume both job types with a handler that always fails
 	for _, jobType := range []string{jobType1, jobType2} {
-		tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+		err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 			// Always fail to move to DLQ
 			return errors.New("simulated failure for filter test")
 		}, sqlq.WithConsumerMaxRetries(maxRetries))
+		require.NoError(t, err, "Failed to start consumer for DLQ filter test (job type: %s)", jobType)
 	}
 
 	// Publish jobs of both types

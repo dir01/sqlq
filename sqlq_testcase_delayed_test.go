@@ -18,13 +18,14 @@ func (tc *TestCase) TestDelayedJobExecution(ctx context.Context, t *testing.T) {
 	delay := 500 * time.Millisecond
 	jobProcessed := make(chan bool, 1)
 
-	tc.Q.Consume(ctx, "delayed_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "delayed_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		jobProcessed <- true
 		return nil
 	})
+	require.NoError(t, err, "Failed to start consumer for delayed_job")
 
 	// Publish a job with a delay
-	err := tc.Q.Publish(
+	err = tc.Q.Publish(
 		ctx,
 		"delayed_job",
 		TestPayload{Message: "This is a delayed job"},

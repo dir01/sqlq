@@ -225,7 +225,12 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 
 	// Note: Rollback is deferred before PublishTx, so if PublishTx fails,
 	// the rollback happens automatically. If PublishTx succeeds, we commit.
-	defer tx.Rollback()
+	// Check the rollback error unless it's because the transaction was already committed/rolled back.
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			span.AddEvent("Failed to rollback transaction in Publish", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	if err := q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
 		// PublishTx already records its internal errors in its own span
@@ -441,7 +446,12 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 		return
 	}
 	// Defer rollback; it will be ignored if tx.Commit() is called later.
-	defer tx.Rollback()
+	// Check the rollback error unless it's because the transaction was already committed/rolled back.
+	defer func() {
+		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
+			consumeSpan.AddEvent("Failed to rollback transaction in processJob", trace.WithAttributes(attribute.String("error", rErr.Error())))
+		}
+	}()
 
 	// Prepare handler context, potentially with timeout
 	handlerCtx := consumeCtx

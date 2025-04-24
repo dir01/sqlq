@@ -135,7 +135,10 @@ func TestDriverSQLite(t *testing.T) {
 		rows, err := db.QueryContext(t.Context(),
 			"SELECT created_at FROM jobs WHERE job_type = 'precision_test' ORDER BY created_at")
 		require.NoError(t, err)
-		defer rows.Close()
+		// Defer close and check error
+		defer func() {
+			require.NoError(t, rows.Close(), "Failed to close rows in precision test")
+		}()
 
 		var timestamps []int64
 		for rows.Next() {
