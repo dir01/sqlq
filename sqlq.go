@@ -120,10 +120,11 @@ type consumer struct {
 	jobType      string
 	consumerName string
 	handler      func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
-	jobsChan     chan job           // Written to by a db poller, consumed by worker goroutines
-	ctx          context.Context    // context that was passed to .Consume, but with cancelation
-	cancel       context.CancelFunc // cancel() cancels ctx
-	workerWg     sync.WaitGroup     // Wait to make sure all scheduled goroutines stopped
+	jobsChan     chan job // Written to by a db poller, consumed by worker goroutines
+	// TODO: stop stroring context in struct, https://go.dev/blog/context-and-structs
+	ctx      context.Context    // context that was passed to .Consume, but with cancelation
+	cancel   context.CancelFunc // cancel() cancels ctx
+	workerWg sync.WaitGroup     // Wait to make sure all scheduled goroutines stopped
 
 	pollInterval    time.Duration                       // How often should db poller run
 	jobTimeout      time.Duration                       // After this amount a time, job context will be canceled
