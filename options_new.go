@@ -21,7 +21,7 @@ func WithTracer(tracer trace.Tracer) NewOption {
 //////////////////////////////////////////
 
 // WithDefaultPollInterval allows to configure default poll interval.
-// This value may be overriden per individual consumer, see WithConsumerPollInteval.
+// This value may be overridden per individual consumer, see WithConsumerPollInteval.
 func WithDefaultPollInterval(tick time.Duration) NewOption {
 	return func(q *sqlq) {
 		q.defaultPollInterval = tick
@@ -29,7 +29,7 @@ func WithDefaultPollInterval(tick time.Duration) NewOption {
 }
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
-// This value may be overriden per individual consumer, see WithConsumerBackoffFunc.
+// This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
 func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
 		q.defaultBackoffFunc = backoffFunc
@@ -37,7 +37,7 @@ func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 }
 
 // WithDefaultConcurrency sets default number of concurrent workers for a new consumer.
-// This value may be overriden per individual consumer, see WithConsumerConcurrency.
+// This value may be overridden per individual consumer, see WithConsumerConcurrency.
 func WithDefaultConcurrency(concurrency uint16) NewOption {
 	return func(o *sqlq) {
 		if concurrency > 0 {
@@ -93,7 +93,7 @@ func WithDefaultCleanupBatch(batchSize uint16) NewOption {
 }
 
 // WithDefaultPrefetchCount sets default number of jobs to prefetch in a single query for a new consumer.
-// This value may be overriden per individual consumer, see WithConsumerPrefetchCount.
+// This value may be overridden per individual consumer, see WithConsumerPrefetchCount.
 func WithDefaultPrefetchCount(prefetchCount uint16) NewOption {
 	return func(o *sqlq) {
 		if prefetchCount > 0 {
@@ -102,9 +102,9 @@ func WithDefaultPrefetchCount(prefetchCount uint16) NewOption {
 	}
 }
 
-// WithConsumerMaxRetries sets default maximum number of job retries for a new consumer.
+// WithDefaultMaxRetries sets the default maximum number of job retries for a new consumer.
 // Use -1 for infinite retries.
-// This value may be overriden per individual consumer, see WithConsumerMaxRetries.
+// This value may be overridden per individual consumer using WithConsumerMaxRetries.
 func WithDefaultMaxRetries(maxRetries int32) NewOption {
 	return func(o *sqlq) {
 		if maxRetries >= infiniteRetries {
@@ -116,7 +116,7 @@ func WithDefaultMaxRetries(maxRetries int32) NewOption {
 // WithDefaultJobTimeout sets a maximum execution duration for a single job handler invocation.
 // If the handler exceeds this duration, its context will be canceled.
 // A timeout is treated as a job failure.
-// This value may be overriden per individual consumer, see WithConsumerJobTimeout.
+// This value may be overridden per individual consumer, see WithConsumerJobTimeout.
 func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	return func(o *sqlq) {
 		if timeout > 0 {

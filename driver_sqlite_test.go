@@ -1,33 +1,35 @@
-package sqlq_test
+package sqlq
 
 import (
 	"database/sql"
 	"testing"
 	"time"
 
-	"github.com/dir01/sqlq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDriverSQLite(t *testing.T) {
+	t.Parallel()
+
 	db, err := sql.Open("sqlite3", "file:memdb1?mode=memory&cache=shared")
 	require.NoError(t, err, "Failed to open SQLite database")
 
-	driver := sqlq.NewSQLiteDriver(db)
+	driver := newSQLiteDriver(db)
 
-	err = driver.InitSchema(t.Context())
+	err = driver.initSchema(t.Context())
 	require.NoError(t, err)
 
 	payload := []byte{'H', 'i'}
 	traceContext := map[string]string{"foo": "bar"}
 
 	t.Run("Insert with delay", func(t *testing.T) {
+		t.Parallel() // Run subtest in parallel
 		delay := 30 * time.Minute
 		expectedScheduledAt := time.Now().Add(delay)
 		jobType := "insert_with_delay"
 
-		err := driver.InsertJob(t.Context(), jobType, payload, delay, traceContext)
+		err := driver.insertJob(t.Context(), jobType, payload, delay, traceContext)
 		require.NoError(t, err)
 
 		var job struct {
@@ -59,13 +61,14 @@ func TestDriverSQLite(t *testing.T) {
 	})
 
 	t.Run("GetJobsForConsumer", func(t *testing.T) {
+		t.Parallel() // Run subtest in parallel
 		ctx := t.Context()
 		jobType := "GetJobsForConsumer"
 
-		err := driver.InsertJob(ctx, jobType, payload, 0, traceContext)
+		err := driver.insertJob(ctx, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.GetJobsForConsumer(ctx, "some-consumer-name", jobType, 10)
+		jobs, err := driver.getJobsForConsumer(ctx, "some-consumer-name", jobType, 10)
 		require.NoError(t, err)
 
 		require.Equal(t, 1, len(jobs))
@@ -76,22 +79,24 @@ func TestDriverSQLite(t *testing.T) {
 	})
 
 	t.Run("GetJobsForConsumer - delay", func(t *testing.T) {
+		t.Parallel() // Run subtest in parallel
 		jobType := "GetJobsForConsumer - delay"
-		err := driver.InsertJob(t.Context(), jobType, payload, 30*time.Minute, traceContext)
+		err := driver.insertJob(t.Context(), jobType, payload, 30*time.Minute, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.GetJobsForConsumer(t.Context(), "some-consumer-name", jobType, 10)
+		jobs, err := driver.getJobsForConsumer(t.Context(), "some-consumer-name", jobType, 10)
 		require.NoError(t, err)
 
 		require.Equal(t, 0, len(jobs))
 	})
 
 	t.Run("Millisecond time precision", func(t *testing.T) {
+		t.Parallel() // Run subtest in parallel
 		jobType := "epoch_test"
 		now := time.Now()
 		nowMs := now.UnixMilli()
 
-		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
+		err := driver.insertJob(t.Context(), jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
 		// Directly check the database to verify timestamps are stored as milliseconds
@@ -124,8 +129,8 @@ func TestDriverSQLite(t *testing.T) {
 
 		// Test millisecond precision by inserting multiple jobs quickly
 		// Add a small sleep between insertions to ensure we get different timestamps
-		for i := 0; i < 3; i++ {
-			err := driver.InsertJob(t.Context(), "precision_test", payload, 0, traceContext)
+		for range 3 { // Use integer range loop
+			err := driver.insertJob(t.Context(), "precision_test", payload, 0, traceContext)
 			require.NoError(t, err)
 			// Sleep a tiny amount to ensure different timestamps
 			time.Sleep(time.Millisecond)
@@ -160,20 +165,21 @@ func TestDriverSQLite(t *testing.T) {
 	})
 
 	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
+		t.Parallel() // Run subtest in parallel
 		jobType := "concurrent_race_test"
 		consumerName := "race-consumer"
-		err := driver.InsertJob(t.Context(), jobType, payload, 0, traceContext)
+		err := driver.insertJob(t.Context(), jobType, payload, 0, traceContext)
 		require.NoError(t, err, "Failed to insert job for race test")
 
 		// Simulate first consumer fetching the job
-		jobs1, err := driver.GetJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		jobs1, err := driver.getJobsForConsumer(t.Context(), consumerName, jobType, 1)
 		require.NoError(t, err, "First GetJobsForConsumer call failed")
 		require.Len(t, jobs1, 1, "First GetJobsForConsumer should fetch 1 job")
 		jobID1 := jobs1[0].ID
 
 		// Simulate second consumer (or same consumer polling again quickly)
 		// *before* the first one marks the job as processed
-		jobs2, err := driver.GetJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		jobs2, err := driver.getJobsForConsumer(t.Context(), consumerName, jobType, 1)
 		require.NoError(t, err, "Second GetJobsForConsumer call failed")
 
 		// *** This is the assertion that should FAIL with the current driver logic ***
@@ -185,7 +191,7 @@ func TestDriverSQLite(t *testing.T) {
 		// If the assertion failed (current state), the following lines might
 		// not be reached, or jobs2 might contain the same job.
 
-		err = driver.MarkJobProcessed(t.Context(), jobID1, consumerName)
+		err = driver.markJobProcessed(t.Context(), jobID1, consumerName)
 		require.NoError(t, err, "Marking job processed for the first time failed")
 
 		// If jobs2 incorrectly contained the job, attempting to mark it

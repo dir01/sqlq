@@ -28,7 +28,9 @@ func newPostgresDriver(db *sql.DB) *PostgresDriver {
 	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)}
 }
 
-func (d *PostgresDriver) InitSchema(ctx context.Context) error {
+// initSchema creates the necessary tables and indexes for PostgreSQL if they don't exist.
+// It's idempotent and safe to call multiple times.
+func (d *PostgresDriver) initSchema(ctx context.Context) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.init_schema", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 	))
@@ -102,7 +104,9 @@ func (d *PostgresDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
-func (d *PostgresDriver) CleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type in PostgreSQL.
+// It deletes processed jobs older than processedMaxAge and DLQ jobs older than dlqMaxAge, in batches.
+func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
@@ -253,7 +257,7 @@ func (d *PostgresDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error)
 	return tx.Commit() // Commit if fn succeeded
 }
 
-func (d *PostgresDriver) InsertJob(
+func (d *PostgresDriver) insertJob(
 	ctx context.Context,
 	jobType string,
 	payload []byte,
@@ -292,7 +296,9 @@ func (d *PostgresDriver) InsertJob(
 	return err
 }
 
-func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
+// getJobsForConsumer selects and locks available jobs for a given consumer and job type from PostgreSQL.
+// It uses an advisory lock-like mechanism by updating `consumed_at`.
+func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.consumer_name", consumerName),
@@ -414,7 +420,8 @@ func (d *PostgresDriver) GetJobsForConsumer(ctx context.Context, consumerName, j
 	return jobsToReturn, nil
 }
 
-func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
+// markJobProcessed updates the job_consumers table to mark a job as successfully processed in PostgreSQL.
+func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -451,7 +458,7 @@ func (d *PostgresDriver) MarkJobProcessed(ctx context.Context, jobID int64, cons
 	return nil // Return nil even if rowsAffected is 0, as the goal is idempotency
 }
 
-func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
+func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_failed_and_reschedule", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -501,7 +508,8 @@ func (d *PostgresDriver) MarkJobFailedAndReschedule(ctx context.Context, jobID i
 	return err
 }
 
-func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+// moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in PostgreSQL.
+func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -529,7 +537,7 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64,
 	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount) // Use QueryRowContext
 	if err != nil {
 		span.RecordError(err)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrJobNotFound
 		}
 		return err
@@ -560,7 +568,8 @@ func (d *PostgresDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64,
 	return err
 }
 
-func (d *PostgresDriver) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
+// getDeadLetterJobs retrieves jobs from the dead_letter_queue table in PostgreSQL, optionally filtered by job type.
+func (d *PostgresDriver) getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType), // jobType might be empty
@@ -634,7 +643,8 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 	return jobs, nil
 }
 
-func (d *PostgresDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
+// requeueDeadLetterJob moves a job from the dead_letter_queue back into the main jobs table for reprocessing in PostgreSQL.
+func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.requeue_dlq_job", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.dlq_id", dlqID),
@@ -661,7 +671,7 @@ func (d *PostgresDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) 
 	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload) // Use QueryRowContext
 	if err != nil {
 		span.RecordError(err)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrJobNotFound
 		}
 		return err

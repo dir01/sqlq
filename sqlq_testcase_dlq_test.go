@@ -21,10 +21,10 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 
 	jobType := "job_moves_to_dlq_after_max_retries"
 	consumerName := "dlq_test_consumer"
-	var maxRetries int32 = 0
+	var maxRetries int32 // Remove '= 0'
 	var attempts atomic.Int32
 
-	err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, jobType, consumerName, func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		attempts.Add(1)
 		return errors.New("simulated failure to move job to DLQ")
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
@@ -36,7 +36,7 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	require.NoError(t, err, "Failed to publish job")
 
 	require.Eventually(t, func() bool {
-		return attempts.Load() == int32(maxRetries)+1
+		return attempts.Load() == maxRetries+1 // Remove unnecessary conversion
 	}, 2*time.Second, 10*time.Millisecond)
 
 	var dlqJobs []sqlq.DeadLetterJob
@@ -64,7 +64,7 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 
 	jobType := "dlq_requeue_test"
 	consumerName := "dlq_requeue_consumer"
-	var maxRetries int32 = 0
+	var maxRetries int32 // Remove '= 0'
 
 	jobFailed := make(chan struct{})
 	jobSucceeded := make(chan struct{})
@@ -128,7 +128,7 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 		err = json.Unmarshal(dlqJob.Payload, &payload)
 		require.NoError(t, err, "Failed to unmarshal DLQ job payload")
 
-		if true { //payload.Count == testPayload.Count {
+		if true { // payload.Count == testPayload.Count { // Add space after //
 			dlqJobID = dlqJob.ID
 			break
 		}
@@ -175,11 +175,11 @@ func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 	jobType1 := "dlq_filter_test_1"
 	jobType2 := "dlq_filter_test_2"
 	consumerName := "dlq_filter_consumer"
-	var maxRetries int32 = 0 // No retries to speed up the test
+	var maxRetries int32 // No retries to speed up the test // Remove '= 0'
 
 	// Consume both job types with a handler that always fails
 	for _, jobType := range []string{jobType1, jobType2} {
-		err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+		err := tc.Q.Consume(ctx, jobType, consumerName, func(_ context.Context, _ *sql.Tx, _ []byte) error {
 			// Always fail to move to DLQ
 			return errors.New("simulated failure for filter test")
 		}, sqlq.WithConsumerMaxRetries(maxRetries))
@@ -187,7 +187,7 @@ func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 	}
 
 	// Publish jobs of both types
-	for i := 0; i < 3; i++ {
+	for range 3 { // Use integer range loop
 		err := tc.Q.Publish(ctx, jobType1, TestPayload{
 			Message: "Type 1 job",
 		})

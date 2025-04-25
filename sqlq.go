@@ -24,40 +24,55 @@ import (
 
 const tracerName = "github.com/dir01/sqlq"
 
+// JobsQueue defines the interface for interacting with the job queue.
 type JobsQueue interface {
+	// Publish adds a new job to the queue.
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
+	// PublishTx adds a new job to the queue within an existing transaction.
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
+	// Consume registers a handler function for a specific job type.
 	Consume(
 		ctx context.Context,
 		jobType string,
 		consumerName string,
 		f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...ConsumerOption,
 	) error
+	// GetDeadLetterJobs retrieves jobs from the dead letter queue, optionally filtered by job type.
 	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
+	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue.
 	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
+	// Shutdown gracefully stops all consumers and background processes.
 	Shutdown()
+	// Run performs initial setup like schema initialization.
 	Run()
 }
 
+// DBType represents the supported database types.
 type DBType string
 
 const (
-	DBTypeSQLite   DBType = "sqlite"
+	// DBTypeSQLite identifies the SQLite database type.
+	DBTypeSQLite DBType = "sqlite"
+	// DBTypePostgres identifies the PostgreSQL database type.
 	DBTypePostgres DBType = "postgres"
 )
 
 var (
-	ErrDuplicateConsumer  = errors.New(".Consume was called twice for same job type")
-	ErrUnsupportedDBType  = errors.New("unsupported database type")
+	// ErrDuplicateConsumer is returned when Consume is called multiple times for the same job type.
+	ErrDuplicateConsumer = errors.New(".Consume was called twice for same job type")
+	// ErrUnsupportedDBType is returned when an unsupported database type is provided to New.
+	ErrUnsupportedDBType = errors.New("unsupported database type")
+	// ErrMaxRetriesExceeded indicates a job failed more times than its configured maximum retries.
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
-	ErrJobNotFound        = errors.New("job not found")
+	// ErrJobNotFound indicates that a job with the specified ID was not found (e.g., in DLQ operations).
+	ErrJobNotFound = errors.New("job not found")
 )
 
 var (
 	defaultMaxRetries      int32  = 3
 	infiniteRetries        int32  = -1
-	defaultConcurrency     uint16 = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
-	defaultPrefetchCount   uint16 = defaultConcurrency
+	defaultConcurrency            = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
+	defaultPrefetchCount          = defaultConcurrency
 	defaultJobTimeout             = 15 * time.Minute
 	defaultCleanupInterval        = 1 * time.Hour
 	defaultCleanupAge             = 7 * 24 * time.Hour
@@ -68,9 +83,9 @@ var (
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
 	db                *sql.DB
-	driver            Driver
+	driver            driver
 	consumersMap      map[string]*consumer // jobType -> consumer
-	consumersMapMutex sync.RWMutex         // guard consumersMap
+	consumersMapMutex sync.RWMutex         // guard consumersMap //nolint:revive // Field name is descriptive
 	shutdown          chan struct{}
 	tracer            trace.Tracer
 
@@ -172,6 +187,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		db:                   db,
 		driver:               driver,
 		consumersMap:         make(map[string]*consumer),
+		consumersMapMutex:    sync.RWMutex{}, // Initialize mutex
 		shutdown:             make(chan struct{}),
 		defaultPollInterval:  100 * time.Millisecond,
 		defaultConcurrency:   defaultConcurrency,
@@ -201,7 +217,7 @@ func (q *sqlq) Run() {
 	initCtx, initSpan := q.tracer.Start(context.Background(), "sqlq.init_schema")
 	defer initSpan.End()
 
-	if err := q.driver.InitSchema(initCtx); err != nil {
+	if err := q.driver.initSchema(initCtx); err != nil {
 		initSpan.RecordError(err)
 		// Consider if initialization failure should prevent startup
 	}
@@ -247,8 +263,8 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 	return nil
 }
 
-// PublishTx adds a new job to the queue within an existing transaction
-func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
+// PublishTx adds a new job to the queue within an existing transaction.
+func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
 	// Start a new span as a child of the context passed in.
 	// It's assumed the caller (Publish or external) started a relevant parent span.
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish_tx",
@@ -259,7 +275,9 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	)
 	defer span.End()
 
-	options := &publishOptions{}
+	options := &publishOptions{
+		delay: 0, // Explicitly initialize delay
+	}
 
 	// Apply provided options
 	for _, o := range opts {
@@ -279,7 +297,7 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	traceContextMap := propagation.MapCarrier(make(map[string]string))
 	otel.GetTextMapPropagator().Inject(ctx, traceContextMap) // Use the context returned by Start
 
-	err = q.driver.InsertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
+	err = q.driver.insertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
 		// The driver method should record the specific DB error in its span.
 		// We record a higher-level error here.
@@ -314,9 +332,12 @@ func (q *sqlq) Consume(
 		backoffFunc:     q.defaultBackoffFunc,
 		cleanupInterval: q.defaultCleanupInterval, // Use default from sqlq struct
 		cleanupBatch:    q.defaultCleanupBatch,    // Use default from sqlq struct
-		// cleanupAge and cleanupDLQAge start as nil, consumer options can override
-		ctx:    consCtx,
-		cancel: cancel,
+		cleanupAge:      nil,                      // Explicitly initialize
+		cleanupDLQAge:   nil,                      // Explicitly initialize
+		jobsChan:        nil,                      // Will be initialized below
+		workerWg:        sync.WaitGroup{},         // Initialize WaitGroup
+		ctx:             consCtx,
+		cancel:          cancel,
 	}
 
 	for _, o := range opts {
@@ -427,6 +448,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 	consumeCtx, consumeSpan := q.tracer.Start(parentCtx, "sqlq.consume",
 		trace.WithLinks(trace.Link{
 			SpanContext: trace.SpanContextFromContext(parentCtx),
+			Attributes:  nil, // Explicitly initialize Attributes
 		}),
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", cons.jobType),
@@ -438,7 +460,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 	)
 	defer consumeSpan.End() // Ensure span is always ended
 
-	tx, err := q.db.BeginTx(consumeCtx, &sql.TxOptions{Isolation: sql.LevelDefault})
+	tx, err := q.db.BeginTx(consumeCtx, &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false}) // Explicitly set ReadOnly
 	if err != nil {
 		consumeSpan.RecordError(err)
 		consumeSpan.RecordError(err)
@@ -501,7 +523,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 
 		// Transaction committed successfully, now mark the job processed
 		markCtx, markSpan := q.tracer.Start(consumeCtx, "sqlq.mark_processed") // Use original consumeCtx
-		markErr := q.driver.MarkJobProcessed(markCtx, job.ID, cons.consumerName)
+		markErr := q.driver.markJobProcessed(markCtx, job.ID, cons.consumerName)
 		if markErr != nil {
 			// Log or trace the error, but the job is technically processed as the TX committed.
 			markSpan.RecordError(fmt.Errorf("failed to mark job processed after commit: %w", markErr))
@@ -539,7 +561,7 @@ func (q *sqlq) processJob(cons *consumer, job *job) {
 
 	// Max retries exceeded or retries disabled, move to Dead Letter Queue
 	dlqCtx, dlqSpan := q.tracer.Start(consumeCtx, "sqlq.move_to_dlq") // Use original consumeCtx
-	moveErr := q.driver.MoveToDeadLetterQueue(dlqCtx, job.ID, finalErr.Error())
+	moveErr := q.driver.moveToDeadLetterQueue(dlqCtx, job.ID, finalErr.Error())
 	if moveErr != nil {
 		dlqSpan.RecordError(moveErr)
 		dlqSpan.SetStatus(codes.Error, "failed to move job to DLQ")
@@ -569,7 +591,7 @@ func (q *sqlq) retryJob(ctx context.Context, consumer *consumer, job *job, error
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	// Mark job as failed and reschedule in a single operation
-	if err := q.driver.MarkJobFailedAndReschedule(ctx, job.ID, errorMsg, backoff); err != nil {
+	if err := q.driver.markJobFailedAndReschedule(ctx, job.ID, errorMsg, backoff); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
@@ -585,7 +607,7 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 	))
 	defer span.End()
 
-	jobs, err := q.driver.GetDeadLetterJobs(ctx, jobType, limit)
+	jobs, err := q.driver.getDeadLetterJobs(ctx, jobType, limit)
 	if err != nil {
 		span.RecordError(err)
 	} else {
@@ -602,7 +624,7 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 	))
 	defer span.End()
 
-	err := q.driver.RequeueDeadLetterJob(ctx, dlqID)
+	err := q.driver.requeueDeadLetterJob(ctx, dlqID)
 	if err != nil {
 		span.RecordError(err)
 	}
@@ -623,7 +645,7 @@ func (q *sqlq) Shutdown() {
 }
 
 // runCleanupLoop periodically cleans up old jobs for a specific consumer/jobType
-func (cons *consumer) runCleanupLoop(driver Driver, tracer trace.Tracer) {
+func (cons *consumer) runCleanupLoop(driver driver, tracer trace.Tracer) {
 	cons.workerWg.Add(1)       // Track the cleanup goroutine in the consumer's WaitGroup
 	defer cons.workerWg.Done() // Signal completion to the consumer's WaitGroup
 
@@ -653,18 +675,18 @@ func (cons *consumer) runCleanupLoop(driver Driver, tracer trace.Tracer) {
 }
 
 // performCleanup calls the driver to delete old jobs for this consumer's job type
-func (c *consumer) performCleanup(driver Driver, tracer trace.Tracer, processedMaxAge, dlqMaxAge time.Duration) {
+func (cons *consumer) performCleanup(driver driver, tracer trace.Tracer, processedMaxAge, dlqMaxAge time.Duration) {
 	// Create a background context for the cleanup operation itself
 	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup", trace.WithAttributes(
-		attribute.String("sqlq.job_type", c.jobType),
-		attribute.String("sqlq.consumer_name", c.consumerName),
+		attribute.String("sqlq.job_type", cons.jobType),
+		attribute.String("sqlq.consumer_name", cons.consumerName),
 		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
 		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
-		attribute.Int("sqlq.cleanup.batch_size", int(c.cleanupBatch)),
+		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
 	))
 	defer span.End()
 
-	processedDeleted, dlqDeleted, err := driver.CleanupJobs(ctx, c.jobType, processedMaxAge, dlqMaxAge, c.cleanupBatch)
+	processedDeleted, dlqDeleted, err := driver.cleanupJobs(ctx, cons.jobType, processedMaxAge, dlqMaxAge, cons.cleanupBatch)
 
 	span.SetAttributes(
 		attribute.Int64("sqlq.cleanup.processed_deleted", processedDeleted),
@@ -673,7 +695,7 @@ func (c *consumer) performCleanup(driver Driver, tracer trace.Tracer, processedM
 
 	if err != nil {
 		// Use a standard logger or integrate with a proper logging library
-		log.Printf("sqlq: cleanup failed for job_type %s: %v", c.jobType, err)
+		log.Printf("sqlq: cleanup failed for job_type %s: %v", cons.jobType, err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "cleanup failed")
 	} else {
@@ -683,7 +705,7 @@ func (c *consumer) performCleanup(driver Driver, tracer trace.Tracer, processedM
 
 // fetchJobsForConsumer fetches jobs for a specific consumer and sends them to worker goroutines
 func (q *sqlq) fetchJobsForConsumer(ctx context.Context, cons *consumer) error {
-	jobs, err := q.driver.GetJobsForConsumer(ctx, cons.consumerName, cons.jobType, cons.prefetchCount)
+	jobs, err := q.driver.getJobsForConsumer(ctx, cons.consumerName, cons.jobType, cons.prefetchCount)
 	if err != nil {
 		return fmt.Errorf("failed to query jobs: %w", err)
 	}

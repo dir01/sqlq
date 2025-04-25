@@ -27,9 +27,8 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 	handlerFinished := make(chan bool, 1) // Should not receive on this channel
 
 	// Consume the queue with a job execution timeout
-	// NOTE: sqlq.WithJobTimeout is not yet implemented!
 	err := tc.Q.Consume(ctx, jobType, consumerName,
-		func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+		func(ctx context.Context, _ *sql.Tx, _ []byte) error { // Rename unused payloadBytes to _
 			handlerStarted <- true
 			select {
 			case <-time.After(processingTime):

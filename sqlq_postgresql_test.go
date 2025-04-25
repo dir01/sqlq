@@ -15,6 +15,7 @@ import (
 )
 
 func TestPostgreSQL(t *testing.T) {
+	t.Parallel() // Run top-level test in parallel
 	if testing.Short() {
 		t.Skip("Skipping PostgreSQL tests in short mode")
 	}
@@ -120,7 +121,8 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	ctx := t.Context()
 	ctx = GracefulContext(ctx, 100*time.Millisecond) // for shutting down mainly
 
-	req := testcontainers.ContainerRequest{
+	// Initialize only necessary fields for testcontainers request
+	req := testcontainers.ContainerRequest{ //nolint:exhaustruct
 		Name:         "sqlq_postgres",
 		Image:        "postgres:14",
 		ExposedPorts: []string{"5432/tcp"},
@@ -136,6 +138,8 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 		ContainerRequest: req,
 		Started:          true,
 		Reuse:            true,
+		ProviderType:     0,   // Initialize ProviderType
+		Logger:           nil, // Initialize Logger
 	})
 	require.NoError(t, err, "Failed to start Postgres container")
 
@@ -185,7 +189,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 		db,
 		sqlq.DBTypePostgres,
 		sqlq.WithDefaultPollInterval(50*time.Millisecond),
-		sqlq.WithDefaultBackoffFunc(func(i uint16) time.Duration { return 0 }),
+		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithTracer(tracer),
 	)
 	require.NoError(t, err)

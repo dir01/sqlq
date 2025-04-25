@@ -39,7 +39,7 @@ func newTracer(ctx context.Context, otlpEndpoint string) (tracer trace.Tracer, c
 	}
 
 	traceProvider := sdktrace.NewTracerProvider(
-		//sdktrace.WithBatcher(exporter), //recommended over Syncer for production, but our volume is low enough
+		// sdktrace.WithBatcher(exporter), // recommended over Syncer for production, but our volume is low enough // Add space after //
 		sdktrace.WithSyncer(exporter),
 		sdktrace.WithResource(resource),
 	)

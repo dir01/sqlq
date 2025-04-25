@@ -19,13 +19,13 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	jobAttempts := make(chan int, 5)
 
 	// Consume the queue
-	err := tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		count := attemptCount.Add(1)
 		jobAttempts <- int(count)
 
 		// For first attempt, count is 1 (since .Add has already happened)
 		// For first retry, count is 2
-		if count <= int32(maxRetries) {
+		if count <= maxRetries { // Remove unnecessary conversion
 			// failed on first attempt and first retry
 			return errors.New("simulated failure")
 		}
@@ -92,7 +92,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	jobAttempts := make(chan int, 3) // Buffer for multiple attempts
 
 	// Use atomic counter to avoid race conditions
-	var attemptCount int32 = 0
+	var attemptCount int32   // Remove '= 0'
 	var maxRetries int32 = 1 // We'll allow 1 retry (2 total attempts)
 
 	// Consume the queue

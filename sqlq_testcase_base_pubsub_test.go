@@ -19,7 +19,7 @@ func (tc *TestCase) TestBasicPubSub(ctx context.Context, t *testing.T) {
 	var receivedPayload TestPayload
 
 	// Consume the queue
-	err := tc.Q.Consume(ctx, "test_job", "test_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "test_job", "test_consumer", func(_ context.Context, _ *sql.Tx, payloadBytes []byte) error { // Rename unused ctx to _
 		var payload TestPayload
 
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
@@ -58,14 +58,14 @@ func (tc *TestCase) TestBasicPubMultiSub(ctx context.Context, t *testing.T) {
 	consumer2Processed := make(chan bool, 1)
 
 	// Consume the first queue
-	err := tc.Q.Consume(ctx, "shared_job", "consumer1", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "shared_job", "consumer1", func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		consumer1Processed <- true
 		return nil
 	})
 	require.NoError(t, err)
 
 	// Consume the second queue
-	err = tc.Q.Consume(ctx, "shared_job", "consumer2", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err = tc.Q.Consume(ctx, "shared_job", "consumer2", func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		consumer2Processed <- true
 		return nil
 	})

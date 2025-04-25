@@ -11,6 +11,8 @@ import (
 )
 
 func TestSQLite(t *testing.T) {
+	t.Parallel() // Run top-level test in parallel
+
 	db, err := otelsql.Open("sqlite3", "file:memdb1?mode=memory&cache=shared")
 	require.NoError(t, err, "Failed to open SQLite database")
 
@@ -20,7 +22,7 @@ func TestSQLite(t *testing.T) {
 
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
-		sqlq.WithDefaultBackoffFunc(func(i uint16) time.Duration { return 0 }),
+		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithDefaultPollInterval(25*time.Millisecond),
 		sqlq.WithTracer(tracer),
 	)

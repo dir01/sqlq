@@ -1,3 +1,4 @@
+// Package sqlq provides a simple SQL-backed job queue.
 package sqlq
 
 import (
@@ -6,41 +7,41 @@ import (
 	"time"
 )
 
-// Driver defines the interface for database-specific operations
-type Driver interface {
-	// InitSchema creates the necessary tables if they don't exist
+// driver defines the interface for database-specific operations
+type driver interface {
+	// initSchema creates the necessary tables if they don't exist
 	// It should be safe to call multiple times, even though there is no reason to do so
-	InitSchema(ctx context.Context) error
+	initSchema(ctx context.Context) error
 
-	// InsertJob executes the query for inserting a job
-	InsertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
+	// insertJob executes the query for inserting a job
+	insertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
-	// GetJobsForConsumer executes the query for finding jobs for a consumer
+	// getJobsForConsumer executes the query for finding jobs for a consumer
 	// Jobs returned once should not be returned unless they were explicitly rescheduled
-	GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error)
+	getJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error)
 
-	// MarkJobProcessed executes the query for marking a job as processed
+	// markJobProcessed executes the query for marking a job as processed
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error
+	markJobProcessed(ctx context.Context, jobID int64, consumerName string) error
 
-	// MarkJobFailedAndReschedule combines marking a job as failed and rescheduling it
+	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	// Rescheduled jobs can be returned to consumers again
-	MarkJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
+	markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
 
-	// MoveToDeadLetterQueue moves a job to the dead letter queue
-	MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error
+	// moveToDeadLetterQueue moves a job to the dead letter queue
+	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error
 
-	// GetDeadLetterJobs retrieves jobs from the dead letter queue
-	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
+	// getDeadLetterJobs retrieves jobs from the dead letter queue
+	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
-	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
+	// requeueDeadLetterJob moves a job from the dead letter queue back to the main queue
+	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
-	// CleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
+	// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
 	// It deletes processed jobs of type jobType older than processedMaxAge, in batches of batchSize.
 	// It deletes DLQ jobs of type jobType older than dlqMaxAge, in batches of batchSize.
 	// It returns the total number of processed jobs deleted, DLQ jobs deleted, and any error.
-	CleanupJobs(
+	cleanupJobs(
 		ctx context.Context,
 		jobType string,
 		processedMaxAge, dlqMaxAge time.Duration,
@@ -49,7 +50,7 @@ type Driver interface {
 }
 
 // getDriver returns the appropriate driver for the given database type
-func getDriver(db *sql.DB, dbType DBType) (Driver, error) {
+func getDriver(db *sql.DB, dbType DBType) (driver, error) {
 	switch dbType {
 	case DBTypeSQLite:
 		return newSQLiteDriver(db), nil

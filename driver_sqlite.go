@@ -26,12 +26,14 @@ type SQLiteDriver struct {
 	tracer trace.Tracer
 }
 
-// newSQLiteDriver creates a new SQLite driver with the given database connection
+// newSQLiteDriver creates a new SQLite driver with the given database connection.
 func newSQLiteDriver(db *sql.DB) *SQLiteDriver {
-	return &SQLiteDriver{db: db, tracer: otel.Tracer(sqliteTracerName)}
+	return &SQLiteDriver{db: db, mutex: sync.Mutex{}, tracer: otel.Tracer(sqliteTracerName)}
 }
 
-func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
+// initSchema creates the necessary tables and indexes for SQLite if they don't exist.
+// It's idempotent and safe to call multiple times.
+func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.init_schema", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 	))
@@ -107,7 +109,9 @@ func (d *SQLiteDriver) InitSchema(ctx context.Context) error {
 	return err
 }
 
-func (d *SQLiteDriver) CleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type in SQLite.
+// It deletes processed jobs older than processedMaxAge and DLQ jobs older than dlqMaxAge, in batches.
+func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
@@ -280,7 +284,7 @@ func (d *SQLiteDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) e
 	return tx.Commit() // Commit if fn succeeded
 }
 
-func (d *SQLiteDriver) InsertJob(
+func (d *SQLiteDriver) insertJob(
 	ctx context.Context,
 	jobType string,
 	payload []byte,
@@ -334,7 +338,9 @@ func (d *SQLiteDriver) InsertJob(
 	return err
 }
 
-func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
+// getJobsForConsumer selects and locks available jobs for a given consumer and job type from SQLite.
+// It uses an advisory lock-like mechanism by updating `consumed_at`.
+func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.consumer_name", consumerName),
@@ -447,7 +453,8 @@ func (d *SQLiteDriver) GetJobsForConsumer(ctx context.Context, consumerName, job
 	return jobsToReturn, nil
 }
 
-func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
+// markJobProcessed updates the job_consumers table to mark a job as successfully processed in SQLite.
+func (d *SQLiteDriver) markJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -495,7 +502,9 @@ func (d *SQLiteDriver) MarkJobProcessed(ctx context.Context, jobID int64, consum
 	return err
 }
 
-func (d *SQLiteDriver) MarkJobFailedAndReschedule(
+// markJobFailedAndReschedule updates a job's state to failed, increments the retry count,
+// and schedules it for a future retry attempt in SQLite.
+func (d *SQLiteDriver) markJobFailedAndReschedule(
 	ctx context.Context,
 	jobID int64,
 	errorMsg string,
@@ -564,7 +573,8 @@ func (d *SQLiteDriver) MarkJobFailedAndReschedule(
 	return err
 }
 
-func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+// moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite.
+func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -601,7 +611,7 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAtMs, &job.RetryCount)
 	if err != nil {
 		span.RecordError(err)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrJobNotFound
 		}
 		return err
@@ -633,7 +643,8 @@ func (d *SQLiteDriver) MoveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	return err
 }
 
-func (d *SQLiteDriver) GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
+// getDeadLetterJobs retrieves jobs from the dead_letter_queue table in SQLite, optionally filtered by job type.
+func (d *SQLiteDriver) getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType), // jobType might be empty
@@ -717,7 +728,8 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 	return jobs, nil
 }
 
-func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
+// requeueDeadLetterJob moves a job from the dead_letter_queue back into the main jobs table for reprocessing in SQLite.
+func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.requeue_dead_letter_job", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.dlq_id", dlqID),
@@ -746,7 +758,7 @@ func (d *SQLiteDriver) RequeueDeadLetterJob(ctx context.Context, dlqID int64) er
 	`, dlqID).Scan(&dlqJob.ID, &dlqJob.JobType, &dlqJob.Payload)
 	if err != nil {
 		span.RecordError(err)
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return ErrJobNotFound
 		}
 		return err

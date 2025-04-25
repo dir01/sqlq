@@ -1,0 +1,32 @@
+version: "2"
+linters:
+  enable:
+    - asasalint
+    - dupl
+    - errorlint
+    - exhaustruct
+    - fatcontext
+    - goconst
+    - gocritic
+    - govet
+    - intrange
+    - makezero
+    - misspell
+    - musttag
+    - nonamedreturns
+    - paralleltest
+    - prealloc
+    - predeclared
+    - promlinter
+    - reassign
+    - revive
+    - spancheck
+    - sqlclosecheck
+    - tagalign
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+    - whitespace
