@@ -60,7 +60,7 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`, // Index for cleaning up processed jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +106,7 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 
 // cleanupJobs deletes old processed jobs for a specific job type in SQLite.
 // It deletes jobs where processed_at is older than maxAge, in batches.
-func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
+func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) { //nolint
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
@@ -155,7 +155,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 
 // cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 // It deletes DLQ jobs older than maxAge, in batches.
-func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
+func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) { //nolint
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
@@ -314,7 +314,10 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		if err != nil {
 			return fmt.Errorf("failed to select potential jobs: %w", err)
 		}
-		defer rows.Close()
+
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		var potentialJobs []job
 		for rows.Next() {
@@ -338,7 +341,8 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		if err = rows.Err(); err != nil {
 			return fmt.Errorf("error iterating potential jobs: %w", err)
 		}
-		rows.Close() // Close explicitly before update
+
+		_ = rows.Close() // Close explicitly before update
 
 		if len(potentialJobs) == 0 {
 			return nil // No jobs found
@@ -352,7 +356,9 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		if err != nil {
 			return fmt.Errorf("failed to prepare update statement: %w", err)
 		}
-		defer stmt.Close()
+		defer func() {
+			_ = stmt.Close()
+		}()
 
 		// Attempt to lock/claim each potential job
 		for _, j := range potentialJobs {

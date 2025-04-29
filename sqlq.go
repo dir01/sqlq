@@ -74,7 +74,7 @@ var (
 var (
 	defaultMaxRetries               int32  = 3
 	infiniteRetries                 int32  = -1
-	defaultConcurrency              uint16 = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
+	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
 	defaultPrefetchCount                   = defaultConcurrency
 	defaultJobTimeout                      = 15 * time.Minute
 	defaultCleanupProcessedInterval        = 1 * time.Hour

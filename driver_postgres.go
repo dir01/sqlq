@@ -54,7 +54,7 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`, // Index for cleaning up processed jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id SERIAL PRIMARY KEY,
@@ -298,7 +298,9 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 		if err != nil {
 			return fmt.Errorf("failed to update and select jobs: %w", err)
 		}
-		defer rows.Close() // Ensure rows are closed within the transaction function
+		defer func() {
+			_ = rows.Close() // Ensure rows are closed within the transaction function
+		}()
 
 		for rows.Next() {
 			var j job
