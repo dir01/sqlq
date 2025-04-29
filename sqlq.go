@@ -88,7 +88,6 @@ var (
 type sqlq struct {
 	db                 *sql.DB
 	driver             driver
-	shutdown           chan struct{}
 	defaultBackoffFunc func(retryNum uint16) time.Duration
 	tracer             trace.Tracer
 	consumersMap       map[string]*consumer // jobType -> consumer
@@ -172,7 +171,6 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		driver:               driver,
 		consumersMap:         make(map[string]*consumer),
 		consumersMapMutex:    sync.RWMutex{},
-		shutdown:             make(chan struct{}),
 		defaultPollInterval:  100 * time.Millisecond,
 		defaultConcurrency:   defaultConcurrency,
 		defaultPrefetchCount: defaultPrefetchCount,
@@ -302,10 +300,9 @@ func (q *sqlq) Consume(
 		consumerName: consumerName,
 		handler:      handler,
 		// Inject dependencies from sqlq
-		db:           q.db,
-		driver:       q.driver,
-		tracer:       q.tracer,
-		shutdownChan: q.shutdown, // Global shutdown channel
+		db:     q.db,
+		driver: q.driver,
+		tracer: q.tracer,
 		// Set defaults from sqlq. Those might be overridden by opts later
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
@@ -387,12 +384,9 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 
 // Shutdown stops the job processing
 func (q *sqlq) Shutdown() {
-	close(q.shutdown)
-
-	// Call the consumer's shutdown method using a WaitGroup
 	wg := sync.WaitGroup{}
 
-	q.consumersMapMutex.Lock() // Lock again to safely iterate
+	q.consumersMapMutex.Lock()
 	for _, cons := range q.consumersMap {
 		wg.Add(1)
 		go func(c *consumer) {

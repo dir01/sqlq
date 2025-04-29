@@ -26,8 +26,7 @@ type consumer struct {
 	cancel                   context.CancelFunc                  // cancel() cancels ctx, TODO: stop storing context in struct, https://go.dev/blog/context-and-structs
 	backoffFunc              func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with
 	tracer                   trace.Tracer
-	jobsChan                 chan job        // Written to by a db poller, consumed by worker goroutines
-	shutdownChan             <-chan struct{} // Read-only view of the global shutdown channel
+	jobsChan                 chan job // Written to by a db poller, consumed by worker goroutines
 	jobType                  string
 	consumerName             string
 	workerWg                 sync.WaitGroup // Wait to make sure all scheduled goroutines stopped
@@ -100,8 +99,6 @@ func (cons *consumer) poll() {
 				continue // Continue after backoff
 			case <-cons.ctx.Done():
 				return // Exit if context canceled during backoff
-			case <-cons.shutdownChan:
-				return // Exit if global shutdown triggered during backoff
 			}
 		}
 
@@ -110,9 +107,6 @@ func (cons *consumer) poll() {
 		select {
 		case <-cons.ctx.Done():
 			// Context was canceled
-			return
-		case <-cons.shutdownChan: // Use consumer's view of the shutdown channel
-			// Check global shutdown signal
 			return
 		case <-ticker.C:
 			// Timer expired, continue to next poll
@@ -335,8 +329,6 @@ func (cons *consumer) runProcessedCleanupLoop() {
 		select {
 		case <-cons.ctx.Done(): // Use consumer's context for shutdown
 			return
-		case <-cons.shutdownChan: // Check global shutdown
-			return
 		case <-ticker.C:
 			// Pass consumer's driver and tracer
 			cons.performProcessedCleanup(cons.driver, cons.tracer, cons.cleanupProcessedAge)
@@ -355,8 +347,6 @@ func (cons *consumer) runDLQCleanupLoop() {
 	for {
 		select {
 		case <-cons.ctx.Done(): // Use consumer's context for shutdown
-			return
-		case <-cons.shutdownChan: // Check global shutdown
 			return
 		case <-ticker.C:
 			// Pass consumer's driver and tracer
