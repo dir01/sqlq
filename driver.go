@@ -38,15 +38,12 @@ type driver interface {
 	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
 	// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
-	// It deletes processed jobs of type jobType older than processedMaxAge, in batches of batchSize.
-	// It deletes DLQ jobs of type jobType older than dlqMaxAge, in batches of batchSize.
-	// It returns the total number of processed jobs deleted, DLQ jobs deleted, and any error.
-	cleanupJobs(
-		ctx context.Context,
-		jobType string,
-		processedMaxAge, dlqMaxAge time.Duration,
-		batchSize uint16,
-	) (processedDeleted int64, dlqDeleted int64, err error)
+	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
+	cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (processed int64, err error)
+
+	// cleanupDeadLetterQueueJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
+	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
+	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (processed int64, err error)
 }
 
 // getDriver returns the appropriate driver for the given database type

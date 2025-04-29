@@ -76,30 +76,38 @@ func WithConsumerJobTimeout(timeout time.Duration) ConsumerOption {
 	}
 }
 
-// WithConsumerCleanupInterval sets the interval at which the cleanup process runs for this consumer.
-// Default is 1 hour. Set to 0 or negative to disable cleanup for this consumer.
-func WithConsumerCleanupInterval(interval time.Duration) ConsumerOption {
+// WithConsumerCleanupProcessedInterval sets the interval for cleaning up old processed jobs for this consumer.
+// Setting to 0 or negative disables automatic processed job cleanup.
+func WithConsumerCleanupProcessedInterval(interval time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		o.cleanupInterval = interval // Allow 0 or negative to disable
+		o.cleanupProcessedInterval = interval
 	}
 }
 
-// WithConsumerCleanupAge sets the maximum age for successfully processed jobs of this specific type
-// before they are deleted. Default is 7 days.
-func WithConsumerCleanupAge(age time.Duration) ConsumerOption {
+// WithConsumerCleanupProcessedAge sets the maximum age for successfully processed jobs
+// before they are eligible for deletion by the cleanup task for this consumer.
+func WithConsumerCleanupProcessedAge(age time.Duration) ConsumerOption {
 	return func(o *consumer) {
 		if age > 0 {
-			o.cleanupAge = &age // Store as pointer to differentiate between 0 and not set
+			o.cleanupProcessedAge = age
 		}
 	}
 }
 
-// WithConsumerCleanupDLQAge sets the maximum age for dead-letter queue jobs of this specific type
-// before they are deleted. Default is 30 days.
+// WithConsumerCleanupDLQInterval sets the interval for cleaning up old DLQ jobs for this consumer.
+// Setting to 0 or negative disables automatic DLQ cleanup.
+func WithConsumerCleanupDLQInterval(interval time.Duration) ConsumerOption {
+	return func(o *consumer) {
+		o.cleanupDLQInterval = interval
+	}
+}
+
+// WithConsumerCleanupDLQAge sets the maximum age for dead-letter queue jobs
+// before they are eligible for deletion by the cleanup task for this consumer.
 func WithConsumerCleanupDLQAge(age time.Duration) ConsumerOption {
 	return func(o *consumer) {
 		if age > 0 {
-			o.cleanupDLQAge = &age // Store as pointer
+			o.cleanupDLQAge = age
 		}
 	}
 }

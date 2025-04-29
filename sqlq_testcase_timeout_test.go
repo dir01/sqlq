@@ -69,7 +69,6 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 	// Check if the job ended up in the DLQ
 	var dlqJobs []sqlq.DeadLetterJob
 	require.Eventually(t, func() bool {
-		var err error
 		dlqJobs, err = tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
 		require.NoError(t, err, "Failed to get DLQ jobs")
 		return len(dlqJobs) > 0

@@ -22,8 +22,8 @@ const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 // SQLiteDriver implements the Driver interface for SQLite
 type SQLiteDriver struct {
 	db     *sql.DB
-	mutex  sync.Mutex
 	tracer trace.Tracer
+	mutex  sync.Mutex
 }
 
 // newSQLiteDriver creates a new SQLite driver with the given database connection.
@@ -95,7 +95,7 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	}()
 
 	for _, query := range queries {
-		_, err := tx.ExecContext(ctx, query)
+		_, err = tx.ExecContext(ctx, query)
 		if err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
@@ -111,24 +111,21 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 
 // cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type in SQLite.
 // It deletes processed jobs older than processedMaxAge and DLQ jobs older than dlqMaxAge, in batches.
-func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
-		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.String("sqlq.cleanup.age", maxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
 	))
 	defer span.End()
 
-	var totalProcessedDeleted int64
-	var totalDlqDeleted int64
+	var totalDeleted int64
 
-	// --- Cleanup Processed Jobs (Batched) ---
-	processedThresholdMs := time.Now().Add(-processedMaxAge).UnixMilli()
+	processedThresholdMs := time.Now().Add(-maxAge).UnixMilli()
 	for {
 		var batchDeleted int64
-		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := d.runInTx(ctx, func(tx *sql.Tx) error {
 			// 1. Find a batch of job IDs to delete
 			rows, err := tx.QueryContext(ctx, `
 				SELECT jc.job_id
@@ -141,22 +138,27 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 				return fmt.Errorf("failed to query batch of old job_consumers for type %s: %w", jobType, err)
 			}
 
+			defer func() {
+				if closeErr := rows.Close(); closeErr != nil {
+					span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+				}
+			}()
+
 			var jobIDsToDelete []int64
 			for rows.Next() {
 				var jobID int64
-				if err := rows.Scan(&jobID); err != nil {
-					// Check close error here as well
-					if closeErr := rows.Close(); closeErr != nil {
-						span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-					}
+				if err = rows.Scan(&jobID); err != nil {
 					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
 				}
 				jobIDsToDelete = append(jobIDsToDelete, jobID)
 			}
+
 			rowsErr := rows.Err()
+
 			if closeErr := rows.Close(); closeErr != nil { // Close should happen before checking rows.Err()
 				span.AddEvent("Failed to close rows after job ID scan", trace.WithAttributes(attribute.String("error", closeErr.Error())))
 			}
+
 			if rowsErr != nil {
 				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, rowsErr)
 			}
@@ -170,6 +172,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 			if err != nil {
 				return fmt.Errorf("failed to prepare delete statement for job_consumers: %w", err)
 			}
+
 			// Defer close and check error
 			defer func() {
 				if closeErr := stmtConsumers.Close(); closeErr != nil {
@@ -181,6 +184,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 			if err != nil {
 				return fmt.Errorf("failed to prepare delete statement for jobs: %w", err)
 			}
+
 			// Defer close and check error
 			defer func() {
 				if closeErr := stmtJobs.Close(); closeErr != nil {
@@ -209,20 +213,33 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
-			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+			return totalDeleted, err // Return partial counts and error
 		}
 
-		totalProcessedDeleted += batchDeleted
+		totalDeleted += batchDeleted
 		if batchDeleted < int64(batchSize) {
 			break // Last batch processed
 		}
 	}
 
-	// --- Cleanup DLQ Jobs (Batched) ---
-	dlqThresholdMs := time.Now().Add(-dlqMaxAge).UnixMilli()
+	return totalDeleted, nil
+}
+
+func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
+		semconv.DBSystemSqlite,
+		attribute.String("sqlq.job_type", jobType),
+		attribute.String("sqlq.cleanup.age", maxAge.String()),
+		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
+	))
+	defer span.End()
+
+	var totalDlqDeleted int64
+	dlqThresholdMs := time.Now().Add(-maxAge).UnixMilli()
+
 	for {
 		var batchDeleted int64
-		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := d.runInTx(ctx, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			resDLQ, err := tx.ExecContext(ctx, `
 				DELETE FROM dead_letter_queue
@@ -243,7 +260,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
-			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+			return totalDlqDeleted, err // Return partial counts and error
 		}
 
 		totalDlqDeleted += batchDeleted
@@ -253,11 +270,10 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, processe
 	}
 
 	span.SetAttributes(
-		attribute.Int64("sqlq.db.rows_deleted.jobs", totalProcessedDeleted),
 		attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted),
 	)
 
-	return totalProcessedDeleted, totalDlqDeleted, nil
+	return totalDlqDeleted, nil
 }
 
 // runInTx is a helper to execute a function within a transaction, acquiring the driver mutex
@@ -284,6 +300,7 @@ func (d *SQLiteDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) e
 	return tx.Commit() // Commit if fn succeeded
 }
 
+// InsertJob inserts a new job into the SQLite jobs table.
 func (d *SQLiteDriver) insertJob(
 	ctx context.Context,
 	jobType string,
@@ -381,7 +398,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		var traceContextJSON sql.NullString
 		var scheduledAtMs int64
 		j.JobType = jobType
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &scheduledAtMs); err != nil {
+		if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &scheduledAtMs); err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
@@ -389,7 +406,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		// Deserialize trace context
 		j.TraceContext = make(map[string]string)
 		if traceContextJSON.Valid && traceContextJSON.String != "" {
-			if err := json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
+			if err = json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
 				span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
 				// Continue without trace context if unmarshal fails
 				j.TraceContext = make(map[string]string)
@@ -397,7 +414,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		}
 		potentialJobs = append(potentialJobs, j)
 	}
-	if err := rows.Err(); err != nil {
+	if err = rows.Err(); err != nil {
 		span.RecordError(err)
 		span.RecordError(err)
 		return nil, err
@@ -598,9 +615,9 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	}()
 
 	var job struct {
-		ID          int64
 		JobType     string
 		Payload     []byte
+		ID          int64
 		CreatedAtMs int64
 		RetryCount  int
 	}
@@ -744,10 +761,14 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, dlqID int64) er
 		span.RecordError(err)
 		return err
 	}
+
 	// Defer rollback and check error
 	defer func() {
 		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent("Failed to rollback transaction during DLQ requeue", trace.WithAttributes(attribute.String("error", rErr.Error())))
+			span.AddEvent(
+				"Failed to rollback transaction during DLQ requeue",
+				trace.WithAttributes(attribute.String("error", rErr.Error())),
+			)
 		}
 	}()
 

@@ -30,3 +30,9 @@ linters:
     - usestdlibvars
     - wastedassign
     - whitespace
+
+
+  settings:
+    govet:
+      enable-all: true
+

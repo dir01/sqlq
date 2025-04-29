@@ -15,7 +15,8 @@ import (
 )
 
 func TestPostgreSQL(t *testing.T) {
-	t.Parallel() // Run top-level test in parallel
+	t.Parallel()
+
 	if testing.Short() {
 		t.Skip("Skipping PostgreSQL tests in short mode")
 	}
@@ -23,8 +24,6 @@ func TestPostgreSQL(t *testing.T) {
 	tc, tracer, cleanup := setupPostgresTestCase(t)
 
 	t.Cleanup(cleanup)
-
-	t.Parallel()
 
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
@@ -118,6 +117,7 @@ func TestPostgreSQL(t *testing.T) {
 }
 
 func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
+	t.Helper()
 	ctx := t.Context()
 	ctx = GracefulContext(ctx, 100*time.Millisecond) // for shutting down mainly
 

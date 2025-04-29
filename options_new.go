@@ -50,29 +50,34 @@ func WithDefaultConcurrency(concurrency uint16) NewOption {
 // Default values for cleanup options
 //////////////////////////////////////////
 
-// WithDefaultCleanupInterval sets the default interval at which consumer cleanup processes run.
-// Default is 1 hour. Set to 0 or negative to disable cleanup by default.
-// This value may be overridden per individual consumer using WithConsumerCleanupInterval.
-func WithDefaultCleanupInterval(interval time.Duration) NewOption {
+// WithDefaultCleanupProcessedInterval sets the default interval for cleaning up processed jobs.
+// Individual consumers may override this using WithConsumerCleanupProcessedInterval.
+func WithDefaultCleanupProcessedInterval(interval time.Duration) NewOption {
 	return func(q *sqlq) {
-		q.defaultCleanupInterval = interval
+		q.defaultCleanupProcessedInterval = interval
 	}
 }
 
-// WithDefaultCleanupAge sets the default maximum age for successfully processed jobs before they are deleted.
-// Default is 7 days.
-// This value may be overridden per individual consumer using WithConsumerCleanupAge.
-func WithDefaultCleanupAge(age time.Duration) NewOption {
+// WithDefaultCleanupProcessedAge sets the default maximum age for successfully processed jobs before deletion.
+// Individual consumers may override this using WithConsumerCleanupProcessedAge.
+func WithDefaultCleanupProcessedAge(age time.Duration) NewOption {
 	return func(q *sqlq) {
 		if age > 0 {
-			q.defaultCleanupAge = age
+			q.defaultCleanupProcessedAge = age
 		}
 	}
 }
 
-// WithDefaultCleanupDLQAge sets the default maximum age for dead-letter queue jobs before they are deleted.
-// Default is 30 days.
-// This value may be overridden per individual consumer using WithConsumerCleanupDLQAge.
+// WithDefaultCleanupDLQInterval sets the default interval for cleaning up DLQ jobs.
+// Individual consumers may override this using WithConsumerCleanupDLQInterval.
+func WithDefaultCleanupDLQInterval(interval time.Duration) NewOption {
+	return func(q *sqlq) {
+		q.defaultCleanupDLQInterval = interval
+	}
+}
+
+// WithDefaultCleanupDLQAge sets the default maximum age for dead-letter queue jobs before deletion.
+// Individual consumers may override this using WithConsumerCleanupDLQAge.
 func WithDefaultCleanupDLQAge(age time.Duration) NewOption {
 	return func(q *sqlq) {
 		if age > 0 {

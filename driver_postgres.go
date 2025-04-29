@@ -90,7 +90,7 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 	}()
 
 	for _, query := range queries {
-		_, err := tx.ExecContext(ctx, query)
+		_, err = tx.ExecContext(ctx, query)
 		if err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
@@ -106,24 +106,22 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 
 // cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type in PostgreSQL.
 // It deletes processed jobs older than processedMaxAge and DLQ jobs older than dlqMaxAge, in batches.
-func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, processedMaxAge, dlqMaxAge time.Duration, batchSize uint16) (processedDeleted int64, dlqDeleted int64, err error) {
+func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
-		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.String("sqlq.cleanup.age.processed", maxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
 	))
 	defer span.End()
 
 	var totalProcessedDeleted int64
-	var totalDlqDeleted int64
 
 	// --- Cleanup Processed Jobs (Batched) ---
-	processedThreshold := time.Now().Add(-processedMaxAge)
+	processedThreshold := time.Now().Add(-maxAge)
 	for {
 		var batchDeleted int64
-		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := d.runInTx(ctx, func(tx *sql.Tx) error {
 			// 1. Find a batch of job IDs to delete
 			rows, err := tx.QueryContext(ctx, `
 				SELECT jc.job_id
@@ -136,23 +134,22 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, proces
 				return fmt.Errorf("failed to query batch of old job_consumers for type %s: %w", jobType, err)
 			}
 
+			defer func() {
+				if closeErr := rows.Close(); closeErr != nil {
+					span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
+				}
+			}()
+
 			var jobIDsToDelete []int64
 			for rows.Next() {
 				var jobID int64
-				if err := rows.Scan(&jobID); err != nil {
-					// Check close error here as well
-					if closeErr := rows.Close(); closeErr != nil {
-						span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-					}
+				if err = rows.Scan(&jobID); err != nil {
 					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
 				}
 				jobIDsToDelete = append(jobIDsToDelete, jobID)
 			}
-			rowsErr := rows.Err()
-			if closeErr := rows.Close(); closeErr != nil { // Close should happen before checking rows.Err()
-				span.AddEvent("Failed to close rows after job ID scan", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-			}
-			if rowsErr != nil {
+
+			if rowsErr := rows.Err(); rowsErr != nil {
 				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, rowsErr)
 			}
 
@@ -178,7 +175,7 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, proces
 
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
-			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+			return totalProcessedDeleted, err // Return partial counts and error
 		}
 
 		totalProcessedDeleted += batchDeleted
@@ -189,11 +186,24 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, proces
 		// time.Sleep(10 * time.Millisecond)
 	}
 
+	return totalProcessedDeleted, nil
+}
+
+func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
+		semconv.DBSystemPostgreSQL,
+		attribute.String("sqlq.job_type", jobType),
+		attribute.String("sqlq.cleanup.age.processed", maxAge.String()),
+		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
+	))
+	defer span.End()
+
 	// --- Cleanup DLQ Jobs (Batched) ---
-	dlqThreshold := time.Now().Add(-dlqMaxAge)
+	dlqThreshold := time.Now().Add(-maxAge)
+	var totalDlqDeleted int64
 	for {
 		var batchDeleted int64
-		err = d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := d.runInTx(ctx, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using ctid in PostgreSQL
 			resDLQ, err := tx.ExecContext(ctx, `
 				DELETE FROM dead_letter_queue
@@ -214,7 +224,7 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, proces
 
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
-			return totalProcessedDeleted, totalDlqDeleted, err // Return partial counts and error
+			return totalDlqDeleted, err // Return partial counts and error
 		}
 
 		totalDlqDeleted += batchDeleted
@@ -226,11 +236,10 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, proces
 	}
 
 	span.SetAttributes(
-		attribute.Int64("sqlq.db.rows_deleted.jobs", totalProcessedDeleted),
 		attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted),
 	)
 
-	return totalProcessedDeleted, totalDlqDeleted, nil
+	return totalDlqDeleted, nil
 }
 
 // runInTx is a helper to execute a function within a transaction
@@ -257,6 +266,7 @@ func (d *PostgresDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error)
 	return tx.Commit() // Commit if fn succeeded
 }
 
+// InsertJob inserts a new job into the PostgreSQL jobs table.
 func (d *PostgresDriver) insertJob(
 	ctx context.Context,
 	jobType string,
@@ -335,7 +345,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 		var traceContextJSON sql.NullString
 		j.JobType = jobType
 
-		if err := rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+		if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
 			span.RecordError(fmt.Errorf("failed to scan potential job details: %w", err))
 			// TODO: Consider returning partial results or skipping the job
 			return nil, fmt.Errorf("failed to scan potential job details: %w", err)
@@ -343,7 +353,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 
 		j.TraceContext = make(map[string]string)
 		if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {
-			if err := json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
+			if err = json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
 				span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
 				// Continue without trace context if unmarshal fails
 				j.TraceContext = make(map[string]string)
@@ -351,8 +361,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 		}
 		potentialJobs = append(potentialJobs, j)
 	}
-	if err := rows.Err(); err != nil {
-		span.RecordError(err)
+	if err = rows.Err(); err != nil {
 		span.RecordError(err)
 		return nil, fmt.Errorf("error iterating potential job rows: %w", err)
 	}
@@ -458,6 +467,8 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64, cons
 	return nil // Return nil even if rowsAffected is 0, as the goal is idempotency
 }
 
+// MarkJobFailedAndReschedule updates a job's state to failed, increments the retry count,
+// and schedules it for a future retry attempt in PostgreSQL.
 func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_failed_and_reschedule", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -530,11 +541,11 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 	}()
 
 	// Get the job details
-	var job job
+	var j job
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, job_type, payload, created_at, retry_count
 		FROM jobs WHERE id = $1
-	`, jobID).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.RetryCount) // Use QueryRowContext
+	`, jobID).Scan(&j.ID, &j.JobType, &j.Payload, &j.CreatedAt, &j.RetryCount) // Use QueryRowContext
 	if err != nil {
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -548,7 +559,7 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		INSERT INTO dead_letter_queue 
 		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, job.ID, job.JobType, job.Payload, job.CreatedAt, job.RetryCount, reason) // Use ExecContext
+	`, j.ID, j.JobType, j.Payload, j.CreatedAt, j.RetryCount, reason) // Use ExecContext
 	if err != nil {
 		span.RecordError(err)
 		return err

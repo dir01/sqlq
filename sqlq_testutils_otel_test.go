@@ -14,8 +14,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func newTracer(ctx context.Context, otlpEndpoint string) (tracer trace.Tracer, cleanup func() error, err error) {
+func newTracer(ctx context.Context, otlpEndpoint string) (trace.Tracer, func() error, error) {
 	var exporter sdktrace.SpanExporter
+	var err error
 
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 
@@ -43,13 +44,13 @@ func newTracer(ctx context.Context, otlpEndpoint string) (tracer trace.Tracer, c
 		sdktrace.WithSyncer(exporter),
 		sdktrace.WithResource(resource),
 	)
-	cleanup = func() error {
+	cleanup := func() error {
 		return traceProvider.Shutdown(ctx)
 	}
 
 	otel.SetTracerProvider(traceProvider)
 
-	tracer = traceProvider.Tracer("sqlq_test")
+	tracer := traceProvider.Tracer("sqlq_test")
 
 	return tracer, cleanup, nil
 }

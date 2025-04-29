@@ -115,7 +115,6 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 
 	var dlqJobs []sqlq.DeadLetterJob
 	require.Eventually(t, func() bool {
-		var err error
 		dlqJobs, err = tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
 		require.NoError(t, err)
 		return len(dlqJobs) != 0
