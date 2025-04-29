@@ -120,7 +120,8 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 
 	for {
 		var batchDeleted int64
-		err := d.runInTx(ctx, func(tx *sql.Tx) error {
+		d.mutex.Lock()
+		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			res, err := tx.ExecContext(ctx, `
 				DELETE FROM jobs
@@ -138,7 +139,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 			batchDeleted = count
 			return nil
 		})
-
+		d.mutex.Unlock()
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
 			return totalDeleted, err // Return partial counts and error
@@ -169,7 +170,8 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 
 	for {
 		var batchDeleted int64
-		err := d.runInTx(ctx, func(tx *sql.Tx) error {
+		d.mutex.Lock()
+		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			resDLQ, err := tx.ExecContext(ctx, `
 				DELETE FROM dead_letter_queue
@@ -187,7 +189,7 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 			batchDeleted = count
 			return nil
 		})
-
+		d.mutex.Unlock()
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
 			return totalDlqDeleted, err // Return partial counts and error
@@ -204,30 +206,6 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 	)
 
 	return totalDlqDeleted, nil
-}
-
-// runInTx is a helper to execute a function within a transaction, acquiring the driver mutex
-func (d *SQLiteDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	d.mutex.Lock()
-	defer d.mutex.Unlock()
-
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	// Defer rollback and check error
-	defer func() {
-		// Note: No span available here. Log simply or ignore.
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			fmt.Printf("WARN: Failed to rollback transaction in runInTx helper: %v\n", rErr)
-		}
-	}()
-
-	if err := fn(tx); err != nil {
-		return err // Error occurred, rollback will happen
-	}
-
-	return tx.Commit() // Commit if fn succeeded
 }
 
 // InsertJob inserts a new job into the SQLite jobs table.
@@ -301,7 +279,9 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 
 	// Since SQLite doesn't support SKIP LOCKED or UPDATE...RETURNING well,
 	// we use the mutex and a two-step process: SELECT potential IDs, then UPDATE.
-	err := d.runInTx(ctx, func(tx *sql.Tx) error {
+
+	d.mutex.Lock()
+	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id, payload, retry_count, trace_context
 			FROM jobs
@@ -382,7 +362,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, consumerName, job
 		}
 		return nil // Commit the successful updates
 	})
-
+	d.mutex.Unlock()
 	if err != nil {
 		span.RecordError(fmt.Errorf("transaction failed during getJobsForConsumer: %w", err))
 		return nil, err // Return nil slice and the error

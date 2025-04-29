@@ -4,6 +4,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -56,4 +57,20 @@ func getDriver(db *sql.DB, dbType DBType) (driver, error) {
 	default:
 		return nil, ErrUnsupportedDBType
 	}
+}
+
+// runInTx executes fn within a transaction, rolling back on error.
+func runInTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

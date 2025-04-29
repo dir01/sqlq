@@ -114,7 +114,7 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge
 
 	for {
 		var batchDeleted int64
-		err := d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using ctid in PostgreSQL
 			res, err := tx.ExecContext(ctx, `
 				DELETE FROM jobs
@@ -163,7 +163,7 @@ func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType
 	var totalDlqDeleted int64
 	for {
 		var batchDeleted int64
-		err := d.runInTx(ctx, func(tx *sql.Tx) error {
+		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using ctid in PostgreSQL
 			resDLQ, err := tx.ExecContext(ctx, `
 				DELETE FROM dead_letter_queue
@@ -200,30 +200,6 @@ func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType
 	)
 
 	return totalDlqDeleted, nil
-}
-
-// runInTx is a helper to execute a function within a transaction
-func (d *PostgresDriver) runInTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	// Defer rollback, checking for errors unless it's sql.ErrTxDone (already committed/rolled back)
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			// Log or handle the rollback error appropriately.
-			// Since this helper doesn't have access to a span, we can't easily add events.
-			// We could potentially pass a logger or span down, but for now, just log simply.
-			// This satisfies staticcheck. A more robust solution might involve refactoring.
-			fmt.Printf("WARN: Failed to rollback transaction in runInTx helper: %v\n", rErr)
-		}
-	}()
-
-	if err := fn(tx); err != nil {
-		return err // Error occurred, rollback will happen
-	}
-
-	return tx.Commit() // Commit if fn succeeded
 }
 
 // InsertJob inserts a new job into the PostgreSQL jobs table.
@@ -278,7 +254,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 	defer span.End()
 
 	var jobsToReturn []job
-	err := d.runInTx(ctx, func(tx *sql.Tx) error {
+	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			UPDATE jobs
 			SET consumed_at = NOW(), consumer_name = $1

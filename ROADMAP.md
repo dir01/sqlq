@@ -1,6 +1,6 @@
 - [x] Support for job execution timeout
-- [ ] Cleanup of old jobs
-- [ ] Panic recovery
+- [x] Cleanup of old jobs
+- [x] Panic recovery
 -------release------
 - [ ] UI
 - [ ] Optional push
