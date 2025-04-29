@@ -248,7 +248,7 @@ func (cons *consumer) processJob(job *job) {
 		// Transaction committed successfully, now mark the job processed
 		// Use consumer's tracer and driver
 		markCtx, markSpan := cons.tracer.Start(consumeCtx, "sqlq.mark_processed") // Use original consumeCtx
-		markErr := cons.driver.markJobProcessed(markCtx, job.ID, cons.consumerName)
+		markErr := cons.driver.markJobProcessed(markCtx, job.ID)
 		if markErr != nil {
 			// Log or trace the error, but the job is technically processed as the TX committed.
 			markSpan.RecordError(fmt.Errorf("failed to mark job processed after commit: %w", markErr))

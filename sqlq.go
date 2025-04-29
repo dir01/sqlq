@@ -74,7 +74,7 @@ var (
 var (
 	defaultMaxRetries               int32  = 3
 	infiniteRetries                 int32  = -1
-	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
+	defaultConcurrency              uint16 = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
 	defaultPrefetchCount                   = defaultConcurrency
 	defaultJobTimeout                      = 15 * time.Minute
 	defaultCleanupProcessedInterval        = 1 * time.Hour
@@ -160,7 +160,7 @@ type DeadLetterJob struct {
 	RetryCount    uint16
 }
 
-// New creates a new SQL-backed job queue
+// New creates a new JobsQueue
 func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	driver, err := getDriver(db, dbType)
 	if err != nil {
@@ -171,7 +171,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		db:                   db,
 		driver:               driver,
 		consumersMap:         make(map[string]*consumer),
-		consumersMapMutex:    sync.RWMutex{}, // Initialize mutex
+		consumersMapMutex:    sync.RWMutex{},
 		shutdown:             make(chan struct{}),
 		defaultPollInterval:  100 * time.Millisecond,
 		defaultConcurrency:   defaultConcurrency,
@@ -225,22 +225,21 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Note: Rollback is deferred before PublishTx, so if PublishTx fails,
-	// the rollback happens automatically. If PublishTx succeeds, we commit.
-	// Check the rollback error unless it's because the transaction was already committed/rolled back.
 	defer func() {
 		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent("Failed to rollback transaction in Publish", trace.WithAttributes(attribute.String("error", rErr.Error())))
+			span.AddEvent(
+				"Failed to rollback transaction in Publish",
+				trace.WithAttributes(attribute.String("error", rErr.Error())),
+			)
 		}
 	}()
 
 	if err = q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
 		// PublishTx already records its internal errors in its own span
-		return err // Return the error from PublishTx
+		return err
 	}
 
-	err = tx.Commit()
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -250,8 +249,6 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 
 // PublishTx adds a new job to the queue within an existing transaction.
 func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
-	// Start a new span as a child of the context passed in.
-	// It's assumed the caller (Publish or external) started a relevant parent span.
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish_tx",
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", jobType),
@@ -260,11 +257,7 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 	)
 	defer span.End()
 
-	options := &publishOptions{
-		delay: 0, // Explicitly initialize delay
-	}
-
-	// Apply provided options
+	options := &publishOptions{delay: 0}
 	for _, o := range opts {
 		o(options)
 	}
@@ -280,12 +273,11 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 	)
 
 	traceContextMap := propagation.MapCarrier(make(map[string]string))
-	otel.GetTextMapPropagator().Inject(ctx, traceContextMap) // Use the context returned by Start
+	otel.GetTextMapPropagator().Inject(ctx, traceContextMap)
 
 	err = q.driver.insertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
-		// The driver method should record the specific DB error in its span.
-		// We record a higher-level error here.
+		// The driver method should record the specific DB error in its span. We record a higher-level error here.
 		span.RecordError(err)
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
@@ -313,8 +305,8 @@ func (q *sqlq) Consume(
 		db:           q.db,
 		driver:       q.driver,
 		tracer:       q.tracer,
-		shutdownChan: q.shutdown, // Pass the global shutdown channel
-		// Set defaults from sqlq
+		shutdownChan: q.shutdown, // Global shutdown channel
+		// Set defaults from sqlq. Those might be overridden by opts later
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
 		maxRetries:               q.defaultMaxRetries,
@@ -327,8 +319,8 @@ func (q *sqlq) Consume(
 		cleanupDLQInterval:       q.defaultCleanupDLQInterval,
 		cleanupDLQAge:            q.defaultCleanupDLQAge,
 		// Initialize consumer-specific fields
-		jobsChan: nil,              // Will be initialized below
-		workerWg: sync.WaitGroup{}, // Initialize WaitGroup
+		jobsChan: nil, // Will be initialized below
+		workerWg: sync.WaitGroup{},
 		ctx:      consCtx,
 		cancel:   cancel,
 	}
@@ -356,10 +348,9 @@ func (q *sqlq) Consume(
 	q.consumersMap[jobType] = cons
 	q.consumersMapMutex.Unlock()
 
-	// Start the consumer's goroutines
 	cons.start()
 
-	return nil // Add missing return nil for Consume function
+	return nil
 }
 
 // GetDeadLetterJobs retrieves jobs from the dead letter queue
@@ -398,16 +389,9 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
 func (q *sqlq) Shutdown() {
 	close(q.shutdown)
 
-	// Cancel all consumer contexts and wait for workers to finish
-	q.consumersMapMutex.Lock()
-	for _, cons := range q.consumersMap {
-		cons.cancel()
-		cons.workerWg.Wait()
-	}
-	q.consumersMapMutex.Unlock()
-
 	// Call the consumer's shutdown method using a WaitGroup
 	wg := sync.WaitGroup{}
+
 	q.consumersMapMutex.Lock() // Lock again to safely iterate
 	for _, cons := range q.consumersMap {
 		wg.Add(1)
@@ -417,5 +401,6 @@ func (q *sqlq) Shutdown() {
 		}(cons)
 	}
 	q.consumersMapMutex.Unlock()
-	wg.Wait() // Wait for all consumers to finish shutting down
+
+	wg.Wait()
 }

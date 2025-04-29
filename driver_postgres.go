@@ -41,26 +41,20 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 			id SERIAL PRIMARY KEY,
 			job_type TEXT NOT NULL,
 			payload BYTEA,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+			scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 			retry_count INTEGER DEFAULT 0,
 			last_error TEXT,
 			trace_context JSONB, -- Added for trace propagation (using JSONB for efficiency)
-			consumed_at TIMESTAMP NULL -- Indicates when the job was consumed
+			consumed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was claimed by a consumer
+			processed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was successfully processed
+			consumer_name TEXT NULL -- Name of the consumer instance that claimed the job
 		)`,
-
-		`CREATE TABLE IF NOT EXISTS job_consumers (
-			job_id INTEGER,
-			consumer_name TEXT,
-			processed_at TIMESTAMP NULL, -- Can be NULL to indicate processing
-			PRIMARY KEY (job_id, consumer_name),
-			FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE -- Cascade delete if job is deleted
-		)`,
+		// Removed job_consumers table definition
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at ON jobs(scheduled_at)`,
-		// Add index for faster lookup in job_consumers
-		`CREATE INDEX IF NOT EXISTS idx_job_consumers_job_id_consumer ON job_consumers(job_id, consumer_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`, // Index for cleaning up processed jobs
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			id SERIAL PRIMARY KEY,
@@ -104,91 +98,57 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 	return err
 }
 
-// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type in PostgreSQL.
-// It deletes processed jobs older than processedMaxAge and DLQ jobs older than dlqMaxAge, in batches.
+// cleanupJobs deletes old processed jobs for a specific job type in PostgreSQL.
+// It deletes jobs where processed_at is older than maxAge, in batches.
 func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.cleanup.age.processed", maxAge.String()),
+		attribute.String("sqlq.cleanup.age", maxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
 	))
 	defer span.End()
 
-	var totalProcessedDeleted int64
+	var totalDeleted int64
+	threshold := time.Now().Add(-maxAge)
 
-	// --- Cleanup Processed Jobs (Batched) ---
-	processedThreshold := time.Now().Add(-maxAge)
 	for {
 		var batchDeleted int64
 		err := d.runInTx(ctx, func(tx *sql.Tx) error {
-			// 1. Find a batch of job IDs to delete
-			rows, err := tx.QueryContext(ctx, `
-				SELECT jc.job_id
-				FROM job_consumers jc
-				JOIN jobs j ON jc.job_id = j.id
-				WHERE j.job_type = $1 AND jc.processed_at < $2
-				LIMIT $3
-			`, jobType, processedThreshold, batchSize)
+			// Efficiently delete a batch using ctid in PostgreSQL
+			res, err := tx.ExecContext(ctx, `
+				DELETE FROM jobs
+				WHERE ctid IN (
+					SELECT ctid
+					FROM jobs
+					WHERE job_type = $1 AND processed_at < $2
+					LIMIT $3
+				)
+			`, jobType, threshold, batchSize)
 			if err != nil {
-				return fmt.Errorf("failed to query batch of old job_consumers for type %s: %w", jobType, err)
+				return fmt.Errorf("failed to delete batch of old processed jobs for type %s: %w", jobType, err)
 			}
-
-			defer func() {
-				if closeErr := rows.Close(); closeErr != nil {
-					span.AddEvent("Failed to close rows during job ID scan (on scan error)", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-				}
-			}()
-
-			var jobIDsToDelete []int64
-			for rows.Next() {
-				var jobID int64
-				if err = rows.Scan(&jobID); err != nil {
-					return fmt.Errorf("failed to scan batch job_id for type %s: %w", jobType, err)
-				}
-				jobIDsToDelete = append(jobIDsToDelete, jobID)
-			}
-
-			if rowsErr := rows.Err(); rowsErr != nil {
-				return fmt.Errorf("error iterating batch job_consumers rows for type %s: %w", jobType, rowsErr)
-			}
-
-			if len(jobIDsToDelete) == 0 {
-				return nil // No more jobs in this batch
-			}
-
-			// 2. Delete from job_consumers (using IDs for precision)
-			_, err = tx.ExecContext(ctx, `DELETE FROM job_consumers WHERE job_id = ANY($1::bigint[])`, jobIDsToDelete)
-			if err != nil {
-				return fmt.Errorf("failed to delete batch of old job_consumers for type %s: %w", jobType, err)
-			}
-
-			// 3. Delete from jobs using the collected IDs
-			resJobs, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ANY($1::bigint[])`, jobIDsToDelete)
-			if err != nil {
-				return fmt.Errorf("failed to delete batch of old jobs for type %s: %w", jobType, err)
-			}
-			count, _ := resJobs.RowsAffected()
+			count, _ := res.RowsAffected()
 			batchDeleted = count
 			return nil
 		})
 
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
-			return totalProcessedDeleted, err // Return partial counts and error
+			return totalDeleted, err // Return partial counts and error
 		}
 
-		totalProcessedDeleted += batchDeleted
+		totalDeleted += batchDeleted
 		if batchDeleted < int64(batchSize) {
 			break // Last batch processed
 		}
-		// Optional: Add a small delay between batches if needed
-		// time.Sleep(10 * time.Millisecond)
 	}
-
-	return totalProcessedDeleted, nil
+	span.SetAttributes(attribute.Int64("sqlq.db.rows_deleted.processed", totalDeleted))
+	return totalDeleted, nil
 }
 
+// cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
+// It deletes DLQ jobs older than maxAge, in batches.
 func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -317,132 +277,73 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, consumerName, j
 	))
 	defer span.End()
 
-	// 1. Select potential jobs without locking
-	rows, err := d.db.QueryContext(ctx, `
-		SELECT j.id, j.payload, j.retry_count, j.trace_context
-		FROM jobs j
-		WHERE j.job_type = $1
-			AND j.scheduled_at <= NOW()
-			AND j.consumed_at IS NULL
-		ORDER BY j.id
-		LIMIT $2
-	`, jobType, prefetchCount)
-	if err != nil {
-		span.RecordError(err)
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to select potential jobs: %w", err)
-	}
-	// Defer close and check error
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			span.AddEvent("Failed to close rows after selecting potential jobs", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-		}
-	}()
-
-	var potentialJobs []job
-	for rows.Next() {
-		var j job
-		var traceContextJSON sql.NullString
-		j.JobType = jobType
-
-		if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
-			span.RecordError(fmt.Errorf("failed to scan potential job details: %w", err))
-			// TODO: Consider returning partial results or skipping the job
-			return nil, fmt.Errorf("failed to scan potential job details: %w", err)
-		}
-
-		j.TraceContext = make(map[string]string)
-		if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {
-			if err = json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
-				span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
-				// Continue without trace context if unmarshal fails
-				j.TraceContext = make(map[string]string)
-			}
-		}
-		potentialJobs = append(potentialJobs, j)
-	}
-	if err = rows.Err(); err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("error iterating potential job rows: %w", err)
-	}
-	// rows are closed by the defer func() added earlier
-
-	// 2. Try to "lock" the potential jobs by inserting into job_consumers
 	var jobsToReturn []job
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
-		span.RecordError(fmt.Errorf("failed to begin transaction for locking jobs: %w", err))
-		return nil, err
-	}
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent("Failed to rollback transaction during job locking", trace.WithAttributes(attribute.String("error", rErr.Error())))
-		}
-	}()
+	err := d.runInTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			UPDATE jobs
+			SET consumed_at = NOW(), consumer_name = $1
+			WHERE id IN (
+				SELECT id
+				FROM jobs
+				WHERE job_type = $2
+				  AND scheduled_at <= NOW()
+				  AND consumed_at IS NULL
+				ORDER BY scheduled_at, id
+				FOR UPDATE SKIP LOCKED
+				LIMIT $3
+			)
+			RETURNING id, payload, retry_count, trace_context
+		`, consumerName, jobType, prefetchCount)
 
-	stmt, err := tx.PrepareContext(ctx, `
-		UPDATE jobs
-		SET consumed_at = NOW()
-		WHERE id = $1 AND consumed_at IS NULL`)
-	if err != nil {
-		span.RecordError(fmt.Errorf("failed to prepare update statement for locking: %w", err))
-		return nil, err
-	}
-	defer func() {
-		if closeErr := stmt.Close(); closeErr != nil {
-			span.AddEvent("Failed to close prepared statement for job locking", trace.WithAttributes(attribute.String("error", closeErr.Error())))
-		}
-	}()
-
-	for _, j := range potentialJobs {
-		res, err := stmt.ExecContext(ctx, j.ID)
 		if err != nil {
-			// This shouldn't happen with ON CONFLICT DO NOTHING unless there's another issue
-			span.RecordError(fmt.Errorf("failed executing insert for job lock (job_id: %d): %w", j.ID, err))
-			// Decide whether to continue or return error based on severity
-			continue // Skip this job
+			return fmt.Errorf("failed to update and select jobs: %w", err)
 		}
+		defer rows.Close() // Ensure rows are closed within the transaction function
 
-		rowsAffected, _ := res.RowsAffected()
-		if rowsAffected > 0 {
-			// Successfully inserted placeholder, job is now "locked" for us
-			jobsToReturn = append(jobsToReturn, j)
-			if len(jobsToReturn) >= int(prefetchCount) {
-				break // Reached prefetch limit
+		for rows.Next() {
+			var j job
+			var traceContextJSON sql.NullString
+			j.JobType = jobType // Set job type as it's not returned by RETURNING
+
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+				// Log or record error, but potentially continue scanning other rows
+				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
+				continue
 			}
-		} else {
-			// Insert did nothing, likely due to ON CONFLICT. Job was already locked/processed.
-			span.AddEvent("Failed to acquire lock for job (likely conflict)", trace.WithAttributes(
-				attribute.Int64("sqlq.job_id", j.ID),
-			))
-			// Job likely locked or processed by another consumer, skip it.
-		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		span.RecordError(fmt.Errorf("failed to commit transaction for locking jobs: %w", err))
-		return nil, err
+			j.TraceContext = make(map[string]string)
+			if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {
+				if err = json.Unmarshal([]byte(traceContextJSON.String), &j.TraceContext); err != nil {
+					span.RecordError(fmt.Errorf("failed to unmarshal trace context for job %d: %w", j.ID, err))
+					j.TraceContext = make(map[string]string) // Reset on error
+				}
+			}
+			jobsToReturn = append(jobsToReturn, j)
+		}
+		return rows.Err() // Return any error encountered during iteration
+	})
+
+	if err != nil {
+		span.RecordError(fmt.Errorf("transaction failed during getJobsForConsumer: %w", err))
+		return nil, err // Return nil slice and the error
 	}
 
 	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobsToReturn)))
 	return jobsToReturn, nil
 }
 
-// markJobProcessed updates the job_consumers table to mark a job as successfully processed in PostgreSQL.
-func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64, consumerName string) error {
+// markJobProcessed updates the jobs table to mark a job as successfully processed in PostgreSQL.
+func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
-		attribute.String("sqlq.consumer_name", consumerName),
+		// Removed consumerName attribute
 	))
 	defer span.End()
 
 	res, err := d.db.ExecContext(ctx,
-		`UPDATE job_consumers 
-		 SET processed_at = NOW() 
-		 WHERE job_id = $1 AND consumer_name = $2 AND processed_at IS NULL`, // Only update if processing
-		jobID, consumerName,
+		`UPDATE jobs SET processed_at = NOW() WHERE id = $1 AND consumed_at IS NOT NULL AND processed_at IS NULL`,
+		jobID,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -453,18 +354,16 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64, cons
 	if rowsAffected == 0 {
 		// This could happen if:
 		// 1. The job was already marked processed (processed_at IS NOT NULL).
-		// 2. The job failed and was rescheduled (placeholder row deleted).
-		// 3. The job ID or consumer name is incorrect, or the placeholder was never inserted.
+		// 2. The job was not consumed (consumed_at IS NULL).
+		// 3. The job failed and was rescheduled (consumed_at became NULL).
+		// 4. The job ID is incorrect.
 		// Log this as it might indicate an unexpected state or double processing attempt.
-		span.AddEvent("MarkJobProcessed found no matching 'processing' row (processed_at IS NULL) to update", trace.WithAttributes(
+		span.AddEvent("MarkJobProcessed found no matching 'consumed' row (consumed_at IS NOT NULL, processed_at IS NULL) to update", trace.WithAttributes(
 			attribute.Int64("sqlq.job_id", jobID),
-			attribute.String("sqlq.consumer_name", consumerName),
 		))
-		// Depending on desired strictness, we might return an error here.
-		// return fmt.Errorf("no processing job found for job_id %d and consumer %s to mark as processed", jobID, consumerName)
 	}
 
-	return nil // Return nil even if rowsAffected is 0, as the goal is idempotency
+	return nil // Return nil even if rowsAffected is 0, goal is idempotency
 }
 
 // MarkJobFailedAndReschedule updates a job's state to failed, increments the retry count,
@@ -490,27 +389,24 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 		}
 	}()
 
-	// Update the job itself
-	_, err = tx.ExecContext(ctx,
-		"UPDATE jobs SET retry_count = retry_count + 1, last_error = $1, scheduled_at = NOW() + $2, consumed_at = NULL WHERE id = $3",
+	// Update the job: increment retry, set error, schedule, clear consumption/processing state
+	_, err = tx.ExecContext(ctx, `
+		UPDATE jobs SET 
+			retry_count = retry_count + 1, 
+			last_error = $1, 
+			scheduled_at = NOW() + $2::interval, 
+			consumed_at = NULL, 
+			processed_at = NULL,
+			consumer_name = NULL
+		WHERE id = $3`,
 		errorMsg, backoffDuration.String(), jobID,
 	)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to update jobs table on reschedule: %w", err))
-		return err
+		return err // Rollback will happen
 	}
 
-	// Remove the "processing" placeholder (where processed_at IS NULL) from job_consumers
-	// It's okay if this affects 0 rows (e.g., if GetJobsForConsumer failed before inserting)
-	_, err = tx.ExecContext(ctx,
-		"DELETE FROM job_consumers WHERE job_id = $1 AND processed_at IS NULL",
-		jobID,
-	)
-	if err != nil {
-		// Log the error but don't necessarily fail the whole operation,
-		// as the job update is the critical part.
-		span.RecordError(fmt.Errorf("failed to delete placeholder from job_consumers on reschedule (job_id: %d): %w", jobID, err))
-	}
+	// No need to delete from job_consumers anymore
 
 	err = tx.Commit()
 	if err != nil {
@@ -565,12 +461,14 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		return err
 	}
 
-	// Delete from jobs table
+	// Delete from jobs table (job_consumers is deleted via CASCADE)
 	_, err = tx.ExecContext(ctx, "DELETE FROM jobs WHERE id = $1", jobID) // Use ExecContext
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)
 	}
+
+	// No need to delete from job_consumers explicitly due to CASCADE
 
 	err = tx.Commit()
 	if err != nil {

@@ -191,7 +191,7 @@ func TestDriverSQLite(t *testing.T) {
 		// If the assertion failed (current state), the following lines might
 		// not be reached, or jobs2 might contain the same job.
 
-		err = driver.markJobProcessed(t.Context(), jobID1, consumerName)
+		err = driver.markJobProcessed(t.Context(), jobID1) // Removed consumerName argument
 		require.NoError(t, err, "Marking job processed for the first time failed")
 
 		// If jobs2 incorrectly contained the job, attempting to mark it

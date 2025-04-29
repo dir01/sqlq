@@ -22,7 +22,7 @@ type driver interface {
 
 	// markJobProcessed executes the query for marking a job as processed
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	markJobProcessed(ctx context.Context, jobID int64, consumerName string) error
+	markJobProcessed(ctx context.Context, jobID int64) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	// Rescheduled jobs can be returned to consumers again
@@ -37,13 +37,13 @@ type driver interface {
 	// requeueDeadLetterJob moves a job from the dead letter queue back to the main queue
 	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
-	// cleanupJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
+	// cleanupJobs deletes old processed jobs for a specific job type.
 	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
-	cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (processed int64, err error)
+	cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
 
-	// cleanupDeadLetterQueueJobs deletes old processed jobs and old dead-letter queue jobs for a specific job type.
-	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
-	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (processed int64, err error)
+	// cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
+	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
+	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
 }
 
 // getDriver returns the appropriate driver for the given database type
