@@ -59,7 +59,10 @@ func setupBenchmarkDB(b *testing.B) (*sql.DB, func()) {
 // BenchmarkHighConcurrency-10          517           2184726 ns/op            7774 B/op        154 allocs/op
 // With polling and push
 // BenchmarkHighConcurrency-10         6561            210670 ns/op            9699 B/op        208 allocs/op
+
 func BenchmarkHighConcurrency(b *testing.B) {
+	b.ReportAllocs()
+
 	db, cleanup := setupBenchmarkDB(b)
 	defer cleanup()
 
@@ -71,7 +74,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultConcurrency(concurrency),
 		sqlq.WithDefaultPrefetchCount(prefetchCount),
-		// Disable cleanup during benchmark for less noise, unless cleanup is part of the test
+		// Disable cleanup during benchmark for less noise
 		sqlq.WithDefaultCleanupProcessedInterval(0),
 		sqlq.WithDefaultCleanupDLQInterval(0),
 	)
@@ -91,7 +94,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	err = q.Consume(
 		b.Context(), jobType, handler,
 		sqlq.WithConsumerPollInteval(100*time.Millisecond),
-		sqlq.WithConsumerPushSubscription(10000),
+		sqlq.WithAsyncPush(),
 	)
 
 	require.NoError(b, err)

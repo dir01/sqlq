@@ -112,8 +112,20 @@ func WithConsumerCleanupDLQAge(age time.Duration) ConsumerOption {
 	}
 }
 
-func WithConsumerPushSubscription(rateLimitRPM int) ConsumerOption {
+// WithAsyncPush enables async push in supported drivers.
+// By deafult, consumer only recieves new jobs via periodic polling.
+// If enabled (and chosen driver supports it), hints to perform a poll will arrive
+// right as they happen. You may also rate limit this process with WithAsyncPushRateLimit.
+func WithAsyncPush() ConsumerOption {
+	return func(c *consumer) {
+		c.asyncPushEnabled = true
+	}
+}
+
+// WithAsyncPushRateLimit says how many times per minute should async notifications
+// from a publisher be delivered, at most
+func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
-		o.rateLimitRPM = uint16(rateLimitRPM)
+		o.asyncPushMaxRPM = uint16(rpm)
 	}
 }

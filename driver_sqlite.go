@@ -92,7 +92,6 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
-		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	// Defer rollback and check error
@@ -240,10 +239,13 @@ func (d *SQLiteDriver) insertJob(
 	d.dbMutex.Lock()
 	defer d.dbMutex.Unlock()
 
-	traceContextJSON, err := json.Marshal(traceContext)
-	if err != nil {
-		span.RecordError(fmt.Errorf("failed to marshal trace context: %w", err))
-		traceContextJSON = []byte("{}")
+	traceContextJSON := []byte("")
+	if len(traceContext) > 0 {
+		if b, err := json.Marshal(traceContext); err == nil {
+			traceContextJSON = b
+		} else {
+			span.RecordError(fmt.Errorf("failed to marshal trace context: %w", err))
+		}
 	}
 
 	// Use SQLite's built-in functions to get current time in milliseconds
@@ -270,8 +272,7 @@ func (d *SQLiteDriver) insertJob(
 	}
 
 	var id int64
-	err = d.db.QueryRowContext(ctx, query, args...).Scan(&id)
-	if err != nil {
+	if err := d.db.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
 		span.RecordError(err)
 	}
 
@@ -281,7 +282,7 @@ func (d *SQLiteDriver) insertJob(
 	d.notifMutex.RUnlock()
 
 	if notif != nil {
-		if notif.bucket.SpendToken(time.Now().UnixMilli()) {
+		if notif.bucket == nil || notif.bucket.SpendToken(time.Now().UnixMilli()) {
 			select {
 			case notif.notifChan <- struct{}{}:
 			default:
@@ -302,7 +303,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	))
 	defer span.End()
 
-	var jobsToReturn []job
+	jobsToReturn := make([]job, 0, prefetchCount)
 	nowMs := time.Now().UnixMilli()
 
 	// Since SQLite doesn't support SKIP LOCKED or UPDATE...RETURNING well,
@@ -327,7 +328,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 			_ = rows.Close()
 		}()
 
-		var potentialJobs []job
+		potentialJobs := make([]job, 0, prefetchCount)
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
@@ -357,13 +358,11 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		}
 
 		// Prepare update statement
-		stmt, err := tx.PrepareContext(ctx, `
-			UPDATE jobs SET consumed_at = ?
-			WHERE id = ? AND consumed_at IS NULL
-		`)
+		stmt, err := tx.PrepareContext(ctx, `UPDATE jobs SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`)
 		if err != nil {
 			return fmt.Errorf("failed to prepare update statement: %w", err)
 		}
+
 		defer func() {
 			_ = stmt.Close()
 		}()
@@ -423,7 +422,6 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, jobID int64) error 
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
-		// Removed consumerName attribute
 	))
 
 	defer span.End()

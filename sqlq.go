@@ -6,14 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand"
 	"runtime"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 
 	"go.opentelemetry.io/otel/trace"
@@ -68,6 +67,8 @@ var (
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
 	// ErrJobNotFound indicates that a job with the specified ID was not found (e.g., in DLQ operations).
 	ErrJobNotFound = errors.New("job not found")
+	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
+	ErrPushNotSupported = errors.New("async push is not supported")
 )
 
 var (
@@ -86,6 +87,7 @@ var (
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
 	db                 *sql.DB
+	dbType             DBType
 	driver             driver
 	defaultBackoffFunc func(retryNum uint16) time.Duration
 	tracer             trace.Tracer
@@ -148,12 +150,13 @@ type job struct {
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue
 type DeadLetterJob struct {
-	OriginalID    int64 // This is the primary key now
-	JobType       string
+	JobType   string
+	CreatedAt time.Time
+	// TraceContext? Does it make sense to bring it along?
 	FailureReason string
-	CreatedAt     time.Time
 	FailedAt      time.Time
 	Payload       []byte
+	OriginalID    int64 // This is the primary key now
 	RetryCount    uint16
 }
 
@@ -165,20 +168,17 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	}
 
 	q := &sqlq{
-		db:                   db,
-		driver:               driver,
-		consumersMap:         make(map[string]*consumer),
-		consumersMapMutex:    sync.RWMutex{},
-		defaultPollInterval:  100 * time.Millisecond,
-		defaultConcurrency:   defaultConcurrency,
-		defaultPrefetchCount: defaultPrefetchCount,
-		defaultMaxRetries:    defaultMaxRetries,
-		defaultJobTimeout:    defaultJobTimeout,
-		defaultBackoffFunc: func(retryNum uint16) time.Duration {
-			jitter := float64(rand.Intn(int(retryNum)))
-			backoff := math.Pow(2, float64(retryNum))
-			return time.Duration(backoff+jitter) * time.Second
-		},
+		db:                              db,
+		dbType:                          dbType,
+		driver:                          driver,
+		consumersMap:                    make(map[string]*consumer),
+		consumersMapMutex:               sync.RWMutex{},
+		defaultPollInterval:             100 * time.Millisecond,
+		defaultConcurrency:              defaultConcurrency,
+		defaultPrefetchCount:            defaultPrefetchCount,
+		defaultMaxRetries:               defaultMaxRetries,
+		defaultJobTimeout:               defaultJobTimeout,
+		defaultBackoffFunc:              exponentialBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
 		defaultCleanupDLQInterval:       defaultCleanupDLQInterval,
@@ -207,17 +207,15 @@ func (q *sqlq) Run() {
 // Publish adds a new job to the queue
 func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish",
-		trace.WithAttributes(
-			attribute.String("sqlq.job_type", jobType),
-		),
+		trace.WithAttributes(attribute.String("sqlq.job_type", jobType)),
 		trace.WithSpanKind(trace.SpanKindProducer),
 	)
-
 	defer span.End()
 
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to begin transaction")
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
@@ -311,6 +309,8 @@ func (q *sqlq) Consume(
 		cleanupProcessedAge:      q.defaultCleanupProcessedAge,
 		cleanupDLQInterval:       q.defaultCleanupDLQInterval,
 		cleanupDLQAge:            q.defaultCleanupDLQAge,
+		asyncPushEnabled:         false,
+		asyncPushMaxRPM:          0,
 		// Initialize consumer-specific fields
 		jobsChan: nil, // Will be initialized below
 		workerWg: sync.WaitGroup{},
@@ -323,9 +323,12 @@ func (q *sqlq) Consume(
 		o(cons)
 	}
 
-	// Options sanity adjustments
+	// Options sanity checks and adjustments
 	if cons.prefetchCount < cons.concurrency {
 		cons.prefetchCount = cons.concurrency
+	}
+	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
+		return fmt.Errorf("%w: %s", ErrPushNotSupported, q.dbType)
 	}
 
 	// It makes sense to have channel be of size `prefetchCount`
@@ -367,11 +370,11 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 // RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue, identified by its original job ID.
 func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes(
-		attribute.Int64("sqlq.original_job_id", originalJobID), // Use original_job_id attribute
+		attribute.Int64("sqlq.original_job_id", originalJobID),
 	))
 	defer span.End()
 
-	err := q.driver.requeueDeadLetterJob(ctx, originalJobID) // Pass originalJobID to driver
+	err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
 	if err != nil {
 		span.RecordError(err)
 	}
