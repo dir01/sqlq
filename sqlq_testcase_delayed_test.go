@@ -18,7 +18,7 @@ func (tc *TestCase) TestDelayedJobExecution(ctx context.Context, t *testing.T) {
 	delay := 500 * time.Millisecond
 	jobProcessed := make(chan bool, 1)
 
-	err := tc.Q.Consume(ctx, "delayed_job", "test_consumer", func(_ context.Context, _ *sql.Tx, _ []byte) error {
+	err := tc.Q.Consume(ctx, "delayed_job", func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		jobProcessed <- true
 		return nil
 	})

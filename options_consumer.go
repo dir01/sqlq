@@ -111,3 +111,9 @@ func WithConsumerCleanupDLQAge(age time.Duration) ConsumerOption {
 		}
 	}
 }
+
+func WithConsumerPushSubscription(rateLimitRPM int) ConsumerOption {
+	return func(o *consumer) {
+		o.rateLimitRPM = uint16(rateLimitRPM)
+	}
+}

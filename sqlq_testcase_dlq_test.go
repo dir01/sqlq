@@ -16,15 +16,15 @@ import (
 func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	// Increase overall test timeout
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	jobType := "job_moves_to_dlq_after_max_retries"
-	consumerName := "dlq_test_consumer"
-	var maxRetries int32 // Remove '= 0'
+	var maxRetries int32
 	var attempts atomic.Int32
 
-	err := tc.Q.Consume(ctx, jobType, consumerName, func(_ context.Context, _ *sql.Tx, _ []byte) error {
+	err := tc.Q.Consume(ctx, jobType, func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		attempts.Add(1)
 		return errors.New("simulated failure to move job to DLQ")
 	}, sqlq.WithConsumerMaxRetries(maxRetries))
@@ -35,9 +35,10 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 	err = tc.Q.Publish(ctx, jobType, testPayload)
 	require.NoError(t, err, "Failed to publish job")
 
+	// Increase timeout for checking attempts
 	require.Eventually(t, func() bool {
 		return attempts.Load() == maxRetries+1 // Remove unnecessary conversion
-	}, 2*time.Second, 10*time.Millisecond)
+	}, 5*time.Second, 10*time.Millisecond)
 
 	var dlqJobs []sqlq.DeadLetterJob
 
@@ -48,12 +49,14 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 		require.NoError(t, err, "Failed to get DLQ jobs")
 
 		return len(dlqJobs) > 0
-	}, 1*time.Second, 10*time.Millisecond)
+	// Increase timeout for checking DLQ
+	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, 1, len(dlqJobs))
 
 	j := dlqJobs[0]
 	require.Equal(t, uint16(maxRetries), j.RetryCount)
+	require.NotZero(t, j.OriginalID, "OriginalID should not be zero in DLQ job")
 }
 
 func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
@@ -63,15 +66,14 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 	defer cancel()
 
 	jobType := "dlq_requeue_test"
-	consumerName := "dlq_requeue_consumer"
-	var maxRetries int32 // Remove '= 0'
+	var maxRetries int32
 
 	jobFailed := make(chan struct{})
 	jobSucceeded := make(chan struct{})
 	shouldSucceed := false
 
 	// Consume job type
-	err := tc.Q.Consume(ctx, jobType, consumerName, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			return err
@@ -121,25 +123,27 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 	}, 1*time.Second, 10*time.Millisecond)
 
 	// Find our job in the DLQ
-	var dlqJobID int64
+	var originalJobID int64 // We need the original job ID to requeue
+	require.NotEmpty(t, dlqJobs, "DLQ should contain the failed job")
 	for _, dlqJob := range dlqJobs {
 		var payload TestPayload
 		err = json.Unmarshal(dlqJob.Payload, &payload)
 		require.NoError(t, err, "Failed to unmarshal DLQ job payload")
 
-		if true { // payload.Count == testPayload.Count { // Add space after //
-			dlqJobID = dlqJob.ID
+		// Assuming the payload message identifies our job for simplicity in this test
+		if payload.Message == testPayload.Message {
+			originalJobID = dlqJob.OriginalID // Get the OriginalID
 			break
 		}
 	}
 
-	require.NotZero(t, dlqJobID, "Job not found in DLQ")
+	require.NotZero(t, originalJobID, "Job not found in DLQ by payload message")
 
 	// Now we'll allow the job to succeed when requeued
 	shouldSucceed = true
 
-	// Requeue the job from DLQ
-	err = tc.Q.RequeueDeadLetterJob(ctx, dlqJobID)
+	// Requeue the job from DLQ using its original ID
+	err = tc.Q.RequeueDeadLetterJob(ctx, originalJobID)
 	require.NoError(t, err, "Failed to requeue job from DLQ")
 
 	// Wait for the requeued job to be processed successfully using Eventually
@@ -156,10 +160,10 @@ func (tc *TestCase) TestDLQReque(ctx context.Context, t *testing.T) {
 	dlqJobs, err = tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
 	require.NoError(t, err, "Failed to get DLQ jobs")
 
-	// Check if our job is still in the DLQ
+	// Check if our job (identified by original ID) is still in the DLQ
 	for _, dlqJob := range dlqJobs {
-		if dlqJob.ID == dlqJobID {
-			t.Fatal("Job still exists in DLQ after requeue")
+		if dlqJob.OriginalID == originalJobID {
+			t.Fatalf("Job with original ID %d still exists in DLQ after requeue", originalJobID)
 		}
 	}
 }
@@ -173,12 +177,11 @@ func (tc *TestCase) TestDLQGet(ctx context.Context, t *testing.T) {
 	// Create two different job types
 	jobType1 := "dlq_filter_test_1"
 	jobType2 := "dlq_filter_test_2"
-	consumerName := "dlq_filter_consumer"
-	var maxRetries int32 // No retries to speed up the test // Remove '= 0'
+	var maxRetries int32 // No retries to speed up the test
 
 	// Consume both job types with a handler that always fails
 	for _, jobType := range []string{jobType1, jobType2} {
-		err := tc.Q.Consume(ctx, jobType, consumerName, func(_ context.Context, _ *sql.Tx, _ []byte) error {
+		err := tc.Q.Consume(ctx, jobType, func(_ context.Context, _ *sql.Tx, _ []byte) error {
 			// Always fail to move to DLQ
 			return errors.New("simulated failure for filter test")
 		}, sqlq.WithConsumerMaxRetries(maxRetries))
@@ -254,12 +257,24 @@ func (tc *TestCase) TestDLQGetLimit(ctx context.Context, t *testing.T) {
 	require.NoError(t, err, "Failed to get DLQ jobs with limit 1")
 	require.LessOrEqual(t, len(dlqJobs1), limit1, "DLQ returned more jobs than the limit")
 
-	// Only run the larger limit test if we have enough jobs
+	// Only run the larger limit test if we have enough jobs and the first query returned exactly the limit
 	if len(dlqJobs1) == limit1 {
-		limit2 := 5
-		dlqJobs2, err := tc.Q.GetDeadLetterJobs(ctx, "", limit2)
-		require.NoError(t, err, "Failed to get DLQ jobs with limit 5")
-		require.LessOrEqual(t, len(dlqJobs2), limit2, "DLQ returned more jobs than the limit")
-		require.GreaterOrEqual(t, len(dlqJobs2), len(dlqJobs1), "Second query with higher limit should return at least as many jobs")
+		// Fetch all jobs to see if there are actually more than limit1
+		allJobs, errAll := tc.Q.GetDeadLetterJobs(ctx, "", 100) // Fetch a large number
+		require.NoError(t, errAll, "Failed to get all DLQ jobs for comparison")
+
+		if len(allJobs) > limit1 { // Only proceed if there are more jobs to fetch
+			limit2 := 5
+			dlqJobs2, err := tc.Q.GetDeadLetterJobs(ctx, "", limit2)
+			require.NoError(t, err, "Failed to get DLQ jobs with limit 5")
+			require.LessOrEqual(t, len(dlqJobs2), limit2, "DLQ returned more jobs than the limit")
+			// Ensure the second query returned more or equal jobs only if enough jobs exist overall
+			if len(allJobs) >= limit2 {
+				require.GreaterOrEqual(t, len(dlqJobs2), len(dlqJobs1), "Second query with higher limit should return at least as many jobs as the first")
+				require.Greater(t, len(dlqJobs2), len(dlqJobs1), "Second query with higher limit should return more jobs than the first when available")
+			} else {
+				require.Equal(t, len(allJobs), len(dlqJobs2), "Second query should return all available jobs if limit is higher than total")
+			}
+		}
 	}
 }

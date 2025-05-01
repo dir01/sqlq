@@ -14,12 +14,26 @@ type driver interface {
 	// It should be safe to call multiple times, even though there is no reason to do so
 	initSchema(ctx context.Context) error
 
+	/*
+		type job struct {
+			JobType      string
+			CreatedAt    time.Time
+			TraceContext map[string]string
+			Payload      []byte
+			ID           int64
+			RetryCount   uint16
+		}
+	*/
+
 	// insertJob executes the query for inserting a job
 	insertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
 	// getJobsForConsumer executes the query for finding jobs for a consumer
 	// Jobs returned once should not be returned unless they were explicitly rescheduled
-	getJobsForConsumer(ctx context.Context, consumerName, jobType string, prefetchCount uint16) ([]job, error)
+	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16) ([]job, error)
+
+	// subscribeForConsumer will post new jobs to a channel according to tokenBucket
+	subscribeForConsumer(ctx context.Context, jobType string, tokenBucket *tokenBucket) (<-chan struct{}, error)
 
 	// markJobProcessed executes the query for marking a job as processed
 	// Processed jobs are not returned to consumers and are eligible for cleanup

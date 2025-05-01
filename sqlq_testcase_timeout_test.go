@@ -19,7 +19,6 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 	defer cancel()
 
 	jobType := "timeout_job"
-	consumerName := "timeout_consumer"
 	jobTimeout := 100 * time.Millisecond     // Job should timeout after this duration
 	processingTime := 300 * time.Millisecond // Handler takes longer than the timeout
 
@@ -27,7 +26,7 @@ func (tc *TestCase) TestJobExecutionTimeout(ctx context.Context, t *testing.T) {
 	handlerFinished := make(chan bool, 1) // Should not receive on this channel
 
 	// Consume the queue with a job execution timeout
-	err := tc.Q.Consume(ctx, jobType, consumerName,
+	err := tc.Q.Consume(ctx, jobType,
 		func(ctx context.Context, _ *sql.Tx, _ []byte) error { // Rename unused payloadBytes to _
 			handlerStarted <- true
 			select {

@@ -33,15 +33,14 @@ type JobsQueue interface {
 	Consume(
 		ctx context.Context,
 		jobType string,
-		consumerName string,
 		f func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error, opts ...ConsumerOption,
 	) error
 
 	// GetDeadLetterJobs retrieves jobs from the dead letter queue, optionally filtered by job type.
 	GetDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
-	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue.
-	RequeueDeadLetterJob(ctx context.Context, dlqID int64) error
+	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue, identified by its original job ID.
+	RequeueDeadLetterJob(ctx context.Context, originalJobID int64) error
 
 	// Shutdown gracefully stops all consumers and background processes.
 	Shutdown()
@@ -149,13 +148,12 @@ type job struct {
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue
 type DeadLetterJob struct {
+	OriginalID    int64 // This is the primary key now
 	JobType       string
 	FailureReason string
 	CreatedAt     time.Time
 	FailedAt      time.Time
 	Payload       []byte
-	ID            int64
-	OriginalID    int64
 	RetryCount    uint16
 }
 
@@ -289,16 +287,14 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 func (q *sqlq) Consume(
 	ctx context.Context,
 	jobType string,
-	consumerName string,
 	handler func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error,
 	opts ...ConsumerOption,
 ) error {
 	consCtx, cancel := context.WithCancel(ctx)
 
 	cons := &consumer{
-		jobType:      jobType,
-		consumerName: consumerName,
-		handler:      handler,
+		jobType: jobType,
+		handler: handler,
 		// Inject dependencies from sqlq
 		db:     q.db,
 		driver: q.driver,
@@ -368,14 +364,14 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 	return jobs, err
 }
 
-// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, dlqID int64) error {
-	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes( // Corrected span name
-		attribute.Int64("sqlq.dlq_id", dlqID),
+// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue, identified by its original job ID.
+func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) error {
+	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes(
+		attribute.Int64("sqlq.original_job_id", originalJobID), // Use original_job_id attribute
 	))
 	defer span.End()
 
-	err := q.driver.requeueDeadLetterJob(ctx, dlqID)
+	err := q.driver.requeueDeadLetterJob(ctx, originalJobID) // Pass originalJobID to driver
 	if err != nil {
 		span.RecordError(err)
 	}

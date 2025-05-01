@@ -19,7 +19,7 @@ func (tc *TestCase) TestRetry(ctx context.Context, t *testing.T) {
 	jobAttempts := make(chan int, 5)
 
 	// Consume the queue
-	err := tc.Q.Consume(ctx, "retry_job", "retry_consumer", func(_ context.Context, _ *sql.Tx, _ []byte) error {
+	err := tc.Q.Consume(ctx, "retry_job", func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		count := attemptCount.Add(1)
 		jobAttempts <- int(count)
 
@@ -96,7 +96,7 @@ func (tc *TestCase) TestRetryMaxExceeded(ctx context.Context, t *testing.T) {
 	var maxRetries int32 = 1 // We'll allow 1 retry (2 total attempts)
 
 	// Consume the queue
-	err := tc.Q.Consume(ctx, "max_retry_job", "max_retry_consumer", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
+	err := tc.Q.Consume(ctx, "max_retry_job", func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 			t.Errorf("Failed to unmarshal payload: %v", err)

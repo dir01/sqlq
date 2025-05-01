@@ -68,7 +68,7 @@ func TestDriverSQLite(t *testing.T) {
 		err := driver.insertJob(ctx, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.getJobsForConsumer(ctx, "some-consumer-name", jobType, 10)
+		jobs, err := driver.getJobsForConsumer(ctx, jobType, 10)
 		require.NoError(t, err)
 
 		require.Equal(t, 1, len(jobs))
@@ -84,7 +84,7 @@ func TestDriverSQLite(t *testing.T) {
 		err := driver.insertJob(t.Context(), jobType, payload, 30*time.Minute, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.getJobsForConsumer(t.Context(), "some-consumer-name", jobType, 10)
+		jobs, err := driver.getJobsForConsumer(t.Context(), jobType, 10)
 		require.NoError(t, err)
 
 		require.Equal(t, 0, len(jobs))
@@ -167,19 +167,18 @@ func TestDriverSQLite(t *testing.T) {
 	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
 		t.Parallel() // Run subtest in parallel
 		jobType := "concurrent_race_test"
-		consumerName := "race-consumer"
 		err := driver.insertJob(t.Context(), jobType, payload, 0, traceContext)
 		require.NoError(t, err, "Failed to insert job for race test")
 
 		// Simulate first consumer fetching the job
-		jobs1, err := driver.getJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		jobs1, err := driver.getJobsForConsumer(t.Context(), jobType, 1)
 		require.NoError(t, err, "First GetJobsForConsumer call failed")
 		require.Len(t, jobs1, 1, "First GetJobsForConsumer should fetch 1 job")
 		jobID1 := jobs1[0].ID
 
 		// Simulate second consumer (or same consumer polling again quickly)
 		// *before* the first one marks the job as processed
-		jobs2, err := driver.getJobsForConsumer(t.Context(), consumerName, jobType, 1)
+		jobs2, err := driver.getJobsForConsumer(t.Context(), jobType, 1)
 		require.NoError(t, err, "Second GetJobsForConsumer call failed")
 
 		// *** This is the assertion that should FAIL with the current driver logic ***

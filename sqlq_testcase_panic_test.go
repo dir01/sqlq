@@ -15,11 +15,10 @@ func (tc *TestCase) TestPanic(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	jobType := "panic_job"
-	consumerName := "panic_consumer"
 	panicMessage := "handler deliberately panicked"
 
 	// Consume the queue with a handler that panics
-	err := tc.Q.Consume(ctx, jobType, consumerName,
+	err := tc.Q.Consume(ctx, jobType,
 		func(_ context.Context, _ *sql.Tx, _ []byte) error {
 			panic(panicMessage)
 		},

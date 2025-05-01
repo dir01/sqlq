@@ -28,7 +28,6 @@ type consumer struct {
 	tracer                   trace.Tracer
 	jobsChan                 chan job // Written to by a db poller, consumed by worker goroutines
 	jobType                  string
-	consumerName             string
 	workerWg                 sync.WaitGroup // Wait to make sure all scheduled goroutines stopped
 	pollInterval             time.Duration  // How often should db poller run
 	jobTimeout               time.Duration  // After this amount a time, job context will be canceled
@@ -40,11 +39,12 @@ type consumer struct {
 	prefetchCount            uint16         // LIMIT when fetching jobs from database into jobsChan
 	concurrency              uint16         // How many goroutines will process jobsChan
 	cleanupBatch             uint16         // Number of jobs to delete per cleanup batch
+	rateLimitRPM             uint16         // If non-zero, async subscription will be used in addition to polling. The value determins how many times per minute async notifications will be delivered
 }
 
 // start launches the polling, worker, and cleanup goroutines for the consumer.
 func (cons *consumer) start() {
-	go cons.poll()
+	go cons.fetchJobsLoop()
 
 	for range cons.concurrency {
 		go cons.workerLoop()
@@ -65,13 +65,21 @@ func (cons *consumer) shutdown() {
 	cons.workerWg.Wait()
 }
 
-// poll periodically fetches jobs from the database and sends them to the jobs channel.
-func (cons *consumer) poll() {
+// fetchJobsLoop periodically fetches jobs from the database and sends them to the jobs channel.
+func (cons *consumer) fetchJobsLoop() {
 	cons.workerWg.Add(1)
 	defer cons.workerWg.Done()
 
 	ticker := time.NewTicker(cons.pollInterval)
 	defer ticker.Stop()
+
+	subChan := make(<-chan struct{})
+	if cons.rateLimitRPM != 0 {
+		bucket := &tokenBucket{Capacity: cons.rateLimitRPM, RPM: cons.rateLimitRPM} //nolint:exhaustruct
+		if driverSubChan, err := cons.driver.subscribeForConsumer(cons.ctx, cons.jobType, bucket); err == nil && driverSubChan != nil {
+			subChan = driverSubChan
+		}
+	}
 
 	var attempt uint16
 	for {
@@ -84,7 +92,6 @@ func (cons *consumer) poll() {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "failed to fetch jobs")
 			span.SetAttributes(
-				attribute.String("consumer_name", cons.consumerName),
 				attribute.String("job_type", cons.jobType),
 			)
 			span.End()
@@ -108,6 +115,11 @@ func (cons *consumer) poll() {
 		case <-cons.ctx.Done():
 			// Context was canceled
 			return
+		case <-subChan: // This will always block if subscription was not enabled with options or driver does not support it or there was a problem subscribing to pushes
+			// Got async push, so we'll fetch prematurely.
+			// This means we need to reset the ticker so that fetches are pollInterval apart.
+			ticker.Reset(cons.pollInterval)
+			continue
 		case <-ticker.C:
 			// Timer expired, continue to next poll
 			continue
@@ -118,7 +130,7 @@ func (cons *consumer) poll() {
 // fetchJobs fetches jobs for this consumer and sends them to the jobs channel.
 func (cons *consumer) fetchJobs(ctx context.Context) error {
 	// Use consumer's driver
-	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.consumerName, cons.jobType, cons.prefetchCount)
+	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, cons.prefetchCount)
 	if err != nil {
 		// Don't wrap error here, let the poller handle logging/backoff
 		return err
@@ -360,7 +372,6 @@ func (cons *consumer) performProcessedCleanup(driver driver, tracer trace.Tracer
 	// Create a background context for the cleanup operation itself
 	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.processed", trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
-		attribute.String("sqlq.consumer_name", cons.consumerName),
 		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
 	))
@@ -388,7 +399,6 @@ func (cons *consumer) performDLQCleanup(driver driver, tracer trace.Tracer, dlqM
 	// Create a background context for the cleanup operation itself
 	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.dlq", trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
-		attribute.String("sqlq.consumer_name", cons.consumerName),
 		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
 	))
