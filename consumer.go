@@ -395,6 +395,11 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	err := callRecovering("dead letter hook", func() error {
 		return cons.onDeadLetter(ctx, tx, info, payload, handlerErr)
 	})
+	if err == nil && ctx.Err() != nil {
+		// As with handlers, a hook that outlived its context failed even if it returned nil:
+		// tx doesn't share ctx, so its writes would otherwise still be committed.
+		err = ctx.Err()
+	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "dead letter hook failed")

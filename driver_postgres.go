@@ -278,13 +278,15 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
-			j.JobType = jobType // Set job type as it's not returned by RETURNING
+			var createdAt sql.NullTime // The schema allows NULL, and failing to scan would strand the claimed job
+			j.JobType = jobType        // Set job type as it's not returned by RETURNING
 
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &j.CreatedAt); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt); err != nil {
 				// Log or record error, but potentially continue scanning other rows
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
 				continue
 			}
+			j.CreatedAt = createdAt.Time // Zero if created_at is NULL
 
 			j.TraceContext = make(map[string]string)
 			if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {

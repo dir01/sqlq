@@ -141,7 +141,8 @@ func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 // If the hook returns an error or panics, the move is rolled back and the job is rescheduled
 // like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
 //
-// ctx is canceled at shutdown and after the consumer's job timeout.
+// ctx is canceled at shutdown and after the consumer's job timeout. A hook whose ctx was canceled
+// counts as failed even if it returns nil.
 //
 // On SQLite the queue's write lock is held while the hook runs, so the hook must write only through tx
 // and must not call queue methods such as Publish: they would wait for that lock forever.

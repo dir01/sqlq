@@ -441,8 +441,8 @@ func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 			case 2:
 				panic("hook panicked")
 			case 3:
-				<-ctx.Done() // Canceled after the job timeout
-				return ctx.Err()
+				<-ctx.Done() // Canceled after the job timeout, which fails the hook although it returns nil
+				return nil
 			default:
 				return nil
 			}

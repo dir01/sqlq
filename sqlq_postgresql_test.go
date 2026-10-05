@@ -1,6 +1,7 @@
 package sqlq_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"testing"
@@ -141,6 +142,47 @@ func TestPostgreSQL(t *testing.T) {
 
 		tc.TestDLQGetLimit(ctx, t)
 	})
+
+	t.Run("Job with NULL created_at is still delivered", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestNullCreatedAt")
+		defer span.End()
+
+		tc.TestNullCreatedAt(ctx, t)
+	})
+}
+
+// TestNullCreatedAt checks that a job whose created_at is NULL, which the PostgreSQL schema allows
+// (unlike SQLite's), is delivered with a zero CreatedAt instead of being claimed and dropped.
+func (tc *TestCase) TestNullCreatedAt(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	jobType := "null_created_at_test"
+	infos := make(chan sqlq.JobInfo, 1)
+
+	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
+		info, _ := sqlq.JobInfoFromContext(ctx)
+		infos <- info
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = tc.DB.ExecContext(ctx,
+		"INSERT INTO jobs (job_type, payload, created_at) VALUES ($1, $2, NULL)",
+		jobType, []byte(`{"message":"null created_at"}`),
+	)
+	require.NoError(t, err)
+
+	select {
+	case info := <-infos:
+		require.True(t, info.CreatedAt.IsZero())
+	case <-ctx.Done():
+		t.Fatal("job with NULL created_at was not delivered")
+	}
 }
 
 func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
