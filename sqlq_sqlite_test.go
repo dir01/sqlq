@@ -119,6 +119,15 @@ func TestSQLite(t *testing.T) {
 		tc.TestDLQGet(ctx, t)
 	})
 
+	t.Run("Dead letter hook and job info", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQHook")
+		defer span.End()
+
+		tc.TestDLQHook(ctx, t)
+	})
+
 	t.Run("Fetching Dead Letter Queue jobs respects limits", func(t *testing.T) {
 		t.Parallel()
 

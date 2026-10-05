@@ -1,6 +1,9 @@
 package sqlq
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // ConsumerOption defines functional options for Subscribe
 type ConsumerOption func(*consumer)
@@ -127,5 +130,18 @@ func WithAsyncPush() ConsumerOption {
 func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
 		o.asyncPushMaxRPM = uint16(rpm)
+	}
+}
+
+// DeadLetterHook is called after a job has exhausted its retries and been moved to the dead letter queue.
+// handlerErr is the error returned by the final attempt.
+// The hook runs once, best effort: if the process dies between the move and the hook, the hook is not re-run.
+type DeadLetterHook func(ctx context.Context, info JobInfo, payload []byte, handlerErr error)
+
+// WithConsumerOnDeadLetter registers a hook that is called after a job of this type
+// is moved to the dead letter queue. Use it to put domain state into a terminal "failed" state.
+func WithConsumerOnDeadLetter(hook DeadLetterHook) ConsumerOption {
+	return func(o *consumer) {
+		o.onDeadLetter = hook
 	}
 }

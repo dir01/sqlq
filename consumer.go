@@ -40,6 +40,7 @@ type consumer struct {
 	cleanupBatch             uint16         // Number of jobs to delete per cleanup batch
 	asyncPushEnabled         bool           // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
 	asyncPushMaxRPM          uint16         // How many times per minute will async push be delivered at most
+	onDeadLetter             DeadLetterHook // Called after a job has been moved to the dead letter queue
 
 }
 
@@ -245,11 +246,13 @@ func (cons *consumer) processJob(j *job) {
 	// Max retries exceeded or retries disabled, move to Dead Letter Queue
 	if err = cons.moveJobToDLQ(ctx, j, handlerErr.Error()); err == nil {
 		span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
+		cons.runDeadLetterHook(ctx, j, handlerErr)
 	}
 }
 
 func (cons *consumer) handleJob(ctx context.Context, j *job, tx *sql.Tx) error {
 	ctx, handlerSpan := cons.tracer.Start(ctx, "sqlq.handle")
+	ctx = contextWithJobInfo(ctx, cons.jobInfo(j))
 
 	defer handlerSpan.End()
 
@@ -332,6 +335,26 @@ func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, errorMsg string)
 	span.SetStatus(codes.Ok, "job moved to DLQ")
 
 	return nil
+}
+
+// runDeadLetterHook invokes the consumer's dead-letter hook, if any.
+// A panic in the hook is recovered and recorded so it cannot take down the worker.
+func (cons *consumer) runDeadLetterHook(ctx context.Context, j *job, handlerErr error) {
+	if cons.onDeadLetter == nil {
+		return
+	}
+
+	ctx, span := cons.tracer.Start(ctx, "sqlq.on_dead_letter")
+	defer span.End()
+
+	defer func() {
+		if r := recover(); r != nil {
+			span.RecordError(fmt.Errorf("panic in dead letter hook: %v", r))
+			span.SetStatus(codes.Error, "dead letter hook panicked")
+		}
+	}()
+
+	cons.onDeadLetter(contextWithJobInfo(ctx, cons.jobInfo(j)), cons.jobInfo(j), j.Payload, handlerErr)
 }
 
 // runProcessedCleanupLoop periodically cleans up old processed jobs for this consumer.

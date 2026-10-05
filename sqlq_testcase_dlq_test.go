@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -276,5 +277,76 @@ func (tc *TestCase) TestDLQGetLimit(ctx context.Context, t *testing.T) {
 				require.Equal(t, len(allJobs), len(dlqJobs2), "Second query should return all available jobs if limit is higher than total")
 			}
 		}
+	}
+}
+
+func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	jobType := "dlq_hook_test"
+	maxRetries := int32(2)
+
+	var seen []sqlq.JobInfo
+	var seenMu sync.Mutex
+
+	type hookCall struct {
+		info    sqlq.JobInfo
+		payload []byte
+		err     error
+		ctxInfo sqlq.JobInfo
+	}
+	hookCalls := make(chan hookCall, 2)
+
+	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
+		info, ok := sqlq.JobInfoFromContext(ctx)
+		require.True(t, ok, "job info should be in handler context")
+		seenMu.Lock()
+		seen = append(seen, info)
+		seenMu.Unlock()
+		return errors.New("always fails")
+	},
+		sqlq.WithConsumerMaxRetries(maxRetries),
+		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, info sqlq.JobInfo, payload []byte, handlerErr error) {
+			ctxInfo, _ := sqlq.JobInfoFromContext(ctx)
+			hookCalls <- hookCall{info: info, payload: payload, err: handlerErr, ctxInfo: ctxInfo}
+		}),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: "dlq_hook"}))
+
+	var call hookCall
+	select {
+	case call = <-hookCalls:
+	case <-ctx.Done():
+		t.Fatal("dead letter hook was not called")
+	}
+
+	require.Equal(t, jobType, call.info.JobType)
+	require.Equal(t, uint16(maxRetries), call.info.RetryCount)
+	require.True(t, call.info.IsFinalAttempt())
+	require.Equal(t, call.info, call.ctxInfo)
+	require.EqualError(t, call.err, "always fails")
+
+	var p TestPayload
+	require.NoError(t, json.Unmarshal(call.payload, &p))
+	require.Equal(t, "dlq_hook", p.Message)
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	require.Len(t, seen, int(maxRetries)+1)
+	for i, info := range seen {
+		require.Equal(t, call.info.ID, info.ID)
+		require.Equal(t, uint16(i), info.RetryCount)
+		require.Equal(t, i == int(maxRetries), info.IsFinalAttempt())
+	}
+
+	select {
+	case <-hookCalls:
+		t.Fatal("dead letter hook called more than once")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
