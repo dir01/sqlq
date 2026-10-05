@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -252,32 +254,34 @@ func (tc *TestCase) TestDLQGetLimit(ctx context.Context, t *testing.T) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	// Get all DLQ jobs with different limits
-	limit1 := 1
-	dlqJobs1, err := tc.Q.GetDeadLetterJobs(ctx, "", limit1)
-	require.NoError(t, err, "Failed to get DLQ jobs with limit 1")
-	require.LessOrEqual(t, len(dlqJobs1), limit1, "DLQ returned more jobs than the limit")
+	// Other tests add and remove dead letter jobs concurrently, so count only jobs of a type of its own
+	jobType := "dlq_limit_test"
+	jobsCount := 3
 
-	// Only run the larger limit test if we have enough jobs and the first query returned exactly the limit
-	if len(dlqJobs1) == limit1 {
-		// Fetch all jobs to see if there are actually more than limit1
-		allJobs, errAll := tc.Q.GetDeadLetterJobs(ctx, "", 100) // Fetch a large number
-		require.NoError(t, errAll, "Failed to get all DLQ jobs for comparison")
+	err := tc.Q.Consume(ctx, jobType, func(_ context.Context, _ *sql.Tx, _ []byte) error {
+		return errors.New("simulated failure for limit test")
+	}, sqlq.WithConsumerMaxRetries(0))
+	require.NoError(t, err, "Failed to start consumer for DLQ limit test")
 
-		if len(allJobs) > limit1 { // Only proceed if there are more jobs to fetch
-			limit2 := 5
-			dlqJobs2, err := tc.Q.GetDeadLetterJobs(ctx, "", limit2)
-			require.NoError(t, err, "Failed to get DLQ jobs with limit 5")
-			require.LessOrEqual(t, len(dlqJobs2), limit2, "DLQ returned more jobs than the limit")
-			// Ensure the second query returned more or equal jobs only if enough jobs exist overall
-			if len(allJobs) >= limit2 {
-				require.GreaterOrEqual(t, len(dlqJobs2), len(dlqJobs1), "Second query with higher limit should return at least as many jobs as the first")
-				require.Greater(t, len(dlqJobs2), len(dlqJobs1), "Second query with higher limit should return more jobs than the first when available")
-			} else {
-				require.Equal(t, len(allJobs), len(dlqJobs2), "Second query should return all available jobs if limit is higher than total")
-			}
-		}
+	for range jobsCount {
+		require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: "limit test job"}))
 	}
+
+	require.Eventually(t, func() bool {
+		dlqJobs, getErr := tc.Q.GetDeadLetterJobs(ctx, jobType, 100)
+		return getErr == nil && len(dlqJobs) == jobsCount
+	}, 5*time.Second, 10*time.Millisecond)
+
+	for _, limit := range []int{1, jobsCount - 1, jobsCount, jobsCount + 1} {
+		limitedJobs, getErr := tc.Q.GetDeadLetterJobs(ctx, jobType, limit)
+		require.NoError(t, getErr, "Failed to get DLQ jobs with limit %d", limit)
+		require.Len(t, limitedJobs, min(limit, jobsCount), "DLQ returned wrong number of jobs for limit %d", limit)
+	}
+
+	// Without a job type, the limit applies across all types
+	dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, "", 1)
+	require.NoError(t, err, "Failed to get DLQ jobs of all types with limit 1")
+	require.Len(t, dlqJobs, 1, "DLQ returned more jobs than the limit")
 }
 
 func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
@@ -289,33 +293,57 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 	jobType := "dlq_hook_test"
 	maxRetries := int32(2)
 
-	var seen []sqlq.JobInfo
-	var seenMu sync.Mutex
+	// The handler locks the order row, and the hook marks the order failed. The hook can only do so
+	// if the handler's transaction has finished by the time the hook runs.
+	for _, query := range []string{
+		"DROP TABLE IF EXISTS dlq_hook_orders",
+		"CREATE TABLE dlq_hook_orders (id INTEGER PRIMARY KEY, status TEXT NOT NULL)",
+		"INSERT INTO dlq_hook_orders (id, status) VALUES (1, 'new')",
+	} {
+		_, err := tc.DB.ExecContext(ctx, query)
+		require.NoError(t, err)
+	}
+
+	type handlerCall struct {
+		info sqlq.JobInfo
+		ok   bool
+	}
+	var handlerCalls []handlerCall
+	var handlerCallsMu sync.Mutex
 
 	type hookCall struct {
 		info    sqlq.JobInfo
 		payload []byte
 		err     error
 		ctxInfo sqlq.JobInfo
+		ctxOK   bool
 	}
 	hookCalls := make(chan hookCall, 2)
 
-	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
+	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 		info, ok := sqlq.JobInfoFromContext(ctx)
-		require.True(t, ok, "job info should be in handler context")
-		seenMu.Lock()
-		seen = append(seen, info)
-		seenMu.Unlock()
+		handlerCallsMu.Lock()
+		handlerCalls = append(handlerCalls, handlerCall{info: info, ok: ok})
+		handlerCallsMu.Unlock()
+
+		if _, err := tx.ExecContext(ctx, "UPDATE dlq_hook_orders SET status = 'processing' WHERE id = 1"); err != nil {
+			return err
+		}
+
 		return errors.New("always fails")
 	},
 		sqlq.WithConsumerMaxRetries(maxRetries),
-		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, info sqlq.JobInfo, payload []byte, handlerErr error) {
-			ctxInfo, _ := sqlq.JobInfoFromContext(ctx)
-			hookCalls <- hookCall{info: info, payload: payload, err: handlerErr, ctxInfo: ctxInfo}
+		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo, payload []byte, handlerErr error) error {
+			ctxInfo, ctxOK := sqlq.JobInfoFromContext(ctx)
+			hookCalls <- hookCall{info: info, payload: payload, err: handlerErr, ctxInfo: ctxInfo, ctxOK: ctxOK}
+
+			_, err := tx.ExecContext(ctx, "UPDATE dlq_hook_orders SET status = 'failed' WHERE id = 1")
+			return err
 		}),
 	)
 	require.NoError(t, err)
 
+	publishedAt := time.Now()
 	require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: "dlq_hook"}))
 
 	var call hookCall
@@ -326,8 +354,13 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 	}
 
 	require.Equal(t, jobType, call.info.JobType)
+	require.NotZero(t, call.info.ID)
+	require.Equal(t, maxRetries, call.info.MaxRetries)
 	require.Equal(t, uint16(maxRetries), call.info.RetryCount)
+	// Generous, since the database server's clock sets created_at on some drivers
+	require.WithinDuration(t, publishedAt, call.info.CreatedAt, time.Minute)
 	require.True(t, call.info.IsFinalAttempt())
+	require.True(t, call.ctxOK, "job info should be in dead letter hook context")
 	require.Equal(t, call.info, call.ctxInfo)
 	require.EqualError(t, call.err, "always fails")
 
@@ -335,13 +368,26 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 	require.NoError(t, json.Unmarshal(call.payload, &p))
 	require.Equal(t, "dlq_hook", p.Message)
 
-	seenMu.Lock()
-	defer seenMu.Unlock()
-	require.Len(t, seen, int(maxRetries)+1)
-	for i, info := range seen {
-		require.Equal(t, call.info.ID, info.ID)
-		require.Equal(t, uint16(i), info.RetryCount)
-		require.Equal(t, i == int(maxRetries), info.IsFinalAttempt())
+	require.Eventually(t, func() bool {
+		var status string
+		err := tc.DB.QueryRowContext(ctx, "SELECT status FROM dlq_hook_orders WHERE id = 1").Scan(&status)
+		return err == nil && status == "failed"
+	}, 5*time.Second, 10*time.Millisecond, "dead letter hook should have marked the order failed")
+
+	require.Eventually(t, func() bool {
+		dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
+		return err == nil && slices.ContainsFunc(dlqJobs, func(j sqlq.DeadLetterJob) bool { return j.OriginalID == call.info.ID })
+	}, 5*time.Second, 10*time.Millisecond, "job should be in the dead letter queue")
+
+	handlerCallsMu.Lock()
+	defer handlerCallsMu.Unlock()
+	require.Len(t, handlerCalls, int(maxRetries)+1)
+	for i, handlerCall := range handlerCalls {
+		require.True(t, handlerCall.ok, "job info should be in handler context")
+		require.Equal(t, call.info.ID, handlerCall.info.ID)
+		require.Equal(t, call.info.CreatedAt, handlerCall.info.CreatedAt)
+		require.Equal(t, uint16(i), handlerCall.info.RetryCount)
+		require.Equal(t, i == int(maxRetries), handlerCall.info.IsFinalAttempt())
 	}
 
 	select {
@@ -349,4 +395,94 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 		t.Fatal("dead letter hook called more than once")
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestDLQHookFailure checks that when the dead letter hook fails, times out or panics,
+// both its writes and the move to the dead letter queue are rolled back, and the job is retried.
+func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	jobType := "dlq_hook_failure_test"
+
+	for _, query := range []string{
+		"DROP TABLE IF EXISTS dlq_hook_failure_attempts",
+		"CREATE TABLE dlq_hook_failure_attempts (attempt INTEGER NOT NULL)",
+	} {
+		_, err := tc.DB.ExecContext(ctx, query)
+		require.NoError(t, err)
+	}
+
+	var handlerCalls atomic.Int32
+	var hookCalls atomic.Int32
+	var jobID atomic.Int64
+
+	err := tc.Q.Consume(ctx, jobType, func(_ context.Context, _ *sql.Tx, _ []byte) error {
+		handlerCalls.Add(1)
+		return errors.New("always fails")
+	},
+		sqlq.WithConsumerMaxRetries(0),
+		sqlq.WithConsumerJobTimeout(200*time.Millisecond),
+		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo, _ []byte, _ error) error {
+			attempt := hookCalls.Add(1)
+			jobID.Store(info.ID)
+
+			// Every call writes, but only the write of the call that succeeds should be committed.
+			insert := fmt.Sprintf("INSERT INTO dlq_hook_failure_attempts (attempt) VALUES (%d)", attempt)
+			if _, err := tx.ExecContext(ctx, insert); err != nil {
+				return err
+			}
+
+			switch attempt {
+			case 1:
+				return errors.New("hook failed")
+			case 2:
+				panic("hook panicked")
+			case 3:
+				<-ctx.Done() // Canceled after the job timeout
+				return ctx.Err()
+			default:
+				return nil
+			}
+		}),
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: "dlq_hook_failure"}))
+
+	var dlqJob sqlq.DeadLetterJob
+	require.Eventually(t, func() bool {
+		dlqJobs, getErr := tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
+		if getErr != nil {
+			return false
+		}
+		i := slices.IndexFunc(dlqJobs, func(j sqlq.DeadLetterJob) bool { return j.OriginalID == jobID.Load() })
+		if i < 0 {
+			return false
+		}
+		dlqJob = dlqJobs[i]
+		return true
+	}, 5*time.Second, 10*time.Millisecond, "job should eventually be in the dead letter queue")
+
+	require.Equal(t, int32(4), hookCalls.Load())
+	require.Equal(t, int32(4), handlerCalls.Load(), "the handler should run again after each failed hook")
+	require.Equal(t, uint16(3), dlqJob.RetryCount, "each failed hook should count as a failed attempt")
+
+	rows, err := tc.DB.QueryContext(ctx, "SELECT attempt FROM dlq_hook_failure_attempts")
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+
+	var attempts []int
+	for rows.Next() {
+		var attempt int
+		require.NoError(t, rows.Scan(&attempt))
+		attempts = append(attempts, attempt)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int{4}, attempts, "writes of failed hook calls should have been rolled back")
+
+	time.Sleep(200 * time.Millisecond)
+	require.Equal(t, int32(4), hookCalls.Load(), "dead letter hook should not be called after it succeeded")
 }

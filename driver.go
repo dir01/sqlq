@@ -43,8 +43,10 @@ type driver interface {
 	// Rescheduled jobs can be returned to consumers again
 	markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
 
-	// moveToDeadLetterQueue moves a job to the dead letter queue
-	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error
+	// moveToDeadLetterQueue moves a job to the dead letter queue.
+	// If inTx is not nil, it is called in the same transaction after the move,
+	// and an error from it rolls the move back and is returned.
+	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error
 
 	// getDeadLetterJobs retrieves jobs from the dead letter queue
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)

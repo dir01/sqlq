@@ -106,6 +106,33 @@ func TestPostgreSQL(t *testing.T) {
 		tc.TestDLQGet(ctx, t)
 	})
 
+	t.Run("Dead letter hook and job info", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestDLQHook")
+		defer span.End()
+
+		tc.TestDLQHook(ctx, t)
+	})
+
+	t.Run("Failed dead letter hook rolls back and retries", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestDLQHookFailure")
+		defer span.End()
+
+		tc.TestDLQHookFailure(ctx, t)
+	})
+
+	t.Run("Handler panic is recovered", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestPanic")
+		defer span.End()
+
+		tc.TestPanic(ctx, t)
+	})
+
 	t.Run("Fetching Dead Letter Queue jobs respects limits", func(t *testing.T) {
 		t.Parallel()
 
@@ -196,7 +223,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 
 	q.Run()
 
-	return &TestCase{Q: q}, tracer, func() {
+	return &TestCase{Q: q, DB: db}, tracer, func() {
 		require.NoError(t, db.Close())
 		require.NoError(t, container.Terminate(tracerCtx))
 		require.NoError(t, stopTracer())

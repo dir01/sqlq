@@ -265,7 +265,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 				FOR UPDATE SKIP LOCKED
 				LIMIT $2 -- Correct parameter index
 			)
-			RETURNING id, payload, retry_count, trace_context
+			RETURNING id, payload, retry_count, trace_context, created_at
 		`, jobType, prefetchCount)
 
 		if err != nil {
@@ -280,7 +280,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			var traceContextJSON sql.NullString
 			j.JobType = jobType // Set job type as it's not returned by RETURNING
 
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &j.CreatedAt); err != nil {
 				// Log or record error, but potentially continue scanning other rows
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
 				continue
@@ -394,7 +394,7 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in PostgreSQL, using the original job ID as the primary key.
-func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.original_job_id", jobID), // Use original_job_id in attribute
@@ -453,6 +453,13 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 	}
 
 	// No need to delete from job_consumers explicitly due to CASCADE
+
+	if inTx != nil {
+		if err = inTx(tx); err != nil {
+			span.RecordError(err)
+			return err // Rollback will happen
+		}
+	}
 
 	err = tx.Commit()
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -40,7 +41,7 @@ type consumer struct {
 	cleanupBatch             uint16         // Number of jobs to delete per cleanup batch
 	asyncPushEnabled         bool           // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
 	asyncPushMaxRPM          uint16         // How many times per minute will async push be delivered at most
-	onDeadLetter             DeadLetterHook // Called after a job has been moved to the dead letter queue
+	onDeadLetter             DeadLetterHook // Called in the transaction that moves a job to the dead letter queue
 
 }
 
@@ -189,6 +190,8 @@ func (cons *consumer) processJob(j *job) {
 
 	defer span.End()
 
+	info := cons.jobInfo(j)
+
 	tx, err := cons.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
 	if err != nil {
 		span.RecordError(err)
@@ -198,6 +201,46 @@ func (cons *consumer) processJob(j *job) {
 		return
 	}
 
+	// attemptJob finishes the handler's transaction before returning, so whatever the handler
+	// locked is released before the job is retried or dead-lettered (and the dead-letter hook runs).
+	handlerErr := cons.attemptJob(ctx, span, j, info, tx)
+	if handlerErr == nil {
+		return
+	}
+
+	// --- Handler failed or timed out ---
+
+	span.SetAttributes(attribute.String("sqlq.handler_error", handlerErr.Error()))
+	span.SetStatus(codes.Error, "handler failed or timed out")
+
+	if !info.IsFinalAttempt() {
+		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
+			span.RecordError(err)
+		}
+
+		return
+	}
+
+	// Max retries exceeded or retries disabled, move to Dead Letter Queue
+	if err = cons.moveJobToDLQ(ctx, j, info, handlerErr); err != nil {
+		// Reschedule the job rather than leave it consumed and never processed.
+		// Its handler runs again, and if it fails again, moving it is attempted again.
+		span.RecordError(err)
+		log.Printf("sqlq: failed to move job %d of type %s to the dead letter queue, rescheduling it: %v", j.ID, cons.jobType, err)
+
+		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
+			span.RecordError(err)
+		}
+
+		return
+	}
+
+	span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
+}
+
+// attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
+// and finishes tx before returning. It returns the handler's error.
+func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, info JobInfo, tx *sql.Tx) error {
 	defer func() {
 		if err := tx.Commit(); err == nil {
 			// Happy path: Commit succeeded, we're done.
@@ -214,45 +257,22 @@ func (cons *consumer) processJob(j *job) {
 		}
 	}()
 
-	handlerErr := cons.handleJob(ctx, j, tx)
+	handlerErr := cons.handleJob(ctx, j, info, tx)
 
 	if handlerErr == nil {
 		// Happy path: Handler succeeded, mark done
 		if markErr := cons.markJobDone(ctx, j, tx); markErr != nil {
 			span.RecordError(fmt.Errorf("failed to mark job %d processed: %w", j.ID, markErr))
 			span.SetStatus(codes.Error, "failed to mark job processed")
-
-			return
 		}
-
-		return
 	}
 
-	// --- Handler failed or timed out ---
-
-	span.SetAttributes(attribute.String("sqlq.handler_error", handlerErr.Error()))
-	span.SetStatus(codes.Error, "handler failed or timed out")
-
-	shouldRetry := cons.maxRetries == infiniteRetries || int32(j.RetryCount) < cons.maxRetries
-
-	if shouldRetry {
-		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
-			span.RecordError(err)
-		}
-
-		return
-	}
-
-	// Max retries exceeded or retries disabled, move to Dead Letter Queue
-	if err = cons.moveJobToDLQ(ctx, j, handlerErr.Error()); err == nil {
-		span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
-		cons.runDeadLetterHook(ctx, j, handlerErr)
-	}
+	return handlerErr
 }
 
-func (cons *consumer) handleJob(ctx context.Context, j *job, tx *sql.Tx) error {
+func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *sql.Tx) error {
 	ctx, handlerSpan := cons.tracer.Start(ctx, "sqlq.handle")
-	ctx = contextWithJobInfo(ctx, cons.jobInfo(j))
+	ctx = contextWithJobInfo(ctx, info)
 
 	defer handlerSpan.End()
 
@@ -264,7 +284,9 @@ func (cons *consumer) handleJob(ctx context.Context, j *job, tx *sql.Tx) error {
 		defer cancel()
 	}
 
-	handlerErr := cons.handler(ctx, tx, j.Payload)
+	handlerErr := callRecovering("handler", func() error {
+		return cons.handler(ctx, tx, j.Payload)
+	})
 
 	if handlerErr == nil && ctx.Err() != nil {
 		handlerErr = ctx.Err()
@@ -321,11 +343,24 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 	return nil
 }
 
-func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, errorMsg string) error {
+// moveJobToDLQ moves the job to the dead letter queue. The dead-letter hook, if any, runs in the
+// same transaction, so the move and the hook's writes are either both committed or both rolled back.
+func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, info JobInfo, handlerErr error) error {
 	ctx, span := cons.tracer.Start(ctx, "sqlq.move_to_dlq")
 	defer span.End()
 
-	if err := cons.driver.moveToDeadLetterQueue(ctx, j.ID, errorMsg); err != nil {
+	var inTx func(tx *sql.Tx) error
+	if cons.onDeadLetter != nil {
+		inTx = func(tx *sql.Tx) error {
+			if err := cons.runDeadLetterHook(ctx, tx, info, j.Payload, handlerErr); err != nil {
+				return fmt.Errorf("dead letter hook failed: %w", err)
+			}
+
+			return nil
+		}
+	}
+
+	if err := cons.driver.moveToDeadLetterQueue(ctx, j.ID, handlerErr.Error(), inTx); err != nil {
 		span.RecordError(fmt.Errorf("failed to move job %d to DLQ: %w", j.ID, err))
 		span.SetStatus(codes.Error, "failed to move job to DLQ")
 
@@ -337,24 +372,47 @@ func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, errorMsg string)
 	return nil
 }
 
-// runDeadLetterHook invokes the consumer's dead-letter hook, if any.
-// A panic in the hook is recovered and recorded so it cannot take down the worker.
-func (cons *consumer) runDeadLetterHook(ctx context.Context, j *job, handlerErr error) {
-	if cons.onDeadLetter == nil {
-		return
-	}
-
+// runDeadLetterHook runs the consumer's dead-letter hook in tx.
+// The hook's context is canceled at shutdown and after the job timeout, and a panic is returned
+// as an error, so a misbehaving hook can neither pin the worker forever nor take it down.
+func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info JobInfo, payload []byte, handlerErr error) error {
 	ctx, span := cons.tracer.Start(ctx, "sqlq.on_dead_letter")
 	defer span.End()
 
+	ctx, cancel := context.WithCancel(contextWithJobInfo(ctx, info))
+	defer cancel()
+
+	stopCancelOnShutdown := context.AfterFunc(cons.ctx, cancel)
+	defer stopCancelOnShutdown()
+
+	if cons.jobTimeout > 0 {
+		var cancelTimeout context.CancelFunc
+		ctx, cancelTimeout = context.WithTimeout(ctx, cons.jobTimeout)
+
+		defer cancelTimeout()
+	}
+
+	err := callRecovering("dead letter hook", func() error {
+		return cons.onDeadLetter(ctx, tx, info, payload, handlerErr)
+	})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "dead letter hook failed")
+	}
+
+	return err
+}
+
+// callRecovering calls f and turns a panic in it into an error,
+// so a panicking callback fails the same way as one that returned an error.
+func callRecovering(callback string, f func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			span.RecordError(fmt.Errorf("panic in dead letter hook: %v", r))
-			span.SetStatus(codes.Error, "dead letter hook panicked")
+			err = fmt.Errorf("panic recovered in %s: %v\nStack trace:\n%s", callback, r, debug.Stack())
 		}
 	}()
 
-	cons.onDeadLetter(contextWithJobInfo(ctx, cons.jobInfo(j)), cons.jobInfo(j), j.Payload, handlerErr)
+	return f()
 }
 
 // runProcessedCleanupLoop periodically cleans up old processed jobs for this consumer.

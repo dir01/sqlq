@@ -312,7 +312,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	d.dbMutex.Lock()
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, payload, retry_count, trace_context
+			SELECT id, payload, retry_count, trace_context, created_at
 			FROM jobs
 			WHERE job_type = ?
 			AND scheduled_at <= ?
@@ -332,10 +332,12 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
+			var createdAtMs int64
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs); err != nil {
 				return fmt.Errorf("failed to scan potential job: %w", err) // Return error to rollback
 			}
+			j.CreatedAt = time.UnixMilli(createdAtMs)
 
 			// Deserialize trace context
 			j.TraceContext = make(map[string]string)
@@ -519,7 +521,8 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
-func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+// inTx runs while dbMutex is held, so it must not call driver methods that take it.
+func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.original_job_id", jobID), // Use original_job_id in attribute
@@ -583,6 +586,13 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	}
 
 	// No need to delete from job_consumers
+
+	if inTx != nil {
+		if err = inTx(tx); err != nil {
+			span.RecordError(err)
+			return err // Rollback will happen
+		}
+	}
 
 	err = tx.Commit()
 	if err != nil {

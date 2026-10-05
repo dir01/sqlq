@@ -2,6 +2,7 @@ package sqlq
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
@@ -133,13 +134,21 @@ func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	}
 }
 
-// DeadLetterHook is called after a job has exhausted its retries and been moved to the dead letter queue.
-// handlerErr is the error returned by the final attempt.
-// The hook runs once, best effort: if the process dies between the move and the hook, the hook is not re-run.
-type DeadLetterHook func(ctx context.Context, info JobInfo, payload []byte, handlerErr error)
+// DeadLetterHook is called when a job has exhausted its retries, inside the transaction that moves
+// the job to the dead letter queue. handlerErr is the error returned by the final attempt.
+//
+// The move and the hook's writes through tx are committed together, and only if the hook returns nil.
+// If the hook returns an error or panics, the move is rolled back and the job is rescheduled
+// like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
+//
+// ctx is canceled at shutdown and after the consumer's job timeout.
+//
+// On SQLite the queue's write lock is held while the hook runs, so the hook must write only through tx
+// and must not call queue methods such as Publish: they would wait for that lock forever.
+type DeadLetterHook func(ctx context.Context, tx *sql.Tx, info JobInfo, payload []byte, handlerErr error) error
 
-// WithConsumerOnDeadLetter registers a hook that is called after a job of this type
-// is moved to the dead letter queue. Use it to put domain state into a terminal "failed" state.
+// WithConsumerOnDeadLetter registers a hook that is called when a job of this type is moved
+// to the dead letter queue. Use it to put domain state into a terminal "failed" state through tx.
 func WithConsumerOnDeadLetter(hook DeadLetterHook) ConsumerOption {
 	return func(o *consumer) {
 		o.onDeadLetter = hook

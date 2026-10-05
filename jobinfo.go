@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// JobInfo describes the job currently being handled. It is available to handlers
-// via JobInfoFromContext and is passed to dead-letter hooks.
+// JobInfo describes the job currently being handled. It is available to handlers and
+// dead-letter hooks via JobInfoFromContext, and is also passed to dead-letter hooks directly.
 type JobInfo struct {
-	JobType    string
 	CreatedAt  time.Time
+	JobType    string
 	ID         int64
 	MaxRetries int32 // -1 means unlimited
 	RetryCount uint16
@@ -24,9 +24,9 @@ func (ji JobInfo) IsFinalAttempt() bool {
 type jobInfoCtxKey struct{}
 
 // JobInfoFromContext returns information about the job being handled.
-// ok is false if ctx does not belong to a job handler invocation.
-func JobInfoFromContext(ctx context.Context) (info JobInfo, ok bool) {
-	info, ok = ctx.Value(jobInfoCtxKey{}).(JobInfo)
+// ok is false if ctx does not belong to a job handler or dead-letter hook invocation.
+func JobInfoFromContext(ctx context.Context) (JobInfo, bool) {
+	info, ok := ctx.Value(jobInfoCtxKey{}).(JobInfo)
 	return info, ok
 }
 
