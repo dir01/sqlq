@@ -47,7 +47,7 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 			last_error TEXT,
 			trace_context JSONB, -- Added for trace propagation (using JSONB for efficiency)
 			consumed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was claimed by a consumer
-			processed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was successfully processed
+			processed_at TIMESTAMP WITH TIME ZONE NULL -- Indicates when the job was successfully processed
 		)`,
 		// Removed job_consumers table definition
 

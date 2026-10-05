@@ -117,7 +117,7 @@ func WithConsumerCleanupDLQAge(age time.Duration) ConsumerOption {
 }
 
 // WithAsyncPush enables async push in supported drivers.
-// By deafult, consumer only recieves new jobs via periodic polling.
+// By default, consumer only receives new jobs via periodic polling.
 // If enabled (and chosen driver supports it), hints to perform a poll will arrive
 // right as they happen. You may also rate limit this process with WithAsyncPushRateLimit.
 func WithAsyncPush() ConsumerOption {

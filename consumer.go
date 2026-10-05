@@ -22,6 +22,7 @@ type consumer struct {
 	db                       *sql.DB
 	driver                   driver
 	handler                  func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
+	onDeadLetter             DeadLetterHook                      // Called in the transaction that moves a job to the dead letter queue
 	ctx                      context.Context                     // context that was passed to .Consume, but with cancelation
 	cancel                   context.CancelFunc                  // cancel() cancels ctx, TODO: consider alternatives, see https://go.dev/blog/context-and-structs
 	backoffFunc              func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with. Defaults to exponential back off with jitter
@@ -41,7 +42,6 @@ type consumer struct {
 	cleanupBatch             uint16         // Number of jobs to delete per cleanup batch
 	asyncPushEnabled         bool           // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
 	asyncPushMaxRPM          uint16         // How many times per minute will async push be delivered at most
-	onDeadLetter             DeadLetterHook // Called in the transaction that moves a job to the dead letter queue
 
 }
 
@@ -179,7 +179,7 @@ func (cons *consumer) processJob(j *job) {
 
 	ctx, span := cons.tracer.Start(parentCtx, "sqlq.consume",
 		// this is what ties our span to a publisher span
-		trace.WithLinks(trace.Link{SpanContext: trace.SpanContextFromContext(parentCtx)}),
+		trace.WithLinks(trace.Link{SpanContext: trace.SpanContextFromContext(parentCtx), Attributes: nil}),
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", cons.jobType),
 			attribute.Int64("sqlq.job_id", j.ID),
@@ -305,7 +305,7 @@ func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *s
 	return handlerErr
 }
 
-func (cons *consumer) markJobDone(ctx context.Context, j *job, tx *sql.Tx) error {
+func (cons *consumer) markJobDone(ctx context.Context, j *job, _ *sql.Tx) error {
 	ctx, span := cons.tracer.Start(ctx, "sqlq.mark_processed")
 
 	defer span.End()

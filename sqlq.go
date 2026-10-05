@@ -87,12 +87,12 @@ var (
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
 	db                 *sql.DB
-	dbType             DBType
 	driver             driver
 	defaultBackoffFunc func(retryNum uint16) time.Duration
 	tracer             trace.Tracer
 	consumersMap       map[string]*consumer // jobType -> consumer
-	consumersMapMutex  sync.RWMutex         // guard consumersMap //nolint:revive // Field name is descriptive
+	dbType             DBType
+	consumersMapMutex  sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
 
 	// Function for calculating how much of a delay to use when rescheduling a failed job.
 	// This is a default that will be used for all consumers
@@ -311,6 +311,7 @@ func (q *sqlq) Consume(
 		cleanupDLQAge:            q.defaultCleanupDLQAge,
 		asyncPushEnabled:         false,
 		asyncPushMaxRPM:          0,
+		onDeadLetter:             nil,
 		// Initialize consumer-specific fields
 		jobsChan: nil, // Will be initialized below
 		workerWg: sync.WaitGroup{},

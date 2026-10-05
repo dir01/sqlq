@@ -18,16 +18,16 @@ func TestExponentialBackoff(t *testing.T) {
 		{
 			name:     "retry 0",
 			retryNum: 0,
-			minExp:   time.Duration(math.Pow(2, 0)) * time.Second, // 1s
+			minExp:   time.Second, // 2^0 = 1s
 			// Adjust maxExp slightly for the zero case to make the range check work.
 			// We expect exactly 1s, so the range should be [1s, 1s + epsilon).
-			maxExp: time.Duration(math.Pow(2, 0))*time.Second + time.Nanosecond,
+			maxExp: time.Second + time.Nanosecond,
 		},
 		{
 			name:     "retry 1",
 			retryNum: 1,
-			minExp:   time.Duration(math.Pow(2, 1)) * time.Second,   // 2s
-			maxExp:   time.Duration(math.Pow(2, 1)+1) * time.Second, // 2s + 1s jitter = 3s
+			minExp:   2 * time.Second, // 2^1 = 2s
+			maxExp:   3 * time.Second, // 2s + 1s jitter = 3s
 		},
 		{
 			name:     "retry 5",
