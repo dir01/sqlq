@@ -17,9 +17,14 @@ func claimKey(j job) string {
 	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
 }
 
+// claimBudget is how much of a claim timeout a worker can rely on locally.
+// SQL stores millisecond durations. Allow for timestamp quantization too.
+func claimBudget(timeout time.Duration) time.Duration {
+	return timeout.Truncate(time.Millisecond) - time.Millisecond
+}
+
 func localClaimDeadline(timeout time.Duration) time.Time {
-	// SQL stores millisecond durations. Allow for timestamp quantization too.
-	return time.Now().Add(timeout.Truncate(time.Millisecond) - time.Millisecond)
+	return time.Now().Add(claimBudget(timeout))
 }
 
 func newClaimToken() (string, error) {

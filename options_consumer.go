@@ -13,9 +13,10 @@ type ConsumerOption func(*consumer)
 // be reclaimed. Default is 30 minutes. Buffer time counts toward this duration.
 // Expiry permits recovery but does not cancel a running handler. Configure a
 // duration that covers execution; claims are not renewed in the background.
+// Timeouts under 2ms leave no budget after rounding and are ignored.
 func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
 	return func(c *consumer) {
-		if timeout >= time.Millisecond {
+		if claimBudget(timeout) > 0 {
 			c.claimTimeout = timeout
 		}
 	}

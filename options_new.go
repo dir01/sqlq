@@ -134,7 +134,7 @@ func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 // Default is 30 minutes. See WithConsumerClaimTimeout for expiry semantics.
 func WithDefaultClaimTimeout(timeout time.Duration) NewOption {
 	return func(q *sqlq) {
-		if timeout >= time.Millisecond {
+		if claimBudget(timeout) > 0 {
 			q.defaultClaimTimeout = timeout
 		}
 	}

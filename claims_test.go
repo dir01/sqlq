@@ -185,13 +185,8 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		}
 		close(start)
 		wg.Wait()
-		// SQLite can reject a deferred read-to-write upgrade with SQLITE_BUSY.
-		// That attempt must roll back rather than return an unowned job.
 		for range 2 {
-			err := <-errors
-			if dbType == DBTypePostgres {
-				require.NoError(t, err)
-			}
+			require.NoError(t, <-errors)
 		}
 		require.Equal(t, 1, <-results+<-results)
 	})
@@ -389,6 +384,25 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.Len(t, jobs, 3)
 	})
 
+	if dbType == DBTypeSQLite {
+		t.Run("legacy migration finishes DLQ moves instead of recovering them", func(t *testing.T) {
+			jobs := seed(2)
+			// Versions without claims inserted into the DLQ but deleted id 0 instead of the job.
+			_, err := db.ExecContext(ctx, `INSERT INTO dead_letter_queue
+				(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
+				VALUES (?, 'claims', '{}', 0, 0, 3, 'failed')`, jobs[0].ID)
+			require.NoError(t, err)
+			require.NoError(t, execSQL(ctx, db, `DROP INDEX idx_jobs_available_claims`))
+			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_token`))
+			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_expires_at`))
+			require.NoError(t, d.initSchema(ctx))
+			recovered, err := other.getJobsForConsumer(ctx, "claims", 2, time.Minute)
+			require.NoError(t, err)
+			require.Len(t, recovered, 1)
+			require.Equal(t, jobs[1].ID, recovered[0].ID)
+		})
+	}
+
 	t.Run("legacy schema migration recovers abandoned but not processed jobs", func(t *testing.T) {
 		seed(2)
 		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET processed_at = consumed_at WHERE id = (SELECT MIN(id) FROM jobs)`))
@@ -401,6 +415,24 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 	})
+}
+
+func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
+	t.Parallel()
+	for timeout, accepted := range map[time.Duration]bool{
+		time.Millisecond: false, 1999 * time.Microsecond: false, 2 * time.Millisecond: true,
+	} {
+		cons := &consumer{claimTimeout: defaultClaimTimeout} //nolint:exhaustruct
+		WithConsumerClaimTimeout(timeout)(cons)
+		q := &sqlq{defaultClaimTimeout: defaultClaimTimeout} //nolint:exhaustruct
+		WithDefaultClaimTimeout(timeout)(q)
+		want := defaultClaimTimeout
+		if accepted {
+			want = timeout
+		}
+		require.Equal(t, want, cons.claimTimeout, timeout)
+		require.Equal(t, want, q.defaultClaimTimeout, timeout)
+	}
 }
 
 func execSQL(ctx context.Context, db *sql.DB, query string) error {
