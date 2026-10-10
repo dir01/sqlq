@@ -43,7 +43,8 @@ func WithConsumerCleanupBatch(batchSize uint16) ConsumerOption {
 	}
 }
 
-// WithConsumerPrefetchCount sets the number of jobs to prefetch in a single query for a given consumer
+// WithConsumerPrefetchCount sets the number of jobs to prefetch in a single query for a given consumer.
+// By default it equals the consumer's concurrency. A value below concurrency is raised to it.
 // You may also configure default value for all consumers, see WithDefaultPrefetchCount.
 func WithConsumerPrefetchCount(prefetchCount uint16) ConsumerOption {
 	return func(o *consumer) {

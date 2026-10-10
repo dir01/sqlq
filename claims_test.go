@@ -431,7 +431,6 @@ func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
 
 func TestConsumeClaimTimeout(t *testing.T) {
 	t.Parallel()
-	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
 	for _, scenario := range []struct {
 		name      string
 		err       error
@@ -457,24 +456,58 @@ func TestConsumeClaimTimeout(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Parallel()
-			db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "consume.db")+"?_busy_timeout=5000&_journal_mode=WAL")
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, db.Close()) })
-			queue, err := New(db, DBTypeSQLite, scenario.queueOpts...)
-			require.NoError(t, err)
-			q, ok := queue.(*sqlq)
-			require.True(t, ok)
-			q.Run()
-			err = q.Consume(t.Context(), "claims", handler, scenario.consOpts...)
+			cons, err := consumeOnTestQueue(t, scenario.queueOpts, scenario.consOpts)
 			if scenario.err != nil {
 				require.ErrorIs(t, err, scenario.err)
 				return
 			}
 			require.NoError(t, err)
-			t.Cleanup(q.Shutdown)
-			require.Equal(t, scenario.want, q.consumersMap["claims"].claimTimeout)
+			require.Equal(t, scenario.want, cons.claimTimeout)
 		})
 	}
+}
+
+func TestConsumePrefetchCount(t *testing.T) {
+	t.Parallel()
+	for _, scenario := range []struct {
+		name      string
+		queueOpts []NewOption
+		consOpts  []ConsumerOption
+		want      uint16
+	}{
+		{"follows consumer concurrency", nil, []ConsumerOption{WithConsumerConcurrency(32)}, 32},
+		{"follows queue concurrency", []NewOption{WithDefaultConcurrency(16)}, nil, 16},
+		{"explicit higher value is kept", nil, []ConsumerOption{WithConsumerConcurrency(4), WithConsumerPrefetchCount(64)}, 64},
+		{"explicit lower value is raised", nil, []ConsumerOption{WithConsumerConcurrency(8), WithConsumerPrefetchCount(2)}, 8},
+		{"queue default lower than concurrency is raised", []NewOption{WithDefaultPrefetchCount(2)}, []ConsumerOption{WithConsumerConcurrency(8)}, 8},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			cons, err := consumeOnTestQueue(t, scenario.queueOpts, scenario.consOpts)
+			require.NoError(t, err)
+			require.Equal(t, scenario.want, cons.prefetchCount)
+			require.Equal(t, int(scenario.want), cap(cons.jobsChan))
+		})
+	}
+}
+
+// consumeOnTestQueue starts a consumer on a new SQLite queue and returns it.
+func consumeOnTestQueue(t *testing.T, queueOpts []NewOption, consOpts []ConsumerOption) (*consumer, error) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "consume.db")+"?_busy_timeout=5000&_journal_mode=WAL")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	queue, err := New(db, DBTypeSQLite, queueOpts...)
+	require.NoError(t, err)
+	q, ok := queue.(*sqlq)
+	require.True(t, ok)
+	q.Run()
+	t.Cleanup(q.Shutdown)
+	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
+	if err = q.Consume(t.Context(), "claims", handler, consOpts...); err != nil {
+		return nil, err
+	}
+	return q.consumersMap["claims"], nil
 }
 
 func execSQL(ctx context.Context, db *sql.DB, query string) error {

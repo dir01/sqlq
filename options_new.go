@@ -98,6 +98,7 @@ func WithDefaultCleanupBatch(batchSize uint16) NewOption {
 }
 
 // WithDefaultPrefetchCount sets default number of jobs to prefetch in a single query for a new consumer.
+// By default it equals the concurrency of each consumer, and it is never lower than that.
 // This value may be overridden per individual consumer, see WithConsumerPrefetchCount.
 func WithDefaultPrefetchCount(prefetchCount uint16) NewOption {
 	return func(o *sqlq) {

@@ -284,7 +284,7 @@ the library defaults are:
 | --- | --- | --- | --- |
 | Poll interval | 100 ms | `WithDefaultPollInterval` | `WithConsumerPollInteval` |
 | Concurrency | min(NumCPU, GOMAXPROCS) | `WithDefaultConcurrency` | `WithConsumerConcurrency` |
-| Prefetch | Initial default concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
+| Prefetch | Consumer's concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
 | Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
 | Claim timeout | 2 × job timeout (30 minutes) | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |

@@ -85,7 +85,6 @@ var (
 	defaultMaxRetries               int32  = 3
 	infiniteRetries                 int32  = -1
 	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
-	defaultPrefetchCount                   = defaultConcurrency
 	defaultJobTimeout                      = 15 * time.Minute
 	defaultCleanupProcessedInterval        = 1 * time.Hour
 	defaultCleanupProcessedAge             = 7 * 24 * time.Hour
@@ -122,7 +121,8 @@ type sqlq struct {
 	// Individual consumers may override this using WithConsumerConcurrency.
 	defaultConcurrency uint16
 
-	// Default number of jobs to fetch in advance per consumer. Default matches defaultConcurrency.
+	// Default number of jobs to fetch in advance per consumer.
+	// Zero means the concurrency of each consumer. See WithDefaultPrefetchCount.
 	// Individual consumers may override this using WithConsumerPrefetchCount.
 	defaultPrefetchCount uint16
 
@@ -191,7 +191,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		consumersMapMutex:               sync.RWMutex{},
 		defaultPollInterval:             100 * time.Millisecond,
 		defaultConcurrency:              defaultConcurrency,
-		defaultPrefetchCount:            defaultPrefetchCount,
+		defaultPrefetchCount:            0,
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
 		defaultClaimTimeout:             0,
@@ -325,6 +325,8 @@ func (q *sqlq) Consume(
 	}
 
 	// Options sanity checks and adjustments
+	// Prefetch follows concurrency unless set. A smaller explicit value is raised:
+	// it would only leave workers idle between polls.
 	if cons.prefetchCount < cons.concurrency {
 		cons.prefetchCount = cons.concurrency
 	}
