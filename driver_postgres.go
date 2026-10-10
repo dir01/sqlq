@@ -50,6 +50,9 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 			processed_at TIMESTAMP WITH TIME ZONE NULL -- Indicates when the job was successfully processed
 		)`,
 		// Removed job_consumers table definition
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claim_token TEXT NULL`,
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMP WITH TIME ZONE NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`,
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
@@ -246,8 +249,9 @@ func (d *PostgresDriver) insertJob(
 }
 
 // getJobsForConsumer selects and locks available jobs for a given consumer and job type from PostgreSQL.
-// It uses an advisory lock-like mechanism by updating `consumed_at`.
-func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16) ([]job, error) {
+// It also takes jobs whose claim expired. Only one consumer gets each job,
+// and jobs that are done are never returned.
+func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
@@ -256,22 +260,26 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 	defer span.End()
 
 	var jobsToReturn []job
+	deadline := localClaimDeadline(claimTimeout)
+	claimToken := newClaimToken()
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			UPDATE jobs
-			SET consumed_at = NOW()
+			SET consumed_at = clock_timestamp(), claim_token = $3 || ':' || id::text,
+				claim_expires_at = clock_timestamp() + $4 * interval '1 millisecond'
 			WHERE id IN (
 				SELECT id
 				FROM jobs
 				WHERE job_type = $1 -- Correct parameter index
 				  AND scheduled_at <= NOW()
-				  AND consumed_at IS NULL
+				  AND processed_at IS NULL
+				  AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
 				ORDER BY scheduled_at, id
 				FOR UPDATE SKIP LOCKED
 				LIMIT $2 -- Correct parameter index
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at
-		`, jobType, prefetchCount)
+			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+		`, jobType, prefetchCount, claimToken, claimTimeout.Milliseconds())
 
 		if err != nil {
 			return fmt.Errorf("failed to update and select jobs: %w", err)
@@ -286,12 +294,13 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			var createdAt sql.NullTime // The schema allows NULL, and failing to scan would strand the claimed job
 			j.JobType = jobType        // Set job type as it's not returned by RETURNING
 
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt); err != nil {
-				// Log or record error, but potentially continue scanning other rows
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken); err != nil {
+				// Undo the whole batch. Otherwise this job would stay claimed but never reach a worker.
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
-				continue
+				return err
 			}
 			j.CreatedAt = createdAt.Time // Zero if created_at is NULL
+			j.ClaimExpiresAt = deadline
 
 			j.TraceContext = make(map[string]string)
 			if traceContextJSON.Valid && traceContextJSON.String != "" && traceContextJSON.String != "null" {
@@ -314,12 +323,26 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 	return jobsToReturn, nil
 }
 
+func (d *PostgresDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+	deadline := localClaimDeadline(timeout)
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = clock_timestamp() + $1 * interval '1 millisecond'
+		WHERE id = $2 AND claim_token = $3 AND processed_at IS NULL AND claim_expires_at > clock_timestamp()`,
+		timeout.Milliseconds(), j.ID, j.ClaimToken)
+	return deadline, checkClaimResult(result, err)
+}
+
+func (d *PostgresDriver) releaseClaim(ctx context.Context, j job) error {
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
+		WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	return checkClaimResult(result, err)
+}
+
 func (d *PostgresDriver) subscribeForConsumer(_ context.Context, _ string, _ *tokenBucket) (<-chan struct{}, error) {
 	return nil, nil
 }
 
 // markJobProcessed updates the jobs table to mark a job as successfully processed in PostgreSQL.
-func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error {
+func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -328,8 +351,8 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 	defer span.End()
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = NOW() WHERE id = $1 AND consumed_at IS NOT NULL AND processed_at IS NULL`,
-		jobID,
+		`UPDATE jobs SET processed_at = clock_timestamp() WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`,
+		jobID, claimToken,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -342,7 +365,7 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 		return err
 	}
 	if rowsAffected != 1 {
-		err := fmt.Errorf("job %d is no longer claimed or was already processed", jobID)
+		err := fmt.Errorf("job %d: %w", jobID, ErrClaimLost)
 		span.RecordError(err)
 		return err
 	}
@@ -352,7 +375,7 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 
 // MarkJobFailedAndReschedule updates a job's state to failed, increments the retry count,
 // and schedules it for a future retry attempt in PostgreSQL.
-func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error {
+func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID int64, claimToken string, errorMsg string, backoffDuration time.Duration) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_failed_and_reschedule", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -374,16 +397,19 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 	}()
 
 	// Update the job: increment retry, set error, schedule, clear consumption/processing state
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET
 			retry_count = retry_count + 1,
 			last_error = $1,
 			scheduled_at = NOW() + $2::interval,
 			consumed_at = NULL,
+			claim_token = NULL,
+			claim_expires_at = NULL,
 			processed_at = NULL
-		WHERE id = $3`,
-		errorMsg, backoffDuration.String(), jobID,
+		WHERE id = $3 AND claim_token = $4 AND processed_at IS NULL`,
+		errorMsg, backoffDuration.String(), jobID, claimToken,
 	)
+	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to update jobs table on reschedule: %w", err))
 		return err // Rollback will happen
@@ -399,7 +425,7 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in PostgreSQL, using the original job ID as the primary key.
-func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error {
+func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.original_job_id", jobID), // Use original_job_id in attribute
@@ -428,12 +454,12 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 	}
 	err = tx.QueryRowContext(ctx, `
 		SELECT job_type, payload, created_at, retry_count
-		FROM jobs WHERE id = $1
-	`, jobID).Scan(&j.JobType, &j.Payload, &j.CreatedAt, &j.RetryCount) // Use QueryRowContext
+		FROM jobs WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL FOR UPDATE
+	`, jobID, claimToken).Scan(&j.JobType, &j.Payload, &j.CreatedAt, &j.RetryCount)
 	if err != nil {
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrJobNotFound
+			return ErrClaimLost
 		}
 		return err
 	}
@@ -451,7 +477,8 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 	}
 
 	// Delete from jobs table (job_consumers is deleted via CASCADE)
-	_, err = tx.ExecContext(ctx, "DELETE FROM jobs WHERE id = $1", jobID) // Use ExecContext
+	res, err := tx.ExecContext(ctx, "DELETE FROM jobs WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL", jobID, claimToken)
+	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)
