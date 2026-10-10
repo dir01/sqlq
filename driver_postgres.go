@@ -325,6 +325,20 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 	return jobsToReturn, nil
 }
 
+func (d *PostgresDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+	deadline := localClaimDeadline(timeout)
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = clock_timestamp() + $1 * interval '1 millisecond'
+		WHERE id = $2 AND claim_token = $3 AND processed_at IS NULL AND claim_expires_at > clock_timestamp()`,
+		timeout.Milliseconds(), j.ID, j.ClaimToken)
+	return deadline, checkClaimResult(result, err)
+}
+
+func (d *PostgresDriver) releaseClaim(ctx context.Context, j job) error {
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
+		WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	return checkClaimResult(result, err)
+}
+
 func (d *PostgresDriver) subscribeForConsumer(_ context.Context, _ string, _ *tokenBucket) (<-chan struct{}, error) {
 	return nil, nil
 }

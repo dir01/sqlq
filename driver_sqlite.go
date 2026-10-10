@@ -21,6 +21,22 @@ import (
 
 const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 
+// sqliteNow is the current time in Unix milliseconds, computed by SQLite. It is
+// the documented recipe (https://www.sqlite.org/lang_datefunc.html#examples),
+// which unlike unixepoch('now','subsec') predates SQLite 3.42, scaled to
+// milliseconds. ROUND absorbs float error that CAST alone would truncate to the
+// previous millisecond.
+//
+// It is used instead of a time.Now() parameter because SQLite evaluates 'now'
+// when the statement runs, after any wait for dbMutex or the write lock, so an
+// expiry check never compares against a timestamp taken before that wait. 'now'
+// is also fixed for the whole statement, so the claim UPDATE sets consumed_at
+// and claim_expires_at and checks the old expiry against one instant.
+//
+// Local deadlines (localClaimDeadline) use the request start time instead, so
+// lock wait never adds to the local budget.
+const sqliteNow = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)"
+
 // SQLiteDriver implements the Driver interface for SQLite
 type SQLiteDriver struct {
 	db         *sql.DB
@@ -433,6 +449,24 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 
 	span.SetAttributes(attribute.Int("sqlq.jobs_fetched", len(jobsToReturn)))
 	return jobsToReturn, nil
+}
+
+func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+	deadline := localClaimDeadline(timeout)
+	d.dbMutex.Lock()
+	defer d.dbMutex.Unlock()
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL AND claim_expires_at > `+sqliteNow,
+		timeout.Milliseconds(), j.ID, j.ClaimToken)
+	return deadline, checkClaimResult(result, err)
+}
+
+func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
+	// Use the database's locking rather than dbMutex so the cleanup context can
+	// bound waiting even when another consumer is inside a dead-letter hook.
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	return checkClaimResult(result, err)
 }
 
 func (d *SQLiteDriver) subscribeForConsumer(_ context.Context, jobType string, tb *tokenBucket) (<-chan struct{}, error) {
