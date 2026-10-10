@@ -376,10 +376,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 
 	jobsToReturn := make([]job, 0, prefetchCount)
 	deadline := localClaimDeadline(claimTimeout)
-	claimToken, tokenErr := newClaimToken()
-	if tokenErr != nil {
-		return nil, tokenErr
-	}
+	claimToken := newClaimToken()
 
 	// Claim the jobs in one statement, so the transaction starts with a write. If it started
 	// with a SELECT, the UPDATE after it could fail at once with SQLITE_BUSY when another

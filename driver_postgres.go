@@ -261,10 +261,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 
 	var jobsToReturn []job
 	deadline := localClaimDeadline(claimTimeout)
-	claimToken, tokenErr := newClaimToken()
-	if tokenErr != nil {
-		return nil, tokenErr
-	}
+	claimToken := newClaimToken()
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			UPDATE jobs

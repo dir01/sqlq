@@ -3,7 +3,6 @@ package sqlq
 import (
 	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"time"
 )
@@ -24,29 +23,26 @@ func claimKey(j job) string {
 
 // claimBudget returns how long a worker can count on a claim, from the time it asked for it.
 // It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
-// It takes off 1ms more, because SQLite can store the claim start up to 1ms early.
-// The timeout options use it to ignore timeouts that leave no time.
+// It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
+// so the claim start it stores can be up to 1ms before the real time.
+// WithConsumerClaimTimeout and WithDefaultClaimTimeout ignore a timeout when this returns zero or less.
 func claimBudget(timeout time.Duration) time.Duration {
 	return timeout.Truncate(time.Millisecond) - time.Millisecond
 }
 
 // localClaimDeadline returns the last time a worker can start a job without asking the database.
-// The drivers call it before they send the request, so it is never later than the expiry
-// in the database. After this time, the worker drops the job. When the time left is below
-// the renewal threshold, the worker extends the claim first.
+// getJobsForConsumer and extendClaim in each driver call it before they send their UPDATE,
+// so it is never later than the expiry the database stores. processJob compares it with
+// the current time before it runs the handler (see WithConsumerClaimRenewalThreshold).
 func localClaimDeadline(timeout time.Duration) time.Time {
 	return time.Now().Add(claimBudget(timeout))
 }
 
-// newClaimToken returns a random 32-character hex string for one claim request.
+// newClaimToken returns a random string for one claim request (128 random bits, base32).
 // The drivers add ":<job ID>", so each job in a batch gets its own token.
 // It is random so that consumers in different processes never make the same token.
-func newClaimToken() (string, error) {
-	var bytes [16]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return "", fmt.Errorf("generate claim token: %w", err)
-	}
-	return hex.EncodeToString(bytes[:]), nil
+func newClaimToken() string {
+	return rand.Text()
 }
 
 // checkClaimResult checks a write that filters on the claim token and must change one row.

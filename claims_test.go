@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -56,9 +57,7 @@ func TestClaimsPostgres(t *testing.T) { //nolint:tparallel // Subtests share one
 	admin, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, admin.Close()) })
-	token, err := newClaimToken()
-	require.NoError(t, err)
-	schema := "claims_" + token
+	schema := "claims_" + strings.ToLower(newClaimToken())
 	require.NoError(t, execSQL(t.Context(), admin, `CREATE SCHEMA `+schema))
 	t.Cleanup(func() { require.NoError(t, execSQL(context.Background(), admin, `DROP SCHEMA `+schema+` CASCADE`)) })
 	db, err := openClaimTestDB(DBTypePostgres, dsn, schema)
