@@ -6,11 +6,11 @@ type, and let background workers fetch and process them.
 
 It supports delayed jobs, configurable worker concurrency, retries with backoff,
 handler timeouts, panic recovery, a dead-letter queue (DLQ), transactional
-dead-letter hooks, automatic cleanup, and OpenTelemetry tracing.
+dead-letter hooks, expiring claims with worker-loss recovery, automatic cleanup,
+and OpenTelemetry tracing.
 
-The current implementation has limitations around recovery of abandoned jobs.
-See [Current behavior and
-limitations](#current-behavior-and-limitations) before relying on those guarantees.
+See [Current behavior and limitations](#current-behavior-and-limitations) for
+claim ownership, transactional completion, and at-least-once execution semantics.
 
 ## Installation
 
@@ -140,9 +140,41 @@ q.Consume(ctx, "numbered_job", handler,
     sqlq.WithConsumerPrefetchCount(6))
 ```
 
-Concurrency caps active handler calls. Prefetch sets fetch size and buffer
-capacity, and is raised to at least concurrency; it is not a total cap on
-claimed jobs. [Full concurrency demo](demo/concurrency/README.md).
+Concurrency caps active handler calls. Prefetch sets the maximum fetch batch and
+buffer capacity, and is raised to at least concurrency. Total outstanding claims
+are bounded by concurrency plus prefetch, so the buffer can stay supplied while
+workers run without an additional batch waiting outside the channel.
+[Full concurrency demo](demo/concurrency/README.md).
+
+### Expiring claims and recovery
+
+```go
+q.Consume(ctx, "numbered_job", handler,
+    sqlq.WithConsumerClaimTimeout(30*time.Minute),
+    sqlq.WithConsumerClaimRenewalThreshold(0.5))
+```
+
+Claims start at fetch time, including time in the local buffer. Another consumer
+can recover unfinished jobs after their claims expire. Recovery does not increment
+the retry count: a prefetched job may never have started. Polling discovers expired
+claims even without a new publish notification.
+
+Before execution, a worker uses a conservative local deadline. Fresh claims need
+no additional database query. When less than half the claim duration remains, it
+conditionally extends the claim using its token. The threshold is configurable
+from zero (no extension) to one (always extend). Expired local copies are discarded;
+a failed ownership check prevents the handler from starting.
+
+Claims are not renewed in the background. Set the claim timeout to cover both
+buffering and execution. It is distinct from the job timeout: claim expiry does
+not cancel a running handler. Expiry permits reclamation; changing the token
+invalidates the previous attempt. Completion can still succeed after expiry if
+no other consumer has replaced the token. SQLite's write transaction prevents
+competing claim updates while its write protection is held.
+
+Shutdown cancels active handlers, waits for their transactions, and attempts to
+release all outstanding claims with a five-second cleanup budget. Expiry is the
+fallback after process loss or a failed release. Cancellation remains cooperative.
 
 ## 7. Stop work at its deadline
 
@@ -254,6 +286,8 @@ the library defaults are:
 | Prefetch | Initial default concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
 | Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
+| Claim timeout | 30 minutes | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |
+| Claim renewal threshold | 0.5 of claim time remaining | — | `WithConsumerClaimRenewalThreshold` |
 | Retry delay | Exponential backoff with jitter | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
 | Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
 | Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |
@@ -270,14 +304,16 @@ See `./sqlq_testutils_otel_test.go:17` for tracing setup used by the tests.
 ## Storage
 
 `Run` creates two tables and their indexes using SQL embedded in the drivers.
-It uses `CREATE TABLE IF NOT EXISTS`, not a versioned migration system.
+It also idempotently adds claim columns to existing `jobs` tables. Stop old-version
+consumers before upgrading: they do not enforce claim tokens. Legacy unprocessed
+jobs without claim metadata are recoverable; processed jobs remain excluded.
 
 | Table | Contents |
 | --- | --- |
-| `jobs` | `id`, `job_type`, JSON `payload`, `created_at`, `scheduled_at`, `retry_count`, `last_error`, `trace_context`, `consumed_at`, `processed_at`. |
+| `jobs` | `id`, `job_type`, JSON `payload`, `created_at`, `scheduled_at`, `retry_count`, `last_error`, `trace_context`, `consumed_at`, `claim_token`, `claim_expires_at`, `processed_at`. |
 | `dead_letter_queue` | `original_job_id` (primary key), `job_type`, `payload`, `created_at`, `failed_at`, `retry_count`, `failure_reason`. |
 
-A due job is claimed by setting `consumed_at`. Success sets `processed_at`;
+A due job is claimed by setting `consumed_at`, a token, and an expiry. Success sets `processed_at`;
 the row remains until cleanup. A retry increments the retry count, schedules
 another attempt, and clears the claim. A DLQ move inserts the failure and
 deletes the original job in a transaction. SQLite stores timestamps as Unix
@@ -293,18 +329,16 @@ These details describe the implementation in this checkout:
   for database writes, and let the queue commit or roll it back. Success commits
   those writes together with job completion. Handler errors, panics, timeouts,
   and completion-update failures roll back the attempt. Completion and commit
-  errors enter the retry/DLQ path. External side effects are outside this
+  errors enter the retry/DLQ path unless ownership has been lost. External side effects are outside this
   transaction and should be safe to repeat.
-- **Claims have no expiry or automatic recovery.** A crash or shutdown after
-  claiming can leave jobs with `consumed_at` set and no worker to finish them.
-  Shutdown does not drain or release every prefetched claim. Durable rows alone
-  do not provide an at-least-once guarantee across crashes. Make handler side
-  effects safe to repeat when retries or manual requeues do occur.
-  See `./consumer.go:136` and `./driver_postgres.go:250`.
-- **Cancellation is cooperative.** Ordinary handler contexts are not currently
-  children of the `Consume` context; their job timeout still applies. DLQ hooks
-  explicitly receive shutdown cancellation. A callback that ignores its context
-  can keep shutdown waiting. See `./consumer.go:174` and `./consumer.go:378`.
+- **Execution is at least once.** Expiring claims recover abandoned jobs, including
+  prefetched jobs. Completion, retry, release, and DLQ operations check ownership
+  tokens; a stale attempt cannot settle a newer one. An execution that overlaps
+  reclamation cannot commit its transaction-local writes if its completion token
+  check fails. External effects need idempotency: local deadline checks cannot
+  prevent a paused process from resuming after another worker has taken over.
+- **Cancellation is cooperative.** Handler and DLQ hook contexts inherit shutdown
+  cancellation. A callback that ignores its context can keep shutdown waiting.
 - **Schema setup errors are visible only in tracing.** `Run` records schema
   errors without returning them. See `./sqlq.go:197`.
 
@@ -312,6 +346,14 @@ These details describe the implementation in this checkout:
 
 CI builds, lints, and tests on the latest patch releases of Go 1.26 and 1.27.
 `make lint` uses the golangci-lint version recorded in `go.mod`.
+
+`TestClaimsPostgres` runs the recovery/ownership suite in an isolated PostgreSQL
+schema. It starts a Docker container by default, or can use an existing test server:
+
+```sh
+SQLQ_TEST_POSTGRES_DSN='postgres://user:password@localhost/testdb?sslmode=disable' \
+    go test -race -run '^TestClaimsPostgres$' .
+```
 
 The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
 suite starts a database through Testcontainers and requires Docker. Integration

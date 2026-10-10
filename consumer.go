@@ -28,36 +28,44 @@ type consumer struct {
 	backoffFunc              func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with. Defaults to exponential back off with jitter
 	tracer                   trace.Tracer
 	jobsChan                 chan job // Written to by a db poller coroutine, consumed by worker goroutines
+	claims                   map[string]job
 	jobType                  string
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
-	pollInterval             time.Duration  // How often should db poller run. You might want to set this value higher if you have push configured
-	jobTimeout               time.Duration  // After this amount a time job context will be canceled
-	cleanupProcessedInterval time.Duration  // How often this consumer cleans up processed jobs
-	cleanupProcessedAge      time.Duration  // Min age a processed job should be to be considered for cleanup
-	cleanupDLQInterval       time.Duration  // How often this consumer cleans up DLQ jobs
-	cleanupDLQAge            time.Duration  // Min age a DLQ job should be to be considered for cleanup
-	maxRetries               int32          // Total attempts is maxRetries+1. -1 means unlimited
-	prefetchCount            uint16         // LIMIT when fetching jobs from database into jobsChan
-	concurrency              uint16         // How many goroutines will read from jobsChan
-	cleanupBatch             uint16         // Number of jobs to delete per cleanup batch
-	asyncPushEnabled         bool           // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
-	asyncPushMaxRPM          uint16         // How many times per minute will async push be delivered at most
+	claimsMutex              sync.Mutex
+	claimTimeout             time.Duration
+	claimRenewalThreshold    float64
+	pollInterval             time.Duration // How often should db poller run. You might want to set this value higher if you have push configured
+	jobTimeout               time.Duration // After this amount a time job context will be canceled
+	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
+	cleanupProcessedAge      time.Duration // Min age a processed job should be to be considered for cleanup
+	cleanupDLQInterval       time.Duration // How often this consumer cleans up DLQ jobs
+	cleanupDLQAge            time.Duration // Min age a DLQ job should be to be considered for cleanup
+	maxRetries               int32         // Total attempts is maxRetries+1. -1 means unlimited
+	prefetchCount            uint16        // LIMIT when fetching jobs from database into jobsChan
+	concurrency              uint16        // How many goroutines will read from jobsChan
+	cleanupBatch             uint16        // Number of jobs to delete per cleanup batch
+	asyncPushEnabled         bool          // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
+	asyncPushMaxRPM          uint16        // How many times per minute will async push be delivered at most
 
 }
 
 // start launches the polling, worker, and cleanup goroutines for the consumer.
 func (cons *consumer) start() {
+	cons.workerWg.Add(1)
 	go cons.fetchJobsLoop()
 
 	for range cons.concurrency {
+		cons.workerWg.Add(1)
 		go cons.workerLoop()
 	}
 
 	if cons.cleanupProcessedInterval > 0 {
+		cons.workerWg.Add(1)
 		go cons.runProcessedCleanupLoop()
 	}
 
 	if cons.cleanupDLQInterval > 0 {
+		cons.workerWg.Add(1)
 		go cons.runDLQCleanupLoop()
 	}
 }
@@ -66,11 +74,20 @@ func (cons *consumer) start() {
 func (cons *consumer) shutdown() {
 	cons.cancel()
 	cons.workerWg.Wait()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cons.claimsMutex.Lock()
+	defer cons.claimsMutex.Unlock()
+	for key, j := range cons.claims {
+		if err := cons.driver.releaseClaim(ctx, j); err != nil && !errors.Is(err, ErrClaimLost) {
+			log.Printf("sqlq: failed to release claim for job %d: %v", j.ID, err)
+		}
+		delete(cons.claims, key)
+	}
 }
 
 // fetchJobsLoop periodically fetches jobs from the database and sends them to the jobs channel.
 func (cons *consumer) fetchJobsLoop() {
-	cons.workerWg.Add(1)
 	defer cons.workerWg.Done()
 
 	ticker := time.NewTicker(cons.pollInterval)
@@ -134,11 +151,24 @@ func (cons *consumer) fetchJobsLoop() {
 
 // fetchJobs fetches jobs for this consumer and sends them to the jobs channel.
 func (cons *consumer) fetchJobs(ctx context.Context) error {
-	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, cons.prefetchCount)
+	cons.claimsMutex.Lock()
+	// Keep the buffer supplied while workers are running, without acquiring an
+	// additional batch that would sit blocked outside the channel.
+	capacity := min(int(cons.prefetchCount), int(cons.prefetchCount)+int(cons.concurrency)-len(cons.claims))
+	cons.claimsMutex.Unlock()
+	if capacity <= 0 {
+		return nil
+	}
+	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, uint16(capacity), cons.claimTimeout)
 	if err != nil {
 		// Don't wrap error here, let the poller handle logging/backoff
 		return err
 	}
+	cons.claimsMutex.Lock()
+	for _, j := range jobs {
+		cons.claims[claimKey(j)] = j
+	}
+	cons.claimsMutex.Unlock()
 
 	for _, job := range jobs {
 		select {
@@ -154,7 +184,6 @@ func (cons *consumer) fetchJobs(ctx context.Context) error {
 
 // workerLoop processes jobs from the jobsChan.
 func (cons *consumer) workerLoop() {
-	cons.workerWg.Add(1)
 	defer cons.workerWg.Done()
 
 	for {
@@ -172,7 +201,44 @@ func (cons *consumer) workerLoop() {
 
 // processJob handles a single job fetched by the poller.
 func (cons *consumer) processJob(j *job) {
-	parentCtx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.MapCarrier(j.TraceContext))
+	settled := false
+	defer func() {
+		// Shutdown releases aborted and undelivered attempts after all workers stop.
+		if cons.ctx.Err() != nil {
+			return
+		}
+		if !settled {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := cons.driver.releaseClaim(ctx, *j); err != nil && !errors.Is(err, ErrClaimLost) {
+				log.Printf("sqlq: failed to release claim for job %d: %v", j.ID, err)
+			}
+		}
+		cons.claimsMutex.Lock()
+		delete(cons.claims, claimKey(*j))
+		cons.claimsMutex.Unlock()
+	}()
+	if cons.ctx.Err() != nil {
+		return
+	}
+	remaining := time.Until(j.ClaimExpiresAt)
+	if remaining <= 0 {
+		return
+	}
+	if remaining <= time.Duration(float64(cons.claimTimeout)*cons.claimRenewalThreshold) {
+		deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
+		if err != nil {
+			if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
+				log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)
+			}
+			return
+		}
+		j.ClaimExpiresAt = deadline
+		if time.Until(deadline) <= 0 || cons.ctx.Err() != nil {
+			return
+		}
+	}
+	parentCtx := otel.GetTextMapPropagator().Extract(cons.ctx, propagation.MapCarrier(j.TraceContext))
 	// For context propagation ^^^^^^^^^^^ to work, there should be something like
 	// `otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))`
 	// somewhere in setup code
@@ -203,6 +269,10 @@ func (cons *consumer) processJob(j *job) {
 	// locked is released before the job is retried or dead-lettered (and the dead-letter hook runs).
 	handlerErr := cons.attemptJob(ctx, span, j, info, tx)
 	if handlerErr == nil {
+		settled = true
+		return
+	}
+	if errors.Is(handlerErr, ErrClaimLost) || cons.ctx.Err() != nil {
 		return
 	}
 
@@ -214,6 +284,8 @@ func (cons *consumer) processJob(j *job) {
 	if !info.IsFinalAttempt() {
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+		} else {
+			settled = true
 		}
 
 		return
@@ -221,6 +293,9 @@ func (cons *consumer) processJob(j *job) {
 
 	// Max retries exceeded or retries disabled, move to Dead Letter Queue
 	if err = cons.moveJobToDLQ(ctx, j, info, handlerErr); err != nil {
+		if errors.Is(err, ErrClaimLost) || cons.ctx.Err() != nil {
+			return
+		}
 		// Reschedule the job rather than leave it consumed and never processed.
 		// Its handler runs again, and if it fails again, moving it is attempted again.
 		span.RecordError(err)
@@ -228,12 +303,15 @@ func (cons *consumer) processJob(j *job) {
 
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+		} else {
+			settled = true
 		}
 
 		return
 	}
 
 	span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
+	settled = true
 }
 
 // attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
@@ -301,7 +379,7 @@ func (cons *consumer) markJobDone(ctx context.Context, j *job, tx *sql.Tx) error
 
 	defer span.End()
 
-	if markErr := cons.driver.markJobProcessed(ctx, tx, j.ID); markErr != nil {
+	if markErr := cons.driver.markJobProcessed(ctx, tx, j.ID, j.ClaimToken); markErr != nil {
 		span.RecordError(fmt.Errorf("failed to mark job processed: %w", markErr))
 		span.SetStatus(codes.Error, "mark processed failed")
 
@@ -326,7 +404,7 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 	backoff := cons.backoffFunc(job.RetryCount + 1)
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
-	if err := cons.driver.markJobFailedAndReschedule(ctx, job.ID, errorMsg, backoff); err != nil {
+	if err := cons.driver.markJobFailedAndReschedule(ctx, job.ID, job.ClaimToken, errorMsg, backoff); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
@@ -351,7 +429,7 @@ func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, info JobInfo, ha
 		}
 	}
 
-	if err := cons.driver.moveToDeadLetterQueue(ctx, j.ID, handlerErr.Error(), inTx); err != nil {
+	if err := cons.driver.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, handlerErr.Error(), inTx); err != nil {
 		span.RecordError(fmt.Errorf("failed to move job %d to DLQ: %w", j.ID, err))
 		span.SetStatus(codes.Error, "failed to move job to DLQ")
 
@@ -413,7 +491,6 @@ func callRecovering(callback string, f func() error) (err error) {
 
 // runProcessedCleanupLoop periodically cleans up old processed jobs for this consumer.
 func (cons *consumer) runProcessedCleanupLoop() {
-	cons.workerWg.Add(1)       // Track the cleanup goroutine
 	defer cons.workerWg.Done() // Signal completion
 
 	ticker := time.NewTicker(cons.cleanupProcessedInterval)
@@ -432,7 +509,6 @@ func (cons *consumer) runProcessedCleanupLoop() {
 
 // runDLQCleanupLoop periodically cleans up old DLQ jobs for this consumer.
 func (cons *consumer) runDLQCleanupLoop() {
-	cons.workerWg.Add(1)       // Track the cleanup goroutine
 	defer cons.workerWg.Done() // Signal completion
 
 	ticker := time.NewTicker(cons.cleanupDLQInterval)

@@ -108,6 +108,39 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
 		}
 	}
+	// CREATE TABLE IF NOT EXISTS does not upgrade existing installations.
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(jobs)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if scanErr := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); scanErr != nil {
+			return scanErr
+		}
+		columns[name] = true
+	}
+	err = rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"claim_token", "TEXT NULL"}, {"claim_expires_at", "INTEGER NULL"},
+	} {
+		if !columns[column.name] {
+			if _, alterErr := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN `+column.name+` `+column.definition); alterErr != nil {
+				return alterErr
+			}
+		}
+	}
+	if _, indexErr := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`); indexErr != nil {
+		return indexErr
+	}
 
 	err = tx.Commit()
 	if err != nil {
@@ -308,8 +341,8 @@ func (d *SQLiteDriver) insertJob(
 }
 
 // getJobsForConsumer selects and locks available jobs for a given consumer and job type from SQLite.
-// It uses an advisory lock-like mechanism by updating `consumed_at`.
-func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16) ([]job, error) {
+// Expired claims are replaced atomically; processed jobs are never returned.
+func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
@@ -318,7 +351,11 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	defer span.End()
 
 	jobsToReturn := make([]job, 0, prefetchCount)
-	nowMs := time.Now().UnixMilli()
+	deadline := localClaimDeadline(claimTimeout)
+	claimToken, tokenErr := newClaimToken()
+	if tokenErr != nil {
+		return nil, tokenErr
+	}
 
 	// Since SQLite doesn't support SKIP LOCKED or UPDATE...RETURNING well,
 	// we use the mutex and a two-step process: SELECT potential IDs, then UPDATE.
@@ -329,11 +366,12 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 			SELECT id, payload, retry_count, trace_context, created_at
 			FROM jobs
 			WHERE job_type = ?
-			AND scheduled_at <= ?
-			AND consumed_at IS NULL
+			AND scheduled_at <= `+sqliteNow+`
+			AND processed_at IS NULL
+			AND (claim_expires_at IS NULL OR claim_expires_at <= `+sqliteNow+`)
 			ORDER BY id
 			LIMIT ?
-		`, jobType, nowMs, prefetchCount)
+		`, jobType, prefetchCount)
 		if err != nil {
 			return fmt.Errorf("failed to select potential jobs: %w", err)
 		}
@@ -374,7 +412,8 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		}
 
 		// Prepare update statement
-		stmt, err := tx.PrepareContext(ctx, `UPDATE jobs SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL`)
+		stmt, err := tx.PrepareContext(ctx, `UPDATE jobs SET consumed_at = `+sqliteNow+`, claim_token = ?, claim_expires_at = `+sqliteNow+` + ?
+			WHERE id = ? AND processed_at IS NULL AND (claim_expires_at IS NULL OR claim_expires_at <= `+sqliteNow+`)`)
 		if err != nil {
 			return fmt.Errorf("failed to prepare update statement: %w", err)
 		}
@@ -385,17 +424,17 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 
 		// Attempt to lock/claim each potential job
 		for _, j := range potentialJobs {
-			res, err := stmt.ExecContext(ctx, nowMs, j.ID)
+			j.ClaimToken = fmt.Sprintf("%s:%d", claimToken, j.ID)
+			res, err := stmt.ExecContext(ctx, j.ClaimToken, claimTimeout.Milliseconds(), j.ID)
 			if err != nil {
-				// Log error but continue trying other jobs in the batch
-				span.AddEvent("Error updating job to consumed state", trace.WithAttributes(
-					attribute.Int64("sqlq.job_id", j.ID),
-					attribute.String("error", err.Error()),
-				))
-				continue
+				return fmt.Errorf("failed to acquire claim for job %d: %w", j.ID, err)
 			}
-			affected, _ := res.RowsAffected()
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
 			if affected > 0 {
+				j.ClaimExpiresAt = deadline
 				// Successfully claimed
 				jobsToReturn = append(jobsToReturn, j)
 			} else {
@@ -434,7 +473,7 @@ func (d *SQLiteDriver) subscribeForConsumer(_ context.Context, jobType string, t
 }
 
 // markJobProcessed updates the jobs table to mark a job as successfully processed in SQLite.
-func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error {
+func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -445,8 +484,8 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 	nowMs := time.Now().UnixMilli()
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = ? WHERE id = ? AND consumed_at IS NOT NULL AND processed_at IS NULL`,
-		nowMs, jobID,
+		`UPDATE jobs SET processed_at = ? WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
+		nowMs, jobID, claimToken,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -460,7 +499,7 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 		return err
 	}
 	if rowsAffected != 1 {
-		err := fmt.Errorf("job %d is no longer claimed or was already processed", jobID)
+		err := fmt.Errorf("job %d: %w", jobID, ErrClaimLost)
 		span.RecordError(err)
 		return err
 	}
@@ -473,6 +512,7 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 func (d *SQLiteDriver) markJobFailedAndReschedule(
 	ctx context.Context,
 	jobID int64,
+	claimToken string,
 	errorMsg string,
 	backoffDuration time.Duration,
 ) error {
@@ -505,16 +545,19 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	scheduledMs := nowMs + backoffDuration.Milliseconds()
 
 	// Update the job: increment retry, set error, schedule, clear consumption/processing state
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET 
 			retry_count = retry_count + 1, 
 			last_error = ?, 
 			scheduled_at = ?,
 			consumed_at = NULL, 
+			claim_token = NULL,
+			claim_expires_at = NULL,
 			processed_at = NULL
-		WHERE id = ?`,
-		errorMsg, scheduledMs, jobID,
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
+		errorMsg, scheduledMs, jobID, claimToken,
 	)
+	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to update jobs table on reschedule: %w", err))
 		return err // Rollback will happen
@@ -531,7 +574,7 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
 // inTx runs while dbMutex is held, so it must not call driver methods that take it.
-func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error {
+func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.original_job_id", jobID), // Use original_job_id in attribute
@@ -557,19 +600,18 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	var job struct {
 		JobType     string
 		Payload     []byte
-		ID          int64
 		CreatedAtMs int64
 		RetryCount  int
 	}
 
 	err = tx.QueryRowContext(ctx, `
 		SELECT job_type, payload, created_at, retry_count
-		FROM jobs WHERE id = ?
-	`, jobID).Scan(&job.JobType, &job.Payload, &job.CreatedAtMs, &job.RetryCount)
+		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
+	`, jobID, claimToken).Scan(&job.JobType, &job.Payload, &job.CreatedAtMs, &job.RetryCount)
 	if err != nil {
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrJobNotFound
+			return ErrClaimLost
 		}
 		return err
 	}
@@ -588,7 +630,8 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	}
 
 	// Delete from jobs table (no CASCADE in SQLite by default, but job_consumers is gone anyway)
-	_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, job.ID)
+	res, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
+	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)

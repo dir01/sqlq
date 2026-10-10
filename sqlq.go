@@ -72,6 +72,8 @@ var (
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
 	// ErrJobNotFound indicates that a job with the specified ID was not found (e.g., in DLQ operations).
 	ErrJobNotFound = errors.New("job not found")
+	// ErrClaimLost indicates that a job is no longer owned by this attempt.
+	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
 )
@@ -82,6 +84,7 @@ var (
 	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
 	defaultPrefetchCount                   = defaultConcurrency
 	defaultJobTimeout                      = 15 * time.Minute
+	defaultClaimTimeout                    = 30 * time.Minute
 	defaultCleanupProcessedInterval        = 1 * time.Hour
 	defaultCleanupProcessedAge             = 7 * 24 * time.Hour
 	defaultCleanupDLQInterval              = 6 * time.Hour
@@ -106,6 +109,7 @@ type sqlq struct {
 	// How often to poll database for new jobs. Default is 100ms.
 	// Individual consumers may override this using WithConsumerPollInteval.
 	defaultPollInterval time.Duration
+	defaultClaimTimeout time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
 	// Individual consumers may override this using WithConsumerJobTimeout.
@@ -145,12 +149,15 @@ type sqlq struct {
 }
 
 type job struct {
-	JobType      string
-	CreatedAt    time.Time
-	TraceContext map[string]string
-	Payload      []byte
-	ID           int64
-	RetryCount   uint16
+	ClaimToken string
+	// ClaimExpiresAt is a conservative local deadline, including database round-trip time.
+	ClaimExpiresAt time.Time
+	JobType        string
+	CreatedAt      time.Time
+	TraceContext   map[string]string
+	Payload        []byte
+	ID             int64
+	RetryCount     uint16
 }
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue
@@ -167,7 +174,7 @@ type DeadLetterJob struct {
 
 // New creates a new JobsQueue
 func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
-	driver, err := getDriver(db, dbType)
+	dbDriver, err := getDriver(db, dbType)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +182,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 	q := &sqlq{
 		db:                              db,
 		dbType:                          dbType,
-		driver:                          driver,
+		driver:                          dbDriver,
 		consumersMap:                    make(map[string]*consumer),
 		consumersMapMutex:               sync.RWMutex{},
 		defaultPollInterval:             100 * time.Millisecond,
@@ -183,6 +190,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultPrefetchCount:            defaultPrefetchCount,
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
+		defaultClaimTimeout:             defaultClaimTimeout,
 		defaultBackoffFunc:              exponentialBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
@@ -288,6 +296,9 @@ func (q *sqlq) Consume(
 		maxRetries:               q.defaultMaxRetries,
 		pollInterval:             q.defaultPollInterval,
 		jobTimeout:               q.defaultJobTimeout,
+		claimTimeout:             q.defaultClaimTimeout,
+		claimRenewalThreshold:    0.5,
+		claims:                   make(map[string]job),
 		backoffFunc:              q.defaultBackoffFunc,
 		cleanupBatch:             q.defaultCleanupBatch,
 		cleanupProcessedInterval: q.defaultCleanupProcessedInterval,
@@ -298,10 +309,11 @@ func (q *sqlq) Consume(
 		asyncPushMaxRPM:          0,
 		onDeadLetter:             nil,
 		// Initialize consumer-specific fields
-		jobsChan: nil, // Will be initialized below
-		workerWg: sync.WaitGroup{},
-		ctx:      consCtx,
-		cancel:   cancel,
+		jobsChan:    nil, // Will be initialized below
+		workerWg:    sync.WaitGroup{},
+		claimsMutex: sync.Mutex{},
+		ctx:         consCtx,
+		cancel:      cancel,
 	}
 
 	// Apply consumer-specific options
@@ -314,6 +326,7 @@ func (q *sqlq) Consume(
 		cons.prefetchCount = cons.concurrency
 	}
 	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
+		cancel()
 		return fmt.Errorf("%w: %s", ErrPushNotSupported, q.dbType)
 	}
 
@@ -325,12 +338,12 @@ func (q *sqlq) Consume(
 	q.consumersMapMutex.Lock()
 	if _, exists := q.consumersMap[jobType]; exists {
 		q.consumersMapMutex.Unlock()
+		cancel()
 		return fmt.Errorf("%w: %s", ErrDuplicateConsumer, jobType)
 	}
 	q.consumersMap[jobType] = cons
-	q.consumersMapMutex.Unlock()
-
 	cons.start()
+	q.consumersMapMutex.Unlock()
 
 	return nil
 }

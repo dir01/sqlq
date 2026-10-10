@@ -9,6 +9,29 @@ import (
 // ConsumerOption defines functional options for Subscribe
 type ConsumerOption func(*consumer)
 
+// WithConsumerClaimTimeout sets how long a fetched job is reserved before it can
+// be reclaimed. Default is 30 minutes. Buffer time counts toward this duration.
+// Expiry permits recovery but does not cancel a running handler. Configure a
+// duration that covers execution; claims are not renewed in the background.
+func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
+	return func(c *consumer) {
+		if timeout >= time.Millisecond {
+			c.claimTimeout = timeout
+		}
+	}
+}
+
+// WithConsumerClaimRenewalThreshold sets the fraction of claim time remaining
+// below which a worker extends its claim before starting. Default is 0.5.
+// Zero disables pre-execution extension; one extends every unexpired claim.
+func WithConsumerClaimRenewalThreshold(fraction float64) ConsumerOption {
+	return func(c *consumer) {
+		if fraction >= 0 && fraction <= 1 {
+			c.claimRenewalThreshold = fraction
+		}
+	}
+}
+
 // WithConsumerConcurrency sets the number of concurrent workers for a given consumer
 // You may also configure default value for all consumers, see WithDefaultConcurrency.
 func WithConsumerConcurrency(concurrency uint16) ConsumerOption {
