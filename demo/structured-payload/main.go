@@ -1,3 +1,4 @@
+// Demonstrates publishing and decoding a structured JSON payload.
 package main
 
 import (

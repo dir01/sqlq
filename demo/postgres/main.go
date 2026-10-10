@@ -1,3 +1,4 @@
+// Demonstrates publishing and consuming a job with PostgreSQL.
 package main
 
 import (

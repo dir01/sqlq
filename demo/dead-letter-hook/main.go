@@ -1,3 +1,4 @@
+// Demonstrates recording terminal failures in the dead-letter transaction.
 package main
 
 import (
@@ -30,11 +31,11 @@ func runExample(ctx context.Context, db *sql.DB, q sqlq.JobsQueue) error {
 
 	onDeadLetter := func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo,
 		_ []byte, handlerErr error) error {
-		_, err := tx.ExecContext(ctx,
+		_, insertErr := tx.ExecContext(ctx,
 			"INSERT INTO failed_tasks (job_id, reason) VALUES (?, ?)",
 			info.ID, handlerErr.Error(),
 		)
-		return err
+		return insertErr
 	}
 
 	err = q.Consume(ctx, "terminal_task", handler,

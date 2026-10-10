@@ -1,3 +1,4 @@
+// Demonstrates SQLite push notifications for newly published jobs.
 package main
 
 import (

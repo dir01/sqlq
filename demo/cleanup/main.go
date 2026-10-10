@@ -1,3 +1,4 @@
+// Demonstrates configuring cleanup of processed jobs.
 package main
 
 import (

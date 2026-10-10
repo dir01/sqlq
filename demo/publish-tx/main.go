@@ -1,3 +1,4 @@
+// Demonstrates publishing a job in the same transaction as an order.
 package main
 
 import (
@@ -29,7 +30,7 @@ func runExample(ctx context.Context, db *sql.DB, q sqlq.JobsQueue) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() // Harmless after a successful commit.
+	defer func() { _ = tx.Rollback() }() // Harmless after a successful commit.
 
 	result, err := tx.ExecContext(ctx,
 		"INSERT INTO orders (description) VALUES (?)", "a new order")

@@ -1,3 +1,4 @@
+// Demonstrates retrying a job that succeeds on its third attempt.
 package main
 
 import (

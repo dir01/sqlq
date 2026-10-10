@@ -1,3 +1,4 @@
+// Demonstrates a handler that stops when its job timeout expires.
 package main
 
 import (

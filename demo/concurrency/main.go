@@ -1,3 +1,4 @@
+// Demonstrates configuring consumer concurrency and prefetching.
 package main
 
 import (

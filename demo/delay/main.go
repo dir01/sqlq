@@ -1,3 +1,4 @@
+// Demonstrates delaying a job until its scheduled time.
 package main
 
 import (
