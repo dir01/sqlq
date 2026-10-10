@@ -249,7 +249,8 @@ func (d *PostgresDriver) insertJob(
 }
 
 // getJobsForConsumer selects and locks available jobs for a given consumer and job type from PostgreSQL.
-// Expired claims are replaced atomically; processed jobs are never returned.
+// It also takes jobs whose claim expired. Only one consumer gets each job,
+// and jobs that are done are never returned.
 func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -297,7 +298,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			j.JobType = jobType        // Set job type as it's not returned by RETURNING
 
 			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken); err != nil {
-				// Roll back the batch rather than strand a job we could not deliver.
+				// Undo the whole batch. Otherwise this job would stay claimed but never reach a worker.
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
 				return err
 			}

@@ -30,7 +30,7 @@ type driver interface {
 	insertJob(ctx context.Context, tx *sql.Tx, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
 	// getJobsForConsumer executes the query for finding jobs for a consumer
-	// Unprocessed jobs can be returned again after their claim expires.
+	// A job that is not done can be returned again after its claim expires.
 	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error)
 	extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error)
 	releaseClaim(ctx context.Context, j job) error

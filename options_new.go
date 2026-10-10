@@ -130,8 +130,8 @@ func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	}
 }
 
-// WithDefaultClaimTimeout sets the default reservation duration for consumers.
-// Default is 30 minutes. See WithConsumerClaimTimeout for expiry semantics.
+// WithDefaultClaimTimeout sets the claim timeout for all consumers. Default is 30 minutes.
+// See WithConsumerClaimTimeout for details.
 func WithDefaultClaimTimeout(timeout time.Duration) NewOption {
 	return func(q *sqlq) {
 		if claimBudget(timeout) > 0 {

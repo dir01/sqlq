@@ -72,7 +72,7 @@ var (
 	ErrMaxRetriesExceeded = errors.New("maximum retries exceeded")
 	// ErrJobNotFound indicates that a job with the specified ID was not found (e.g., in DLQ operations).
 	ErrJobNotFound = errors.New("job not found")
-	// ErrClaimLost indicates that a job is no longer owned by this attempt.
+	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
@@ -149,8 +149,9 @@ type sqlq struct {
 }
 
 type job struct {
+	// ClaimToken shows that this consumer owns the job. A write fails if the jobs table has a different token.
 	ClaimToken string
-	// ClaimExpiresAt is a conservative local deadline, including database round-trip time.
+	// ClaimExpiresAt is the last time this consumer can start the job. It is a little before the expiry in the jobs table.
 	ClaimExpiresAt time.Time
 	JobType        string
 	CreatedAt      time.Time

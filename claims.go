@@ -8,20 +8,39 @@ import (
 	"time"
 )
 
+// A claim lets one consumer work on one job for a limited time.
+// The jobs table stores the claim token and the expiry time.
+// Every later write for the job must give the same token, or it fails with ErrClaimLost.
+// After a claim expires, another consumer can claim the job with a new token.
+// This lets another worker finish jobs that a stopped worker left behind.
+
+// claimKey returns the key for a claim in consumer.claims. The consumer uses that map
+// to limit how many jobs it holds, and to release them at shutdown.
+// The key includes the token, because the consumer can claim the same job again
+// after its old claim expires.
 func claimKey(j job) string {
 	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
 }
 
-// claimBudget is how much of a claim timeout a worker can rely on locally.
-// SQL stores millisecond durations. Allow for timestamp quantization too.
+// claimBudget returns how long a worker can count on a claim, from the time it asked for it.
+// It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
+// It takes off 1ms more, because SQLite can store the claim start up to 1ms early.
+// The timeout options use it to ignore timeouts that leave no time.
 func claimBudget(timeout time.Duration) time.Duration {
 	return timeout.Truncate(time.Millisecond) - time.Millisecond
 }
 
+// localClaimDeadline returns the last time a worker can start a job without asking the database.
+// The drivers call it before they send the request, so it is never later than the expiry
+// in the database. After this time, the worker drops the job. When the time left is below
+// the renewal threshold, the worker extends the claim first.
 func localClaimDeadline(timeout time.Duration) time.Time {
 	return time.Now().Add(claimBudget(timeout))
 }
 
+// newClaimToken returns a random 32-character hex string for one claim request.
+// The drivers add ":<job ID>", so each job in a batch gets its own token.
+// It is random so that consumers in different processes never make the same token.
 func newClaimToken() (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
@@ -30,6 +49,10 @@ func newClaimToken() (string, error) {
 	return hex.EncodeToString(bytes[:]), nil
 }
 
+// checkClaimResult checks a write that filters on the claim token and must change one row.
+// If it did not change one row, it returns ErrClaimLost. That happens when another consumer
+// took the job, the claim was released, or the job is already done.
+// If the write itself failed, it returns that error.
 func checkClaimResult(result sql.Result, err error) error {
 	if err != nil {
 		return err

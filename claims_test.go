@@ -21,7 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-func TestClaimsSQLite(t *testing.T) { //nolint:tparallel // Shared-database scenarios must run sequentially.
+func TestClaimsSQLite(t *testing.T) { //nolint:tparallel // Subtests share one database, so they run one at a time.
 	t.Parallel()
 	dsn := "file:" + filepath.Join(t.TempDir(), "claims.db") + "?_busy_timeout=5000&_journal_mode=WAL"
 	db, err := sql.Open("sqlite3", dsn)
@@ -30,7 +30,7 @@ func TestClaimsSQLite(t *testing.T) { //nolint:tparallel // Shared-database scen
 	testClaims(t, db, DBTypeSQLite, dsn, "")
 }
 
-func TestClaimsPostgres(t *testing.T) { //nolint:tparallel // Shared-database scenarios must run sequentially.
+func TestClaimsPostgres(t *testing.T) { //nolint:tparallel // Subtests share one database, so they run one at a time.
 	t.Parallel()
 	if testing.Short() {
 		t.Skip("PostgreSQL integration requires Docker or SQLQ_TEST_POSTGRES_DSN")
@@ -73,7 +73,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	d, err := getDriver(db, dbType)
 	require.NoError(t, err)
 	require.NoError(t, d.initSchema(ctx))
-	other, err := getDriver(db, dbType) // Independent mutexes, same database.
+	other, err := getDriver(db, dbType) // Acts as a second process: same database, its own mutex.
 	require.NoError(t, err)
 	expire := func() {
 		t.Helper()
@@ -249,7 +249,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("shutdown releases active and buffered jobs without counting failures", func(t *testing.T) {
 		seed(3)
-		// Make all three available for the actual consumer.
+		// Clear seed's claims, so the consumer below can claim all three jobs.
 		_, err := db.ExecContext(ctx, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`)
 		require.NoError(t, err)
 		started := make(chan struct{})
@@ -298,7 +298,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
-		cons.jobsChan = make(chan job) // No receiver: delivery blocks after acquisition.
+		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
 		cons.workerWg.Add(1)
 		go func() {
 			defer cons.workerWg.Done()
@@ -322,9 +322,9 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job, 3)
 		require.NoError(t, cons.fetchJobs(ctx))
-		<-cons.jobsChan // Simulate one active worker, retaining its outstanding claim.
+		<-cons.jobsChan // Take one job, like a busy worker. Its claim stays open.
 		require.NoError(t, cons.fetchJobs(ctx))
-		require.NoError(t, cons.fetchJobs(ctx)) // At capacity: must not acquire more.
+		require.NoError(t, cons.fetchJobs(ctx)) // The consumer is full, so this fetch must claim nothing.
 		require.Len(t, cons.claims, 4)
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 6, time.Minute)
 		require.NoError(t, err)
@@ -387,7 +387,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	if dbType == DBTypeSQLite {
 		t.Run("legacy migration finishes DLQ moves instead of recovering them", func(t *testing.T) {
 			jobs := seed(2)
-			// Versions without claims inserted into the DLQ but deleted id 0 instead of the job.
+			// Old versions added the job to the DLQ, but deleted job 0 instead of this job.
 			_, err := db.ExecContext(ctx, `INSERT INTO dead_letter_queue
 				(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
 				VALUES (?, 'claims', '{}', 0, 0, 3, 'failed')`, jobs[0].ID)
@@ -474,8 +474,8 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 	}
 }
 
-// Invoked in a separate process so killing it tests database transaction cleanup,
-// rather than calling Rollback to simulate worker loss.
+// TestClaimCrashHelper runs in a child process that the parent test kills.
+// This tests what the database does when a worker really dies, not a call to Rollback.
 func TestClaimCrashHelper(t *testing.T) {
 	t.Parallel()
 	dsn := os.Getenv("SQLQ_CLAIM_CRASH_DSN")

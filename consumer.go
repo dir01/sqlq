@@ -152,8 +152,8 @@ func (cons *consumer) fetchJobsLoop() {
 // fetchJobs fetches jobs for this consumer and sends them to the jobs channel.
 func (cons *consumer) fetchJobs(ctx context.Context) error {
 	cons.claimsMutex.Lock()
-	// Keep the buffer supplied while workers are running, without acquiring an
-	// additional batch that would sit blocked outside the channel.
+	// Claim no more jobs than the workers and the buffer can hold. Extra jobs would
+	// wait outside the channel while their claim time runs out.
 	capacity := min(int(cons.prefetchCount), int(cons.prefetchCount)+int(cons.concurrency)-len(cons.claims))
 	cons.claimsMutex.Unlock()
 	if capacity <= 0 {
@@ -203,7 +203,7 @@ func (cons *consumer) workerLoop() {
 func (cons *consumer) processJob(j *job) {
 	settled := false
 	defer func() {
-		// Shutdown releases aborted and undelivered attempts after all workers stop.
+		// During shutdown, keep the claim in the map. shutdown releases all claims after the workers stop.
 		if cons.ctx.Err() != nil {
 			return
 		}

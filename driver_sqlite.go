@@ -21,20 +21,17 @@ import (
 
 const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 
-// sqliteNow is the current time in Unix milliseconds, computed by SQLite. It is
-// the documented recipe (https://www.sqlite.org/lang_datefunc.html#examples),
-// which unlike unixepoch('now','subsec') predates SQLite 3.42, scaled to
-// milliseconds. ROUND absorbs float error that CAST alone would truncate to the
-// previous millisecond.
+// sqliteNow is SQL that gives the current time in Unix milliseconds.
+// The formula is from the SQLite docs: https://www.sqlite.org/lang_datefunc.html#examples
+// (unixepoch('now','subsec') is simpler, but needs SQLite 3.42). ROUND fixes float error
+// that would otherwise make CAST cut the value down by one millisecond.
 //
-// It is used instead of a time.Now() parameter because SQLite evaluates 'now'
-// when the statement runs, after any wait for dbMutex or the write lock, so an
-// expiry check never compares against a timestamp taken before that wait. 'now'
-// is also fixed for the whole statement, so the claim UPDATE sets consumed_at
-// and claim_expires_at and checks the old expiry against one instant.
+// We use it instead of passing time.Now(), because SQLite reads 'now' when the statement
+// runs, after any wait for dbMutex or the write lock. A time.Now() value would be old by then.
+// 'now' also stays the same for the whole statement, so one UPDATE uses one time everywhere.
 //
-// Local deadlines (localClaimDeadline) use the request start time instead, so
-// lock wait never adds to the local budget.
+// localClaimDeadline uses the time before the request on purpose: waiting must not add
+// to the worker's time.
 const sqliteNow = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)"
 
 // SQLiteDriver implements the Driver interface for SQLite
@@ -126,7 +123,7 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to execute query (%s): %w", query, err)
 		}
 	}
-	// CREATE TABLE IF NOT EXISTS does not upgrade existing installations.
+	// CREATE TABLE IF NOT EXISTS does not change an existing table, so add the new columns here.
 	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(jobs)`)
 	if err != nil {
 		return err
@@ -148,9 +145,9 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 		return err
 	}
 	if !columns["claim_token"] {
-		// Versions without claims never deleted dead-lettered jobs (they deleted id 0).
-		// Finish those moves, or claim recovery would run the jobs again. IDs are
-		// AUTOINCREMENT, so a jobs row with a DLQ'd ID can only be such a leftover.
+		// Old versions put failed jobs in the DLQ but did not delete them from jobs (they deleted
+		// id 0). Delete them now, or claim recovery would run them again. IDs are never reused
+		// (AUTOINCREMENT), so every jobs row with a DLQ ID is one of these.
 		if _, deleteErr := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id IN (SELECT original_job_id FROM dead_letter_queue)`); deleteErr != nil {
 			return deleteErr
 		}
@@ -367,7 +364,8 @@ func (d *SQLiteDriver) insertJob(
 }
 
 // getJobsForConsumer selects and locks available jobs for a given consumer and job type from SQLite.
-// Expired claims are replaced atomically; processed jobs are never returned.
+// It also takes jobs whose claim expired. Only one consumer gets each job,
+// and jobs that are done are never returned.
 func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_jobs_for_consumer", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -383,10 +381,9 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		return nil, tokenErr
 	}
 
-	// Claim with a single statement so the transaction starts as a write. A SELECT
-	// followed by UPDATE would have to upgrade a read snapshot, which SQLite rejects
-	// with SQLITE_BUSY whenever another connection has written in between, without
-	// waiting on the busy timeout.
+	// Claim the jobs in one statement, so the transaction starts with a write. If it started
+	// with a SELECT, the UPDATE after it could fail at once with SQLITE_BUSY when another
+	// connection wrote in between. A first write waits for the lock instead.
 	d.dbMutex.Lock()
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
@@ -437,7 +434,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		if err = rows.Err(); err != nil {
 			return fmt.Errorf("error iterating claimed jobs: %w", err)
 		}
-		// RETURNING order is unspecified.
+		// RETURNING gives rows in no fixed order.
 		slices.SortFunc(jobsToReturn, func(a, b job) int { return cmp.Compare(a.ID, b.ID) })
 		return nil
 	})
@@ -462,8 +459,8 @@ func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Dura
 }
 
 func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
-	// Use the database's locking rather than dbMutex so the cleanup context can
-	// bound waiting even when another consumer is inside a dead-letter hook.
+	// Do not take dbMutex here. A dead-letter hook can hold it for a long time, and a wait
+	// for a mutex ignores ctx. A wait for SQLite's lock stops when ctx ends.
 	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, j.ID, j.ClaimToken)
 	return checkClaimResult(result, err)
