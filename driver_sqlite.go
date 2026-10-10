@@ -223,6 +223,7 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 // InsertJob inserts a new job into the SQLite jobs table.
 func (d *SQLiteDriver) insertJob(
 	ctx context.Context,
+	tx *sql.Tx,
 	jobType string,
 	payload []byte,
 	delay time.Duration,
@@ -236,8 +237,15 @@ func (d *SQLiteDriver) insertJob(
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	var executor sqlExecutor = d.db
+	if tx != nil {
+		// A caller-owned transaction may already hold SQLite's write lock.
+		// Taking dbMutex here could deadlock with a queue operation waiting on it.
+		executor = tx
+	} else {
+		d.dbMutex.Lock()
+		defer d.dbMutex.Unlock()
+	}
 
 	traceContextJSON := []byte("")
 	if len(traceContext) > 0 {
@@ -259,21 +267,27 @@ func (d *SQLiteDriver) insertJob(
 	if delay <= 0 {
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (?, ?, ?, ?, ?) RETURNING id
+			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
 	} else {
 		scheduledMs := nowMs + delay.Milliseconds()
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (?, ?, ?, ?, ?) RETURNING id
+			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
 	}
 
-	var id int64
-	if err := d.db.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
+	if _, err := executor.ExecContext(ctx, query, args...); err != nil {
 		span.RecordError(err)
+		return err
+	}
+
+	if tx != nil {
+		// The caller has not committed yet. Polling will discover the job after
+		// commit; a push here could wake a consumer before the row is visible.
+		return nil
 	}
 
 	var notif *sqliteNotificationSubscription

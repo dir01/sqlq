@@ -12,7 +12,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 
 	"go.opentelemetry.io/otel/trace"
@@ -26,6 +25,7 @@ type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 
 	// PublishTx adds a new job to the queue within an existing transaction.
+	// The caller commits or rolls back tx. A nil tx publishes immediately.
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 
 	// Consume registers a handler function for a specific job type.
@@ -212,37 +212,12 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 	)
 	defer span.End()
 
-	tx, err := q.db.BeginTx(ctx, nil)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "failed to begin transaction")
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent(
-				"Failed to rollback transaction in Publish",
-				trace.WithAttributes(attribute.String("error", rErr.Error())),
-			)
-		}
-	}()
-
-	if err = q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
-		// PublishTx already records its internal errors in its own span
-		return err
-	}
-
-	if err = tx.Commit(); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+	return q.PublishTx(ctx, nil, jobType, payload, opts...)
 }
 
 // PublishTx adds a new job to the queue within an existing transaction.
-func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
+// The caller commits or rolls back tx. A nil tx publishes immediately.
+func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish_tx",
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", jobType),
@@ -269,7 +244,7 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 	traceContextMap := propagation.MapCarrier(make(map[string]string))
 	otel.GetTextMapPropagator().Inject(ctx, traceContextMap)
 
-	err = q.driver.insertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
+	err = q.driver.insertJob(ctx, tx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
 		// The driver method should record the specific DB error in its span. We record a higher-level error here.
 		span.RecordError(err)

@@ -26,6 +26,12 @@ func TestPostgreSQL(t *testing.T) {
 
 	t.Cleanup(cleanup)
 
+	t.Run("Publishing uses the caller's transaction", func(t *testing.T) {
+		t.Parallel()
+
+		tc.TestPublishTx(t.Context(), t)
+	})
+
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
 

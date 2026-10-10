@@ -203,6 +203,7 @@ func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType
 // InsertJob inserts a new job into the PostgreSQL jobs table.
 func (d *PostgresDriver) insertJob(
 	ctx context.Context,
+	tx *sql.Tx,
 	jobType string,
 	payload []byte,
 	delay time.Duration,
@@ -233,7 +234,11 @@ func (d *PostgresDriver) insertJob(
 		args = []any{jobType, payload, delay.String(), string(traceContextJSON)}
 	}
 
-	_, err = d.db.ExecContext(ctx, query, args...)
+	var executor sqlExecutor = d.db
+	if tx != nil {
+		executor = tx
+	}
+	_, err = executor.ExecContext(ctx, query, args...)
 	if err != nil {
 		span.RecordError(err)
 	}
