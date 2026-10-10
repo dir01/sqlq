@@ -194,15 +194,15 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		for _, scenario := range []struct {
 			name       string
 			remaining  time.Duration
-			threshold  float64
 			extensions int
 			called     bool
 		}{
-			{"fresh", time.Minute, 0.5, 0, true},
-			{"near expiry", time.Second, 0.5, 1, true},
-			{"expired buffer", -time.Second, 0.5, 0, false},
-			{"extension disabled", time.Second, 0, 0, true},
-			{"always extend", time.Minute, 1, 1, true},
+			// testClaimConsumer has a 10s job timeout, so a handler needs 15s of claim time.
+			{"fresh", time.Minute, 0, true},
+			{"enough for job timeout and margin", 20 * time.Second, 0, true},
+			{"enough for job timeout but not margin", 12 * time.Second, 1, true},
+			{"near expiry", time.Second, 1, true},
+			{"expired buffer", -time.Second, 0, false},
 		} {
 			t.Run(scenario.name, func(t *testing.T) {
 				j := seed(1)[0]
@@ -213,7 +213,6 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 					called = true
 					return nil
 				})
-				WithConsumerClaimRenewalThreshold(scenario.threshold)(cons)
 				cons.processJob(&j)
 				require.Equal(t, scenario.called, called)
 				require.Equal(t, scenario.extensions, spy.extensions)
@@ -421,16 +420,64 @@ func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
 	for timeout, accepted := range map[time.Duration]bool{
 		time.Millisecond: false, 1999 * time.Microsecond: false, 2 * time.Millisecond: true,
 	} {
-		cons := &consumer{claimTimeout: defaultClaimTimeout} //nolint:exhaustruct
+		cons := &consumer{} //nolint:exhaustruct
 		WithConsumerClaimTimeout(timeout)(cons)
-		q := &sqlq{defaultClaimTimeout: defaultClaimTimeout} //nolint:exhaustruct
+		q := &sqlq{} //nolint:exhaustruct
 		WithDefaultClaimTimeout(timeout)(q)
-		want := defaultClaimTimeout
+		want := time.Duration(0)
 		if accepted {
 			want = timeout
 		}
 		require.Equal(t, want, cons.claimTimeout, timeout)
 		require.Equal(t, want, q.defaultClaimTimeout, timeout)
+	}
+}
+
+func TestConsumeClaimTimeout(t *testing.T) {
+	t.Parallel()
+	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
+	for _, scenario := range []struct {
+		name      string
+		err       error
+		queueOpts []NewOption
+		consOpts  []ConsumerOption
+		want      time.Duration
+	}{
+		{"defaults to twice the job timeout", nil, nil, nil, 2 * defaultJobTimeout},
+		{"follows a consumer job timeout", nil, nil, []ConsumerOption{WithConsumerJobTimeout(time.Hour)}, 2 * time.Hour},
+		{"follows a queue job timeout", nil, []NewOption{WithDefaultJobTimeout(time.Hour)}, nil, 2 * time.Hour},
+		{
+			"consumer claim timeout wins", nil, []NewOption{WithDefaultClaimTimeout(time.Hour)},
+			[]ConsumerOption{WithConsumerClaimTimeout(20 * time.Minute)}, 20 * time.Minute,
+		},
+		{
+			"claim timeout equal to job timeout is rejected", ErrClaimTimeoutTooShort, nil,
+			[]ConsumerOption{WithConsumerClaimTimeout(defaultJobTimeout)}, 0,
+		},
+		{
+			"queue claim timeout shorter than consumer job timeout is rejected", ErrClaimTimeoutTooShort,
+			[]NewOption{WithDefaultClaimTimeout(time.Hour)}, []ConsumerOption{WithConsumerJobTimeout(2 * time.Hour)}, 0,
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "consume.db")+"?_busy_timeout=5000&_journal_mode=WAL")
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			queue, err := New(db, DBTypeSQLite, scenario.queueOpts...)
+			require.NoError(t, err)
+			q, ok := queue.(*sqlq)
+			require.True(t, ok)
+			q.Run()
+			err = q.Consume(t.Context(), "claims", handler, scenario.consOpts...)
+			if scenario.err != nil {
+				require.ErrorIs(t, err, scenario.err)
+				return
+			}
+			require.NoError(t, err)
+			t.Cleanup(q.Shutdown)
+			require.Equal(t, scenario.want, q.consumersMap["claims"].claimTimeout)
+		})
 	}
 }
 
@@ -466,7 +513,7 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 	return &consumer{ //nolint:exhaustruct
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
-		claimTimeout: time.Minute, claimRenewalThreshold: 0.5,
+		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
 		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
 		pollInterval: time.Millisecond, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },

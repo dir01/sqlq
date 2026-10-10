@@ -10,25 +10,15 @@ import (
 type ConsumerOption func(*consumer)
 
 // WithConsumerClaimTimeout sets how long a consumer holds a fetched job before other
-// consumers can take it. Default is 30 minutes. The time starts at fetch, so time in the
-// buffer counts. When it runs out, a running handler is not stopped, and the claim is not
-// renewed in the background. Pick a value that covers buffer time plus handler time.
-// Values under 2ms are ignored.
+// consumers can take it. Default is twice the job timeout (30 minutes with defaults).
+// The time starts at fetch, so time in the buffer counts. Before a worker starts a handler,
+// it extends the claim if less than the job timeout plus a margin is left. Claims are not
+// renewed while the handler runs. Consume returns ErrClaimTimeoutTooShort if the claim
+// timeout is not longer than the job timeout. Values under 2ms are ignored.
 func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
 	return func(c *consumer) {
 		if claimBudget(timeout) > 0 {
 			c.claimTimeout = timeout
-		}
-	}
-}
-
-// WithConsumerClaimRenewalThreshold sets when a worker extends its claim before it starts
-// a job: when less than this fraction of the claim time is left. Default is 0.5.
-// 0 never extends. 1 always extends.
-func WithConsumerClaimRenewalThreshold(fraction float64) ConsumerOption {
-	return func(c *consumer) {
-		if fraction >= 0 && fraction <= 1 {
-			c.claimRenewalThreshold = fraction
 		}
 	}
 }

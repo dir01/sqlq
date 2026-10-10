@@ -130,8 +130,8 @@ func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	}
 }
 
-// WithDefaultClaimTimeout sets the claim timeout for all consumers. Default is 30 minutes.
-// See WithConsumerClaimTimeout for details.
+// WithDefaultClaimTimeout sets the claim timeout for all consumers.
+// Default is twice the job timeout of each consumer. See WithConsumerClaimTimeout for details.
 func WithDefaultClaimTimeout(timeout time.Duration) NewOption {
 	return func(q *sqlq) {
 		if claimBudget(timeout) > 0 {

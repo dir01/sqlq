@@ -33,7 +33,6 @@ type consumer struct {
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
 	claimTimeout             time.Duration
-	claimRenewalThreshold    float64
 	pollInterval             time.Duration // How often should db poller run. You might want to set this value higher if you have push configured
 	jobTimeout               time.Duration // After this amount a time job context will be canceled
 	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
@@ -225,7 +224,7 @@ func (cons *consumer) processJob(j *job) {
 	if remaining <= 0 {
 		return
 	}
-	if remaining <= time.Duration(float64(cons.claimTimeout)*cons.claimRenewalThreshold) {
+	if remaining < claimTimeNeeded(cons.jobTimeout) {
 		deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
 		if err != nil {
 			if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {

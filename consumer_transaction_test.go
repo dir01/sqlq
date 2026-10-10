@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -53,7 +54,7 @@ func TestAttemptJobTransactionFailure(t *testing.T) {
 			_, err = db.ExecContext(ctx, scenario.setup)
 			require.NoError(t, err)
 			require.NoError(t, d.insertJob(ctx, nil, "transaction", []byte("payload"), 0, nil))
-			jobs, err := d.getJobsForConsumer(ctx, "transaction", 1, defaultClaimTimeout)
+			jobs, err := d.getJobsForConsumer(ctx, "transaction", 1, time.Minute)
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
 

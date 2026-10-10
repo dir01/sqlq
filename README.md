@@ -150,8 +150,8 @@ workers run without an additional batch waiting outside the channel.
 
 ```go
 q.Consume(ctx, "numbered_job", handler,
-    sqlq.WithConsumerClaimTimeout(30*time.Minute),
-    sqlq.WithConsumerClaimRenewalThreshold(0.5))
+    sqlq.WithConsumerJobTimeout(10*time.Minute),
+    sqlq.WithConsumerClaimTimeout(30*time.Minute))
 ```
 
 Claims start at fetch time, including time in the local buffer. Another consumer
@@ -159,15 +159,16 @@ can recover unfinished jobs after their claims expire. Recovery does not increme
 the retry count: a prefetched job may never have started. Polling discovers expired
 claims even without a new publish notification.
 
-Before execution, a worker uses a conservative local deadline. Fresh claims need
-no additional database query. When less than half the claim duration remains, it
-conditionally extends the claim using its token. The threshold is configurable
-from zero (no extension) to one (always extend). Expired local copies are discarded;
-a failed ownership check prevents the handler from starting.
+The claim timeout defaults to twice the job timeout and must be longer than it;
+otherwise `Consume` returns `ErrClaimTimeoutTooShort`. Before a worker starts a
+handler, it checks a conservative local deadline. If less than the job timeout plus
+a margin (half the job timeout, at most one minute) remains, it extends the claim
+using its token. Fresh claims need no additional database query. Expired local
+copies are discarded; a failed ownership check prevents the handler from starting.
 
-Claims are not renewed in the background. Set the claim timeout to cover both
-buffering and execution. It is distinct from the job timeout: claim expiry does
-not cancel a running handler. Expiry permits reclamation; changing the token
+Claims are not renewed while a handler runs, and claim expiry does not cancel it.
+The job timeout does, and cancellation is cooperative: a handler that ignores its
+context can outlive its claim. Expiry permits reclamation; changing the token
 invalidates the previous attempt. Completion can still succeed after expiry if
 no other consumer has replaced the token. SQLite's write transaction prevents
 competing claim updates while its write protection is held.
@@ -286,8 +287,7 @@ the library defaults are:
 | Prefetch | Initial default concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
 | Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
-| Claim timeout | 30 minutes | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |
-| Claim renewal threshold | 0.5 of claim time remaining | — | `WithConsumerClaimRenewalThreshold` |
+| Claim timeout | 2 × job timeout (30 minutes) | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |
 | Retry delay | Exponential backoff with jitter | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
 | Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
 | Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |

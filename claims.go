@@ -33,9 +33,17 @@ func claimBudget(timeout time.Duration) time.Duration {
 // localClaimDeadline returns the last time a worker can start a job without asking the database.
 // getJobsForConsumer and extendClaim in each driver call it before they send their UPDATE,
 // so it is never later than the expiry the database stores. processJob compares it with
-// the current time before it runs the handler (see WithConsumerClaimRenewalThreshold).
+// the current time before it runs the handler (see claimTimeNeeded).
 func localClaimDeadline(timeout time.Duration) time.Time {
 	return time.Now().Add(claimBudget(timeout))
+}
+
+// claimTimeNeeded returns how much claim time must be left before a worker starts a handler:
+// the job timeout, plus time for the handler to return and its result to be written.
+// That extra time is half the job timeout, but at most one minute.
+// processJob extends the claim first when less time is left.
+func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + min(time.Minute, jobTimeout/2)
 }
 
 // newClaimToken returns a random string for one claim request (128 random bits, base32).

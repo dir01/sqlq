@@ -74,6 +74,9 @@ var (
 	ErrJobNotFound = errors.New("job not found")
 	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
+	// ErrClaimTimeoutTooShort means the claim timeout is not longer than the job timeout,
+	// so a handler could still run after another consumer took its job.
+	ErrClaimTimeoutTooShort = errors.New("claim timeout must be longer than job timeout")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
 )
@@ -84,7 +87,6 @@ var (
 	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
 	defaultPrefetchCount                   = defaultConcurrency
 	defaultJobTimeout                      = 15 * time.Minute
-	defaultClaimTimeout                    = 30 * time.Minute
 	defaultCleanupProcessedInterval        = 1 * time.Hour
 	defaultCleanupProcessedAge             = 7 * 24 * time.Hour
 	defaultCleanupDLQInterval              = 6 * time.Hour
@@ -109,6 +111,7 @@ type sqlq struct {
 	// How often to poll database for new jobs. Default is 100ms.
 	// Individual consumers may override this using WithConsumerPollInteval.
 	defaultPollInterval time.Duration
+	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
@@ -191,7 +194,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultPrefetchCount:            defaultPrefetchCount,
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
-		defaultClaimTimeout:             defaultClaimTimeout,
+		defaultClaimTimeout:             0,
 		defaultBackoffFunc:              exponentialBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
@@ -298,7 +301,6 @@ func (q *sqlq) Consume(
 		pollInterval:             q.defaultPollInterval,
 		jobTimeout:               q.defaultJobTimeout,
 		claimTimeout:             q.defaultClaimTimeout,
-		claimRenewalThreshold:    0.5,
 		claims:                   make(map[string]job),
 		backoffFunc:              q.defaultBackoffFunc,
 		cleanupBatch:             q.defaultCleanupBatch,
@@ -325,6 +327,14 @@ func (q *sqlq) Consume(
 	// Options sanity checks and adjustments
 	if cons.prefetchCount < cons.concurrency {
 		cons.prefetchCount = cons.concurrency
+	}
+	if cons.claimTimeout == 0 {
+		// Leaves about as much claim time for the buffer as for the handler.
+		cons.claimTimeout = 2 * cons.jobTimeout
+	}
+	if cons.claimTimeout <= cons.jobTimeout {
+		cancel()
+		return fmt.Errorf("%w: claim timeout %s, job timeout %s", ErrClaimTimeoutTooShort, cons.claimTimeout, cons.jobTimeout)
 	}
 	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
 		cancel()
