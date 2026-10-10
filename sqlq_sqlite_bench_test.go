@@ -15,6 +15,8 @@ import (
 
 // setupBenchmarkDB creates an in-memory SQLite database for benchmark tests.
 func setupBenchmarkDB(b *testing.B) (*sql.DB, func()) {
+	b.Helper()
+
 	// Use a unique in-memory DB for each benchmark run to avoid interference
 	// "file::memory:?cache=shared" allows multiple connections in the same process
 	// We add a unique identifier based on benchmark name/time if needed, but for simple cases,

@@ -10,7 +10,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -34,15 +33,10 @@ func newTracer(ctx context.Context, otlpEndpoint string) (trace.Tracer, func() e
 		return nil, nil, fmt.Errorf("create exporter: %w", err)
 	}
 
-	resource, err := getOtelResource()
-	if err != nil {
-		return nil, nil, err
-	}
-
 	traceProvider := sdktrace.NewTracerProvider(
 		// sdktrace.WithBatcher(exporter), // recommended over Syncer for production, but our volume is low enough // Add space after //
 		sdktrace.WithSyncer(exporter),
-		sdktrace.WithResource(resource),
+		sdktrace.WithResource(sdkresource.Default()),
 	)
 	cleanup := func() error {
 		return traceProvider.Shutdown(ctx)
@@ -53,12 +47,4 @@ func newTracer(ctx context.Context, otlpEndpoint string) (trace.Tracer, func() e
 	tracer := traceProvider.Tracer("sqlq_test")
 
 	return tracer, cleanup, nil
-}
-func getOtelResource() (*sdkresource.Resource, error) {
-	return sdkresource.Merge(
-		sdkresource.Default(),
-		sdkresource.NewWithAttributes(
-			semconv.SchemaURL,
-		),
-	)
 }

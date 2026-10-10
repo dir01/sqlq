@@ -223,6 +223,7 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 // InsertJob inserts a new job into the SQLite jobs table.
 func (d *SQLiteDriver) insertJob(
 	ctx context.Context,
+	tx *sql.Tx,
 	jobType string,
 	payload []byte,
 	delay time.Duration,
@@ -236,8 +237,15 @@ func (d *SQLiteDriver) insertJob(
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	var executor sqlExecutor = d.db
+	if tx != nil {
+		// A caller-owned transaction may already hold SQLite's write lock.
+		// Taking dbMutex here could deadlock with a queue operation waiting on it.
+		executor = tx
+	} else {
+		d.dbMutex.Lock()
+		defer d.dbMutex.Unlock()
+	}
 
 	traceContextJSON := []byte("")
 	if len(traceContext) > 0 {
@@ -259,21 +267,27 @@ func (d *SQLiteDriver) insertJob(
 	if delay <= 0 {
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (?, ?, ?, ?, ?) RETURNING id
+			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
 	} else {
 		scheduledMs := nowMs + delay.Milliseconds()
 		query = `
 			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
-			VALUES (?, ?, ?, ?, ?) RETURNING id
+			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
 	}
 
-	var id int64
-	if err := d.db.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
+	if _, err := executor.ExecContext(ctx, query, args...); err != nil {
 		span.RecordError(err)
+		return err
+	}
+
+	if tx != nil {
+		// The caller has not committed yet. Polling will discover the job after
+		// commit; a push here could wake a consumer before the row is visible.
+		return nil
 	}
 
 	var notif *sqliteNotificationSubscription
@@ -312,7 +326,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	d.dbMutex.Lock()
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, payload, retry_count, trace_context
+			SELECT id, payload, retry_count, trace_context, created_at
 			FROM jobs
 			WHERE job_type = ?
 			AND scheduled_at <= ?
@@ -332,10 +346,12 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
+			var createdAtMs int64
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs); err != nil {
 				return fmt.Errorf("failed to scan potential job: %w", err) // Return error to rollback
 			}
+			j.CreatedAt = time.UnixMilli(createdAtMs)
 
 			// Deserialize trace context
 			j.TraceContext = make(map[string]string)
@@ -418,7 +434,7 @@ func (d *SQLiteDriver) subscribeForConsumer(_ context.Context, jobType string, t
 }
 
 // markJobProcessed updates the jobs table to mark a job as successfully processed in SQLite.
-func (d *SQLiteDriver) markJobProcessed(ctx context.Context, jobID int64) error {
+func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -426,12 +442,9 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, jobID int64) error 
 
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
-
 	nowMs := time.Now().UnixMilli()
 
-	res, err := d.db.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET processed_at = ? WHERE id = ? AND consumed_at IS NOT NULL AND processed_at IS NULL`,
 		nowMs, jobID,
 	)
@@ -441,20 +454,18 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, jobID int64) error 
 		return err
 	}
 
-	rowsAffected, _ := res.RowsAffected()
-	if rowsAffected == 0 {
-		// This could happen if:
-		// 1. The job was already marked processed (processed_at IS NOT NULL).
-		// 2. The job was not consumed (consumed_at IS NULL).
-		// 3. The job failed and was rescheduled (consumed_at became NULL).
-		// 4. The job ID is incorrect.
-		// Log this as it might indicate an unexpected state or double processing attempt.
-		span.AddEvent("MarkJobProcessed found no matching 'consumed' row (consumed_at IS NOT NULL, processed_at IS NULL) to update", trace.WithAttributes(
-			attribute.Int64("sqlq.job_id", jobID),
-		))
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	if rowsAffected != 1 {
+		err := fmt.Errorf("job %d is no longer claimed or was already processed", jobID)
+		span.RecordError(err)
+		return err
 	}
 
-	return nil // Return nil even if rowsAffected is 0, goal is idempotency
+	return nil
 }
 
 // markJobFailedAndReschedule updates a job's state to failed, increments the retry count,
@@ -519,7 +530,8 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
-func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error {
+// inTx runs while dbMutex is held, so it must not call driver methods that take it.
+func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.original_job_id", jobID), // Use original_job_id in attribute
@@ -583,6 +595,13 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, r
 	}
 
 	// No need to delete from job_consumers
+
+	if inTx != nil {
+		if err = inTx(tx); err != nil {
+			span.RecordError(err)
+			return err // Rollback will happen
+		}
+	}
 
 	err = tx.Commit()
 	if err != nil {

@@ -1,6 +1,10 @@
 package sqlq
 
-import "time"
+import (
+	"context"
+	"database/sql"
+	"time"
+)
 
 // ConsumerOption defines functional options for Subscribe
 type ConsumerOption func(*consumer)
@@ -113,7 +117,7 @@ func WithConsumerCleanupDLQAge(age time.Duration) ConsumerOption {
 }
 
 // WithAsyncPush enables async push in supported drivers.
-// By deafult, consumer only recieves new jobs via periodic polling.
+// By default, consumer only receives new jobs via periodic polling.
 // If enabled (and chosen driver supports it), hints to perform a poll will arrive
 // right as they happen. You may also rate limit this process with WithAsyncPushRateLimit.
 func WithAsyncPush() ConsumerOption {
@@ -127,5 +131,29 @@ func WithAsyncPush() ConsumerOption {
 func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
 		o.asyncPushMaxRPM = uint16(rpm)
+	}
+}
+
+// DeadLetterHook is called when a job has exhausted its retries, inside the transaction that moves
+// the job to the dead letter queue. handlerErr is the error returned by the final attempt.
+//
+// The move and the hook's writes through tx are committed together, and only if the hook returns nil.
+// The queue owns tx: hooks must not call Commit or Rollback, including in a defer.
+// Return an error to abort the transaction; return nil to allow the queue to commit.
+// If the hook returns an error or panics, the move is rolled back and the job is rescheduled
+// like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
+//
+// ctx is canceled at shutdown and after the consumer's job timeout. A hook whose ctx was canceled
+// counts as failed even if it returns nil.
+//
+// On SQLite the queue's write lock is held while the hook runs, so the hook must write only through tx
+// and must not call queue methods such as Publish: they would wait for that lock forever.
+type DeadLetterHook func(ctx context.Context, tx *sql.Tx, info JobInfo, payload []byte, handlerErr error) error
+
+// WithConsumerOnDeadLetter registers a hook that is called when a job of this type is moved
+// to the dead letter queue. Use it to put domain state into a terminal "failed" state through tx.
+func WithConsumerOnDeadLetter(hook DeadLetterHook) ConsumerOption {
+	return func(o *consumer) {
+		o.onDeadLetter = hook
 	}
 }

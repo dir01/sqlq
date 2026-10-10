@@ -1,164 +1,333 @@
 # SQL Queue
 
-A robust, database-backed job queue system for Go applications that supports SQLite, PostgreSQL, and MySQL.
+`sqlq` is a SQL-backed job queue for Go applications, with SQLite and PostgreSQL
+backends. Publish JSON payloads under a job type, register a handler for that
+type, and let background workers fetch and process them.
 
-## Features
+It supports delayed jobs, configurable worker concurrency, retries with backoff,
+handler timeouts, panic recovery, a dead-letter queue (DLQ), transactional
+dead-letter hooks, automatic cleanup, and OpenTelemetry tracing.
 
-- Simple API for publishing and consuming jobs
-- Support for multiple database backends (SQLite, PostgreSQL, MySQL)
-- Concurrent job processing with configurable worker pools
-- Transaction support for atomic job publishing
-- Durable storage with at-least-once delivery guarantees
-- Configurable polling intervals and prefetch counts
+The current implementation has limitations around recovery of abandoned jobs.
+See [Current behavior and
+limitations](#current-behavior-and-limitations) before relying on those guarantees.
 
 ## Installation
 
-```bash
-go get github.com/dir01/sqlqueue
+Use Go 1.26 or newer. Install the queue and a database driver:
+
+```sh
+go get github.com/dir01/sqlq
+
+# SQLite (requires CGO and a C compiler):
+go get github.com/mattn/go-sqlite3
+
+# Or PostgreSQL; these examples use pgx v5:
+go get github.com/jackc/pgx/v5/stdlib
 ```
 
-## Quick Start
+## How the queue runs
+
+1. Your application opens a `*sql.DB` and passes it to `sqlq.New`.
+2. `Run` creates the queue tables and indexes. It does not start workers.
+3. `Consume` registers a handler and immediately starts workers for its job type.
+4. `Publish` JSON-encodes a payload and inserts a job. Publishing does not wait
+   for the handler to finish.
+5. `Shutdown` cancels consumers and waits for their goroutines. Your application
+   closes the database afterward.
+
+There can be one `Consume` registration per job type on a queue instance.
+Registering the same type twice returns `ErrDuplicateConsumer`. Increase the
+consumer's concurrency to run more workers. Separate instances using the same
+database compete for jobs; they do not each receive a copy.
+
+Transaction ownership determines who commits:
+
+| Where `tx` comes from | Who commits or rolls it back? |
+| --- | --- |
+| The argument passed to a consumer handler | The queue. The handler must never call `Commit` or `Rollback`, including in a `defer`. |
+| The argument passed to a dead-letter hook | The queue. The hook must never call `Commit` or `Rollback`, including in a `defer`. |
+| Your application's own `db.BeginTx` call | Your application, including when passing that transaction to `PublishTx`. |
+
+In a handler or hook, use the supplied `tx` for database work and return `nil`
+on success or an error on failure. The queue completes the transaction after
+the callback returns. Returning `nil` permits a commit; cancellation or a
+later database error can still fail the attempt.
+
+Calling `PublishTx(ctx, tx, ...)` does not transfer ownership. When you pass a
+handler's or hook's transaction, let the queue commit the new job with the
+other writes. Do not commit it yourself. A separate transaction you create
+inside a callback belongs to you, but its commits cannot be rolled back with
+the queue's transaction.
+
+If a callback commits the supplied transaction early, its writes are already
+permanent. The queue's subsequent operations fail with `sql.ErrTxDone`, and
+retry handling may run the callback again. The queue cannot undo that early
+commit or preserve atomic completion in that case.
+
+## 1. Start a SQLite queue
+
+Open a database, start the queue, register a handler, then publish. `Publish`
+returns after insertion, not after processing. Shut down the queue before closing
+the database.
 
 ```go
-package main
+q, _ := sqlq.New(db, sqlq.DBTypeSQLite)
+q.Run()
+q.Consume(ctx, "greeting", handleGreeting)
+q.Publish(ctx, "greeting", "hello")
+// On shutdown: q.Shutdown(), then db.Close()
+```
 
-import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"log"
-	"time"
+Handlers receive JSON bytes. Return `nil` for success or an error for retry/DLQ
+handling. `Run` creates the schema but reports schema errors only through tracing.
+[Full SQLite demo](demo/basic-sqlite/README.md).
 
-	"github.com/dir01/sqlqueue"
-	_ "github.com/mattn/go-sqlite3"
-)
+## 2. Use PostgreSQL
 
-type MyPayload struct {
-	Message string `json:"message"`
-	Count   int    `json:"count"`
+The queue calls stay the same. Open a `pgx` SQL connection and select the
+PostgreSQL backend.
+
+```go
+db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+q, _ := sqlq.New(db, sqlq.DBTypePostgres)
+```
+
+Point `DATABASE_URL` at an existing database. PostgreSQL uses `SKIP LOCKED`
+when workers claim jobs. [Full PostgreSQL demo](demo/postgres/README.md).
+
+## 3. Publish a structured payload
+
+`Publish` JSON-encodes the value; the handler decodes it into the same shape.
+
+```go
+type WelcomeEmail struct { Address, Name string }
+q.Publish(ctx, "welcome_email", WelcomeEmail{"alex@example.com", "Alex"})
+// Handler: json.Unmarshal(payload, &email)
+```
+
+Register one handler for each job type.
+[Full structured-payload demo](demo/structured-payload/README.md).
+
+## 4. Delay a job
+
+```go
+q.Publish(ctx, "reminder", "check the oven", sqlq.WithDelay(5*time.Second))
+```
+
+The delay is the earliest eligible time; polling and worker availability can
+make execution later. [Full delay demo](demo/delay/README.md).
+
+## 5. Retry a failure and inspect the attempt
+
+```go
+q.Consume(ctx, "retry_demo", handler,
+    sqlq.WithConsumerMaxRetries(2),
+    sqlq.WithConsumerBackoffFunc(func(uint16) time.Duration { return time.Second }))
+// In handler: info, _ := sqlq.JobInfoFromContext(ctx)
+// info.RetryCount is 0 on the first attempt.
+```
+
+Two retries allow three attempts total. A failure on `info.IsFinalAttempt()`
+moves the job to the DLQ; success completes it. Panics use the same failure
+path. [Full retry demo](demo/retry/README.md).
+
+## 6. Process jobs concurrently
+
+```go
+q.Consume(ctx, "numbered_job", handler,
+    sqlq.WithConsumerConcurrency(3),
+    sqlq.WithConsumerPrefetchCount(6))
+```
+
+Concurrency caps active handler calls. Prefetch sets fetch size and buffer
+capacity, and is raised to at least concurrency; it is not a total cap on
+claimed jobs. [Full concurrency demo](demo/concurrency/README.md).
+
+## 7. Stop work at its deadline
+
+```go
+q.Consume(ctx, "slow_job", handler,
+    sqlq.WithConsumerJobTimeout(time.Second),
+    sqlq.WithConsumerMaxRetries(0))
+// Handler: select on ctx.Done() while doing cancellable work.
+```
+
+Timeouts cancel the handler context; they cannot interrupt work that ignores
+it. A handler returning `nil` after its deadline still fails.
+[Full timeout demo](demo/timeout/README.md).
+
+## 8. Inspect dead-letter jobs
+
+```go
+jobs, _ := q.GetDeadLetterJobs(ctx, "slow_job", 10)
+// Each job includes OriginalID, RetryCount, FailedAt, FailureReason, Payload.
+```
+
+An empty type selects all types. Results are newest first; a zero limit returns
+no rows. [Full DLQ inspection demo](demo/inspect-dlq/README.md).
+
+## 9. Requeue a failure
+
+```go
+jobs, _ := q.GetDeadLetterJobs(ctx, "slow_job", 1)
+q.RequeueDeadLetterJob(ctx, jobs[0].OriginalID)
+```
+
+Fix the handler first. Requeue removes the DLQ row and inserts a new pending
+job with a new ID, zero retries, and no inherited trace context. A missing row
+returns `ErrJobNotFound`. [Full requeue demo](demo/requeue-dlq/README.md).
+
+## 10. Record terminal failure atomically
+
+A dead-letter hook shares the transaction that moves the job into the DLQ.
+
+```go
+onDeadLetter := func(ctx context.Context, tx *sql.Tx,
+    info sqlq.JobInfo, payload []byte, cause error) error {
+    _, err := tx.ExecContext(ctx, "INSERT INTO failed_tasks ...", info.ID)
+    return err
 }
-
-func main() {
-	// Open a database connection
-	db, err := sql.Open("sqlite3", "file:queue.db?cache=shared")
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	// Create a queue with 500ms polling interval
-	queue, err := sqlqueue.NewSQLQueue(db, sqlqueue.DBTypeSQLite, 500*time.Millisecond)
-	if err != nil {
-		log.Fatalf("Failed to create queue: %v", err)
-	}
-
-	// Start the queue
-	queue.Run()
-	defer queue.Shutdown()
-
-	// Subscribe to jobs
-	queue.Subscribe(
-		context.Background(),
-		"example_job",
-		"example_consumer",
-		func(ctx context.Context, payloadBytes []byte) error {
-			var payload MyPayload
-			if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-				return err
-			}
-			
-			log.Printf("Received job: %s (count: %d)", payload.Message, payload.Count)
-			return nil
-		},
-		// Optional: Configure concurrency and prefetch
-		sqlqueue.WithConcurrency(5),
-		sqlqueue.WithPrefetchCount(10),
-	)
-
-	// Publish a job
-	err = queue.Publish(
-		context.Background(),
-		"example_job",
-		MyPayload{Message: "Hello, World!", Count: 42},
-	)
-	if err != nil {
-		log.Fatalf("Failed to publish job: %v", err)
-	}
-
-	// Keep the program running
-	select {}
-}
+q.Consume(ctx, "terminal_task", handler,
+    sqlq.WithConsumerMaxRetries(0),
+    sqlq.WithConsumerOnDeadLetter(onDeadLetter))
 ```
 
-## Usage
+Return an error to roll back the hook's writes and DLQ move. Never commit or
+roll back its supplied `tx`. On SQLite, use that `tx` for writes inside the
+hook; queue methods such as `Publish` can deadlock there.
+[Full dead-letter hook demo](demo/dead-letter-hook/README.md).
 
-### Creating a Queue
+## 11. Wake a SQLite consumer on publish
 
 ```go
-// SQLite
-db, _ := sql.Open("sqlite3", "file:queue.db?cache=shared")
-queue, _ := sqlqueue.NewSQLQueue(db, sqlqueue.DBTypeSQLite, 1*time.Second)
-
-// PostgreSQL
-db, _ := sql.Open("postgres", "postgres://user:password@localhost/dbname?sslmode=disable")
-queue, _ := sqlqueue.NewSQLQueue(db, sqlqueue.DBTypePostgres, 1*time.Second)
-
-// MySQL
-db, _ := sql.Open("mysql", "user:password@tcp(localhost:3306)/dbname")
-queue, _ := sqlqueue.NewSQLQueue(db, sqlqueue.DBTypeMySQL, 1*time.Second)
+q.Consume(ctx, "notification", handler,
+    sqlq.WithAsyncPush(),
+    sqlq.WithAsyncPushRateLimit(60))
 ```
 
-### Publishing Jobs
+Push hints work only within one SQLite driver instance. Polling still handles
+delays, retries, requeues, transactional publications, missed hints, and
+external writes. PostgreSQL returns `ErrPushNotSupported`. The current poll
+option spelling is `WithConsumerPollInteval`.
+[Full SQLite push demo](demo/sqlite-push/README.md).
+
+## 12. Choose retention periods
 
 ```go
-// Simple publish
-err := queue.Publish(ctx, "job_type", payload)
+q.Consume(ctx, "report", handler,
+    sqlq.WithConsumerCleanupProcessedAge(24*time.Hour),
+    sqlq.WithConsumerCleanupBatch(100),
+    sqlq.WithConsumerCleanupDLQInterval(0)) // Disable DLQ cleanup.
+```
 
-// Publish within a transaction
+Cleanup runs only for registered job types. A nonpositive interval disables a
+cleanup loop; zero age does not.
+[Full cleanup demo](demo/cleanup/README.md).
+
+## 13. Save an order and publish its job together
+
+```go
 tx, _ := db.BeginTx(ctx, nil)
-err := queue.PublishTx(ctx, tx, "job_type", payload)
-// ... other operations in the same transaction
+defer tx.Rollback()
+orderID := insertOrder(ctx, tx)
+q.PublishTx(ctx, tx, "process_order", orderID)
 tx.Commit()
 ```
 
-### Subscribing to Jobs
+`PublishTx` uses your transaction and never finishes it. If you created it,
+you commit or roll it back. A handler's or hook's supplied transaction belongs
+to the queue. The job is visible after commit; SQLite discovers transactional
+publications through polling. [Full transaction demo](demo/publish-tx/README.md).
 
-```go
-queue.Subscribe(
-    ctx,
-    "job_type",
-    "consumer_name",
-    func(ctx context.Context, payloadBytes []byte) error {
-        // Process the job
-        return nil
-    },
-    // Optional configuration
-    sqlqueue.WithConcurrency(10),
-    sqlqueue.WithPrefetchCount(20),
-)
+## Configuration reference
+
+`sqlq.New` accepts `WithDefault...` options. `Consume` copies those defaults,
+then applies `WithConsumer...` overrides. `Publish` and `PublishTx` accept
+`WithDelay`. The starter sets concurrency and prefetch to one for clarity;
+the library defaults are:
+
+| Setting | Default | Queue option | Consumer option |
+| --- | --- | --- | --- |
+| Poll interval | 100 ms | `WithDefaultPollInterval` | `WithConsumerPollInteval` |
+| Concurrency | min(NumCPU, GOMAXPROCS) | `WithDefaultConcurrency` | `WithConsumerConcurrency` |
+| Prefetch | Initial default concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
+| Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
+| Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
+| Retry delay | Exponential backoff with jitter | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
+| Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
+| Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |
+| DLQ cleanup interval | 6 hours | `WithDefaultCleanupDLQInterval` | `WithConsumerCleanupDLQInterval` |
+| DLQ retention | 30 days after failure | `WithDefaultCleanupDLQAge` | `WithConsumerCleanupDLQAge` |
+| Cleanup batch | 500 | `WithDefaultCleanupBatch` | `WithConsumerCleanupBatch` |
+
+Consumer-only options include `WithConsumerOnDeadLetter`, `WithAsyncPush`, and
+`WithAsyncPushRateLimit`. `WithTracer` is a queue option. Configure a global
+OpenTelemetry tracer provider and text-map propagator to export traces and
+carry publisher context into handlers; driver tracers use the global provider.
+See `./sqlq_testutils_otel_test.go:17` for tracing setup used by the tests.
+
+## Storage
+
+`Run` creates two tables and their indexes using SQL embedded in the drivers.
+It uses `CREATE TABLE IF NOT EXISTS`, not a versioned migration system.
+
+| Table | Contents |
+| --- | --- |
+| `jobs` | `id`, `job_type`, JSON `payload`, `created_at`, `scheduled_at`, `retry_count`, `last_error`, `trace_context`, `consumed_at`, `processed_at`. |
+| `dead_letter_queue` | `original_job_id` (primary key), `job_type`, `payload`, `created_at`, `failed_at`, `retry_count`, `failure_reason`. |
+
+A due job is claimed by setting `consumed_at`. Success sets `processed_at`;
+the row remains until cleanup. A retry increments the retry count, schedules
+another attempt, and clears the claim. A DLQ move inserts the failure and
+deletes the original job in a transaction. SQLite stores timestamps as Unix
+milliseconds; PostgreSQL uses SQL timestamps.
+
+Schema definitions: `./driver_sqlite.go:51` and `./driver_postgres.go:33`.
+
+## Current behavior and limitations
+
+These details describe the implementation in this checkout:
+
+- **Handler writes and completion share a transaction.** Use the supplied `tx`
+  for database writes, and let the queue commit or roll it back. Success commits
+  those writes together with job completion. Handler errors, panics, timeouts,
+  and completion-update failures roll back the attempt. Completion and commit
+  errors enter the retry/DLQ path. External side effects are outside this
+  transaction and should be safe to repeat.
+- **Claims have no expiry or automatic recovery.** A crash or shutdown after
+  claiming can leave jobs with `consumed_at` set and no worker to finish them.
+  Shutdown does not drain or release every prefetched claim. Durable rows alone
+  do not provide an at-least-once guarantee across crashes. Make handler side
+  effects safe to repeat when retries or manual requeues do occur.
+  See `./consumer.go:136` and `./driver_postgres.go:250`.
+- **Cancellation is cooperative.** Ordinary handler contexts are not currently
+  children of the `Consume` context; their job timeout still applies. DLQ hooks
+  explicitly receive shutdown cancellation. A callback that ignores its context
+  can keep shutdown waiting. See `./consumer.go:174` and `./consumer.go:378`.
+- **Schema setup errors are visible only in tracing.** `Run` records schema
+  errors without returning them. See `./sqlq.go:197`.
+
+## Development
+
+CI builds, lints, and tests on the latest patch releases of Go 1.26 and 1.27.
+`make lint` uses the golangci-lint version recorded in `go.mod`.
+
+The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
+suite starts a database through Testcontainers and requires Docker. Integration
+tests export traces to localhost:4318; the Makefile provides a Jaeger command.
+
+```sh
+make build
+make start-jaeger
+make test-short  # Race detector; skips PostgreSQL.
+make test        # Race detector; includes PostgreSQL via Docker.
+make lint
 ```
 
-## Configuration Options
-
-### Subscription Options
-
-- `WithConcurrency(n int)`: Sets the number of concurrent workers for a subscription (default: number of CPUs)
-- `WithPrefetchCount(n int)`: Sets the number of jobs to prefetch in a single query (default: same as concurrency)
-
-## Database Schema
-
-The system uses two tables:
-
-1. `jobs` - Stores job information:
-   - `id` - Primary key
-   - `job_type` - Type of job
-   - `payload` - JSON-encoded job data
-   - `created_at` - Timestamp when the job was created
-
-2. `job_consumers` - Tracks which consumers have processed which jobs:
-   - `job_id` - Foreign key to jobs table
-   - `consumer_name` - Name of the consumer
-   - `processed_at` - Timestamp when the job was processed
+Public API: `./sqlq.go:23`. Consumer runtime: `./consumer.go:49`.
+Dead-letter hook contract: `./options_consumer.go:149`.
+Shared DLQ examples and tests: `./sqlq_testcase_dlq_test.go:287`.
 
 ## License
 

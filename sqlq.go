@@ -12,7 +12,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 
 	"go.opentelemetry.io/otel/trace"
@@ -26,9 +25,15 @@ type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 
 	// PublishTx adds a new job to the queue within an existing transaction.
+	// It never commits or rolls back tx. If you created tx, you must finish it;
+	// if a handler or hook received tx from the queue, the queue finishes it.
+	// A nil tx publishes immediately.
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 
 	// Consume registers a handler function for a specific job type.
+	// The queue owns the handler's transaction: handlers must not commit or roll it back.
+	// Do not defer tx.Rollback either. Return nil on success or an error to abort.
+	// Handler writes and job completion commit together on success; failures roll back.
 	Consume(
 		ctx context.Context,
 		jobType string,
@@ -87,12 +92,12 @@ var (
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
 	db                 *sql.DB
-	dbType             DBType
 	driver             driver
 	defaultBackoffFunc func(retryNum uint16) time.Duration
 	tracer             trace.Tracer
 	consumersMap       map[string]*consumer // jobType -> consumer
-	consumersMapMutex  sync.RWMutex         // guard consumersMap //nolint:revive // Field name is descriptive
+	dbType             DBType
+	consumersMapMutex  sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
 
 	// Function for calculating how much of a delay to use when rescheduling a failed job.
 	// This is a default that will be used for all consumers
@@ -212,37 +217,14 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 	)
 	defer span.End()
 
-	tx, err := q.db.BeginTx(ctx, nil)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "failed to begin transaction")
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent(
-				"Failed to rollback transaction in Publish",
-				trace.WithAttributes(attribute.String("error", rErr.Error())),
-			)
-		}
-	}()
-
-	if err = q.PublishTx(ctx, tx, jobType, payload, opts...); err != nil {
-		// PublishTx already records its internal errors in its own span
-		return err
-	}
-
-	if err = tx.Commit(); err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
+	return q.PublishTx(ctx, nil, jobType, payload, opts...)
 }
 
 // PublishTx adds a new job to the queue within an existing transaction.
-func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
+// It never commits or rolls back tx. If you created tx, you must finish it;
+// if a handler or hook received tx from the queue, the queue finishes it.
+// A nil tx publishes immediately.
+func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish_tx",
 		trace.WithAttributes(
 			attribute.String("sqlq.job_type", jobType),
@@ -269,7 +251,7 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 	traceContextMap := propagation.MapCarrier(make(map[string]string))
 	otel.GetTextMapPropagator().Inject(ctx, traceContextMap)
 
-	err = q.driver.insertJob(ctx, jobType, payloadBytes, options.delay, traceContextMap)
+	err = q.driver.insertJob(ctx, tx, jobType, payloadBytes, options.delay, traceContextMap)
 	if err != nil {
 		// The driver method should record the specific DB error in its span. We record a higher-level error here.
 		span.RecordError(err)
@@ -280,6 +262,9 @@ func (q *sqlq) PublishTx(ctx context.Context, _ *sql.Tx, jobType string, payload
 }
 
 // Consume registers a handler for a specific job type.
+// The queue commits the handler's transaction together with job completion on success,
+// and rolls it back on failure. Handlers must not commit or roll back the transaction.
+// Do not defer tx.Rollback either. Return nil on success or an error to abort.
 // ctx passed to handler will be a child of ctx passed to Consume.
 // Registering multiple handlers for same jobType will cause ErrDuplicateConsumer.
 func (q *sqlq) Consume(
@@ -311,6 +296,7 @@ func (q *sqlq) Consume(
 		cleanupDLQAge:            q.defaultCleanupDLQAge,
 		asyncPushEnabled:         false,
 		asyncPushMaxRPM:          0,
+		onDeadLetter:             nil,
 		// Initialize consumer-specific fields
 		jobsChan: nil, // Will be initialized below
 		workerWg: sync.WaitGroup{},

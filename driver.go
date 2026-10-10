@@ -25,8 +25,9 @@ type driver interface {
 		}
 	*/
 
-	// insertJob executes the query for inserting a job
-	insertJob(ctx context.Context, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
+	// insertJob inserts through tx when provided, otherwise through the database.
+	// The caller owns committing or rolling back tx.
+	insertJob(ctx context.Context, tx *sql.Tx, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
 	// getJobsForConsumer executes the query for finding jobs for a consumer
 	// Jobs returned once should not be returned unless they were explicitly rescheduled
@@ -35,16 +36,18 @@ type driver interface {
 	// subscribeForConsumer will post new jobs to a channel according to tokenBucket
 	subscribeForConsumer(ctx context.Context, jobType string, tokenBucket *tokenBucket) (<-chan struct{}, error)
 
-	// markJobProcessed executes the query for marking a job as processed
+	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	markJobProcessed(ctx context.Context, jobID int64) error
+	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	// Rescheduled jobs can be returned to consumers again
 	markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
 
-	// moveToDeadLetterQueue moves a job to the dead letter queue
-	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string) error
+	// moveToDeadLetterQueue moves a job to the dead letter queue.
+	// If inTx is not nil, it is called in the same transaction after the move,
+	// and an error from it rolls the move back and is returned.
+	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error
 
 	// getDeadLetterJobs retrieves jobs from the dead letter queue
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
@@ -59,6 +62,11 @@ type driver interface {
 	// cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
+}
+
+// sqlExecutor is implemented by both *sql.DB and *sql.Tx.
+type sqlExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 // getDriver returns the appropriate driver for the given database type

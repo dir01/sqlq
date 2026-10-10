@@ -1,6 +1,7 @@
 package sqlq_test
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -8,35 +9,42 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestSQLite(t *testing.T) {
 	t.Parallel() // Run top-level test in parallel
 
-	db, err := otelsql.Open("sqlite3", "file:memdb1?mode=memory&cache=shared")
-	require.NoError(t, err, "Failed to open SQLite database")
-
-	tracerCtx := GracefulContext(t.Context(), 10*time.Millisecond)
+	tracerCtx := GracefulContext(t.Context(), 1*time.Second) // Leaves the tracer time to shut down
 	tracer, stopTracer, err := newTracer(tracerCtx, "localhost:4318")
 	require.NoError(t, err)
 
-	q, err := sqlq.New(
-		db, sqlq.DBTypeSQLite,
-		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
-		sqlq.WithDefaultPollInterval(25*time.Millisecond),
-		sqlq.WithTracer(tracer),
-	)
-	require.NoError(t, err)
+	tc := newSQLiteTestCase(t, "memdb1", tracer)
 
-	q.Run()
-
+	// Registered after the queue's cleanup so it runs first, before tracerCtx's grace period ends
 	t.Cleanup(func() {
 		assert.NoError(t, stopTracer())
-		q.Shutdown()
-		assert.NoError(t, db.Close())
 	})
 
-	tc := &TestCase{Q: q}
+	// Dead-letter hook tests hold write transactions while exercising failures and
+	// timeouts, so each gets a database of its own to avoid delaying unrelated tests.
+	t.Run("Dead letter hook and job info", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQHook")
+		defer span.End()
+
+		newSQLiteTestCase(t, "memdb_dlq_hook", tracer).TestDLQHook(ctx, t)
+	})
+
+	t.Run("Failed dead letter hook rolls back and retries", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestDLQHookFailure")
+		defer span.End()
+
+		newSQLiteTestCase(t, "memdb_dlq_hook_failure", tracer).TestDLQHookFailure(ctx, t)
+	})
 
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
@@ -119,6 +127,15 @@ func TestSQLite(t *testing.T) {
 		tc.TestDLQGet(ctx, t)
 	})
 
+	t.Run("Handler panic is recovered", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestPanic")
+		defer span.End()
+
+		tc.TestPanic(ctx, t)
+	})
+
 	t.Run("Fetching Dead Letter Queue jobs respects limits", func(t *testing.T) {
 		t.Parallel()
 
@@ -127,4 +144,31 @@ func TestSQLite(t *testing.T) {
 
 		tc.TestDLQGetLimit(ctx, t)
 	})
+}
+
+// newSQLiteTestCase opens an isolated database and starts a queue on it.
+func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCase {
+	t.Helper()
+
+	// WAL and a busy timeout let concurrent transactions wait for SQLite's writer
+	// lock. Shared-cache in-memory databases instead fail immediately with SQLITE_LOCKED.
+	db, err := otelsql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), dbName+".db")+"?_journal_mode=WAL&_busy_timeout=1000")
+	require.NoError(t, err, "Failed to open SQLite database")
+
+	q, err := sqlq.New(
+		db, sqlq.DBTypeSQLite,
+		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
+		sqlq.WithDefaultPollInterval(25*time.Millisecond),
+		sqlq.WithTracer(tracer),
+	)
+	require.NoError(t, err)
+
+	q.Run()
+
+	t.Cleanup(func() {
+		q.Shutdown()
+		assert.NoError(t, db.Close())
+	})
+
+	return &TestCase{Q: q, DB: db}
 }

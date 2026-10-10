@@ -2,6 +2,7 @@ package sqlq
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,8 +13,9 @@ import (
 func TestDriverSQLite(t *testing.T) {
 	t.Parallel()
 
-	db, err := sql.Open("sqlite3", "file:memdb1?mode=memory&cache=shared")
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "queue.db")+"?_journal_mode=WAL&_busy_timeout=1000")
 	require.NoError(t, err, "Failed to open SQLite database")
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	driver := newSQLiteDriver(db)
 
@@ -29,7 +31,7 @@ func TestDriverSQLite(t *testing.T) {
 		expectedScheduledAt := time.Now().Add(delay)
 		jobType := "insert_with_delay"
 
-		err := driver.insertJob(t.Context(), jobType, payload, delay, traceContext)
+		err := driver.insertJob(t.Context(), nil, jobType, payload, delay, traceContext)
 		require.NoError(t, err)
 
 		var job struct {
@@ -65,7 +67,7 @@ func TestDriverSQLite(t *testing.T) {
 		ctx := t.Context()
 		jobType := "GetJobsForConsumer"
 
-		err := driver.insertJob(ctx, jobType, payload, 0, traceContext)
+		err := driver.insertJob(ctx, nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
 		jobs, err := driver.getJobsForConsumer(ctx, jobType, 10)
@@ -81,7 +83,7 @@ func TestDriverSQLite(t *testing.T) {
 	t.Run("GetJobsForConsumer - delay", func(t *testing.T) {
 		t.Parallel() // Run subtest in parallel
 		jobType := "GetJobsForConsumer - delay"
-		err := driver.insertJob(t.Context(), jobType, payload, 30*time.Minute, traceContext)
+		err := driver.insertJob(t.Context(), nil, jobType, payload, 30*time.Minute, traceContext)
 		require.NoError(t, err)
 
 		jobs, err := driver.getJobsForConsumer(t.Context(), jobType, 10)
@@ -96,7 +98,7 @@ func TestDriverSQLite(t *testing.T) {
 		now := time.Now()
 		nowMs := now.UnixMilli()
 
-		err := driver.insertJob(t.Context(), jobType, payload, 0, traceContext)
+		err := driver.insertJob(t.Context(), nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
 		// Directly check the database to verify timestamps are stored as milliseconds
@@ -130,7 +132,7 @@ func TestDriverSQLite(t *testing.T) {
 		// Test millisecond precision by inserting multiple jobs quickly
 		// Add a small sleep between insertions to ensure we get different timestamps
 		for range 3 { // Use integer range loop
-			err = driver.insertJob(t.Context(), "precision_test", payload, 0, traceContext)
+			err = driver.insertJob(t.Context(), nil, "precision_test", payload, 0, traceContext)
 			require.NoError(t, err)
 			// Sleep a tiny amount to ensure different timestamps
 			time.Sleep(time.Millisecond)
@@ -167,7 +169,7 @@ func TestDriverSQLite(t *testing.T) {
 	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
 		t.Parallel() // Run subtest in parallel
 		jobType := "concurrent_race_test"
-		err := driver.insertJob(t.Context(), jobType, payload, 0, traceContext)
+		err := driver.insertJob(t.Context(), nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err, "Failed to insert job for race test")
 
 		// Simulate first consumer fetching the job
@@ -190,7 +192,9 @@ func TestDriverSQLite(t *testing.T) {
 		// If the assertion failed (current state), the following lines might
 		// not be reached, or jobs2 might contain the same job.
 
-		err = driver.markJobProcessed(t.Context(), jobID1) // Removed consumerName argument
+		err = runInTx(t.Context(), db, func(tx *sql.Tx) error {
+			return driver.markJobProcessed(t.Context(), tx, jobID1)
+		})
 		require.NoError(t, err, "Marking job processed for the first time failed")
 
 		// If jobs2 incorrectly contained the job, attempting to mark it
