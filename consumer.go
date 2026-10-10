@@ -50,22 +50,18 @@ type consumer struct {
 
 // start launches the polling, worker, and cleanup goroutines for the consumer.
 func (cons *consumer) start() {
-	cons.workerWg.Add(1)
-	go cons.fetchJobsLoop()
+	cons.workerWg.Go(cons.fetchJobsLoop)
 
 	for range cons.concurrency {
-		cons.workerWg.Add(1)
-		go cons.workerLoop()
+		cons.workerWg.Go(cons.workerLoop)
 	}
 
 	if cons.cleanupProcessedInterval > 0 {
-		cons.workerWg.Add(1)
-		go cons.runProcessedCleanupLoop()
+		cons.workerWg.Go(cons.runProcessedCleanupLoop)
 	}
 
 	if cons.cleanupDLQInterval > 0 {
-		cons.workerWg.Add(1)
-		go cons.runDLQCleanupLoop()
+		cons.workerWg.Go(cons.runDLQCleanupLoop)
 	}
 }
 
@@ -87,8 +83,6 @@ func (cons *consumer) shutdown() {
 
 // fetchJobsLoop periodically fetches jobs from the database and sends them to the jobs channel.
 func (cons *consumer) fetchJobsLoop() {
-	defer cons.workerWg.Done()
-
 	ticker := time.NewTicker(cons.pollInterval)
 	defer ticker.Stop()
 
@@ -183,8 +177,6 @@ func (cons *consumer) fetchJobs(ctx context.Context) error {
 
 // workerLoop processes jobs from the jobsChan.
 func (cons *consumer) workerLoop() {
-	defer cons.workerWg.Done()
-
 	for {
 		select {
 		case <-cons.ctx.Done():
@@ -490,8 +482,6 @@ func callRecovering(callback string, f func() error) (err error) {
 
 // runProcessedCleanupLoop periodically cleans up old processed jobs for this consumer.
 func (cons *consumer) runProcessedCleanupLoop() {
-	defer cons.workerWg.Done() // Signal completion
-
 	ticker := time.NewTicker(cons.cleanupProcessedInterval)
 	defer ticker.Stop()
 
@@ -508,8 +498,6 @@ func (cons *consumer) runProcessedCleanupLoop() {
 
 // runDLQCleanupLoop periodically cleans up old DLQ jobs for this consumer.
 func (cons *consumer) runDLQCleanupLoop() {
-	defer cons.workerWg.Done() // Signal completion
-
 	ticker := time.NewTicker(cons.cleanupDLQInterval)
 	defer ticker.Stop()
 

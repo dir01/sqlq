@@ -297,11 +297,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
-		cons.workerWg.Add(1)
-		go func() {
-			defer cons.workerWg.Done()
-			_ = cons.fetchJobs(cons.ctx)
-		}()
+		cons.workerWg.Go(func() { _ = cons.fetchJobs(cons.ctx) })
 		require.Eventually(t, func() bool {
 			cons.claimsMutex.Lock()
 			defer cons.claimsMutex.Unlock()
