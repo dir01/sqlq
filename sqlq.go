@@ -25,11 +25,14 @@ type JobsQueue interface {
 	Publish(ctx context.Context, jobType string, payload any, opts ...PublishOption) error
 
 	// PublishTx adds a new job to the queue within an existing transaction.
-	// The caller commits or rolls back tx. A nil tx publishes immediately.
+	// It never commits or rolls back tx. If you created tx, you must finish it;
+	// if a handler or hook received tx from the queue, the queue finishes it.
+	// A nil tx publishes immediately.
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 
 	// Consume registers a handler function for a specific job type.
 	// The queue owns the handler's transaction: handlers must not commit or roll it back.
+	// Do not defer tx.Rollback either. Return nil on success or an error to abort.
 	// Handler writes and job completion commit together on success; failures roll back.
 	Consume(
 		ctx context.Context,
@@ -218,7 +221,9 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 }
 
 // PublishTx adds a new job to the queue within an existing transaction.
-// The caller commits or rolls back tx. A nil tx publishes immediately.
+// It never commits or rolls back tx. If you created tx, you must finish it;
+// if a handler or hook received tx from the queue, the queue finishes it.
+// A nil tx publishes immediately.
 func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error {
 	ctx, span := q.tracer.Start(ctx, "sqlq.publish_tx",
 		trace.WithAttributes(
@@ -259,6 +264,7 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 // Consume registers a handler for a specific job type.
 // The queue commits the handler's transaction together with job completion on success,
 // and rolls it back on failure. Handlers must not commit or roll back the transaction.
+// Do not defer tx.Rollback either. Return nil on success or an error to abort.
 // ctx passed to handler will be a child of ctx passed to Consume.
 // Registering multiple handlers for same jobType will cause ErrDuplicateConsumer.
 func (q *sqlq) Consume(

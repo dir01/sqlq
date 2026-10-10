@@ -14,7 +14,7 @@ limitations](#current-behavior-and-limitations) before relying on those guarante
 
 ## Installation
 
-Use Go 1.24.1 or newer. Install the queue and a database driver:
+Use Go 1.26 or newer. Install the queue and a database driver:
 
 ```sh
 go get github.com/dir01/sqlq
@@ -22,8 +22,8 @@ go get github.com/dir01/sqlq
 # SQLite (requires CGO and a C compiler):
 go get github.com/mattn/go-sqlite3
 
-# Or PostgreSQL; these examples use pgx v4:
-go get github.com/jackc/pgx/v4/stdlib
+# Or PostgreSQL; these examples use pgx v5:
+go get github.com/jackc/pgx/v5/stdlib
 ```
 
 ## How the queue runs
@@ -41,595 +41,204 @@ Registering the same type twice returns `ErrDuplicateConsumer`. Increase the
 consumer's concurrency to run more workers. Separate instances using the same
 database compete for jobs; they do not each receive a copy.
 
-## 1. Run a complete SQLite example
+Transaction ownership determines who commits:
 
-Save this as `main.go` in a Go module, install the dependencies above, and run
-`go run .`. It creates `queue.db`, publishes the string `"hello"`, and prints
-`received: hello` when the worker handles it. Press Ctrl-C after the message
-appears to shut down the queue and close the database.
+| Where `tx` comes from | Who commits or rolls it back? |
+| --- | --- |
+| The argument passed to a consumer handler | The queue. The handler must never call `Commit` or `Rollback`, including in a `defer`. |
+| The argument passed to a dead-letter hook | The queue. The hook must never call `Commit` or `Rollback`, including in a `defer`. |
+| Your application's own `db.BeginTx` call | Your application, including when passing that transaction to `PublishTx`. |
 
-`runExample` contains the job-specific code. The rest is reusable application
-setup. Later examples replace only `runExample`, unless stated otherwise.
+In a handler or hook, use the supplied `tx` for database work and return `nil`
+on success or an error on failure. The queue completes the transaction after
+the callback returns. Returning `nil` permits a commit; cancellation or a
+later database error can still fail the attempt.
 
-```go
-package main
+Calling `PublishTx(ctx, tx, ...)` does not transfer ownership. When you pass a
+handler's or hook's transaction, let the queue commit the new job with the
+other writes. Do not commit it yourself. A separate transaction you create
+inside a callback belongs to you, but its commits cannot be rolled back with
+the queue's transaction.
 
-import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"log"
-	"os"
-	"os/signal"
-	"syscall"
+If a callback commits the supplied transaction early, its writes are already
+permanent. The queue's subsequent operations fail with `sql.ErrTxDone`, and
+retry handling may run the callback again. The queue cannot undo that early
+commit or preserve atomic completion in that case.
 
-	"github.com/dir01/sqlq"
-	_ "github.com/mattn/go-sqlite3"
-)
+## 1. Start a SQLite queue
 
-func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if err := run(ctx); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func run(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", "file:queue.db?_busy_timeout=5000&_journal_mode=WAL")
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	if err := db.PingContext(ctx); err != nil {
-		return err
-	}
-
-	q, err := sqlq.New(db, sqlq.DBTypeSQLite,
-		sqlq.WithDefaultConcurrency(1),
-		sqlq.WithDefaultPrefetchCount(1),
-	)
-	if err != nil {
-		return err
-	}
-	q.Run()
-	defer q.Shutdown() // Runs before db.Close().
-
-	if err := runExample(ctx, db, q); err != nil {
-		return err
-	}
-
-	log.Print("queue running; press Ctrl-C to stop")
-	<-ctx.Done()
-	return nil
-}
-
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var message string
-		if err := json.Unmarshal(payload, &message); err != nil {
-			return err
-		}
-		log.Printf("received: %s", message)
-		return nil
-	}
-
-	if err := q.Consume(ctx, "greeting", handler); err != nil {
-		return err
-	}
-	return q.Publish(ctx, "greeting", "hello")
-}
-```
-
-The handler receives JSON bytes, even when the published value is just a string.
-Returning nil signals success; returning an error triggers retry or DLQ handling.
-The unused transaction parameter is written as `_ *sql.Tx` in examples that do
-not write application data.
-
-The database file survives restarts. Each run publishes another job, while
-previously completed rows remain until cleanup. `Run` records schema errors in
-tracing but does not return an error; a successful `New` is not a schema check.
-
-## 2. Use PostgreSQL instead
-
-Keep the starter's handler and lifecycle. Replace the SQLite blank import with
-`_ "github.com/jackc/pgx/v4/stdlib"`, and add `fmt` to the imports. Add this helper:
+Open a database, start the queue, register a handler, then publish. `Publish`
+returns after insertion, not after processing. Shut down the queue before closing
+the database.
 
 ```go
-func openPostgres(ctx context.Context) (*sql.DB, error) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		return nil, fmt.Errorf("DATABASE_URL is required")
-	}
-
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
-}
+q, _ := sqlq.New(db, sqlq.DBTypeSQLite)
+q.Run()
+q.Consume(ctx, "greeting", handleGreeting)
+q.Publish(ctx, "greeting", "hello")
+// On shutdown: q.Shutdown(), then db.Close()
 ```
 
-In `run`, replace the `sql.Open(...)` call with `openPostgres(ctx)` and change
-`sqlq.DBTypeSQLite` to `sqlq.DBTypePostgres`. The existing error check and
-`defer db.Close()` stay in place; the second ping can be removed.
+Handlers receive JSON bytes. Return `nil` for success or an error for retry/DLQ
+handling. `Run` creates the schema but reports schema errors only through tracing.
+[Full SQLite demo](demo/basic-sqlite/README.md).
 
-Point `DATABASE_URL` at a running PostgreSQL database, then run the program:
+## 2. Use PostgreSQL
 
-```sh
-export DATABASE_URL='postgres://postgres:postgres@localhost:5432/queue?sslmode=disable'
-go run .
+The queue calls stay the same. Open a `pgx` SQL connection and select the
+PostgreSQL backend.
+
+```go
+db, _ := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+q, _ := sqlq.New(db, sqlq.DBTypePostgres)
 ```
 
-This URL is for a local development database. `Run` creates tables inside an
-existing database; it does not create the database itself. PostgreSQL uses row
-locking with `SKIP LOCKED` when multiple workers claim jobs.
+Point `DATABASE_URL` at an existing database. PostgreSQL uses `SKIP LOCKED`
+when workers claim jobs. [Full PostgreSQL demo](demo/postgres/README.md).
 
 ## 3. Publish a structured payload
 
-Replace `runExample` with the following function and add the `WelcomeEmail`
-type next to it. No new imports are needed. This publishes an address and name,
-decodes them into the same Go type, and logs a welcome message. It does not send
-an actual email; replace the log call with your application's work.
+`Publish` JSON-encodes the value; the handler decodes it into the same shape.
 
 ```go
-type WelcomeEmail struct {
-	Address string `json:"address"`
-	Name    string `json:"name"`
-}
-
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var email WelcomeEmail
-		if err := json.Unmarshal(payload, &email); err != nil {
-			return err
-		}
-		log.Printf("welcome %s; recipient=%s", email.Name, email.Address)
-		return nil
-	}
-
-	if err := q.Consume(ctx, "welcome_email", handler); err != nil {
-		return err
-	}
-
-	email := WelcomeEmail{Address: "alex@example.com", Name: "Alex"}
-	return q.Publish(ctx, "welcome_email", email)
-}
+type WelcomeEmail struct { Address, Name string }
+q.Publish(ctx, "welcome_email", WelcomeEmail{"alex@example.com", "Alex"})
+// Handler: json.Unmarshal(payload, &email)
 ```
 
-Each job type can have a different payload type and handler. To register several
-job types in one application, call `Consume` once for each distinct type.
+Register one handler for each job type.
+[Full structured-payload demo](demo/structured-payload/README.md).
 
 ## 4. Delay a job
 
-Replace `runExample` and add `time` to the starter's imports. This schedules a
-reminder for five seconds in the future. The worker logs it once the job is due.
-
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var reminder string
-		if err := json.Unmarshal(payload, &reminder); err != nil {
-			return err
-		}
-		log.Printf("reminder: %s", reminder)
-		return nil
-	}
-
-	if err := q.Consume(ctx, "reminder", handler); err != nil {
-		return err
-	}
-
-	log.Print("scheduling a reminder for five seconds from now")
-	return q.Publish(ctx, "reminder", "check the oven",
-		sqlq.WithDelay(5*time.Second),
-	)
-}
+q.Publish(ctx, "reminder", "check the oven", sqlq.WithDelay(5*time.Second))
 ```
 
-The delay sets the earliest eligible time, not an exact execution time. Polling
-and available workers determine when the handler actually starts. The schedule
-is stored in the database, so it does not depend on a sleeping Go goroutine.
+The delay is the earliest eligible time; polling and worker availability can
+make execution later. [Full delay demo](demo/delay/README.md).
 
 ## 5. Retry a failure and inspect the attempt
 
-Replace `runExample`, add `errors` and `time`, and remove `encoding/json` if it
-is now unused. This deliberately fails the first two attempts and succeeds on
-the third. It uses the job's stored retry count, so there is no shared counter
-to protect with a mutex.
-
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(ctx context.Context, _ *sql.Tx, _ []byte) error {
-		info, ok := sqlq.JobInfoFromContext(ctx)
-		if !ok {
-			return errors.New("job metadata is missing")
-		}
-
-		log.Printf("job=%d attempt=%d final=%t",
-			info.ID, int(info.RetryCount)+1, info.IsFinalAttempt())
-		if info.RetryCount < 2 {
-			return errors.New("temporary failure for this demo")
-		}
-
-		log.Print("third attempt succeeded")
-		return nil
-	}
-
-	err := q.Consume(ctx, "retry_demo", handler,
-		sqlq.WithConsumerMaxRetries(2),
-		sqlq.WithConsumerBackoffFunc(func(_ uint16) time.Duration {
-			return time.Second
-		}),
-	)
-	if err != nil {
-		return err
-	}
-	return q.Publish(ctx, "retry_demo", "try again")
-}
+q.Consume(ctx, "retry_demo", handler,
+    sqlq.WithConsumerMaxRetries(2),
+    sqlq.WithConsumerBackoffFunc(func(uint16) time.Duration { return time.Second }))
+// In handler: info, _ := sqlq.JobInfoFromContext(ctx)
+// info.RetryCount is 0 on the first attempt.
 ```
 
-`MaxRetries(2)` means one initial attempt plus two retries. `RetryCount` starts
-at zero. Zero maximum retries sends the first failure to the DLQ; -1 allows
-unlimited retries. The default is three retries with exponential backoff and
-jitter. The custom function above uses a fixed one-second delay instead.
+Two retries allow three attempts total. A failure on `info.IsFinalAttempt()`
+moves the job to the DLQ; success completes it. Panics use the same failure
+path. [Full retry demo](demo/retry/README.md).
 
-`IsFinalAttempt` means a failure on this attempt would trigger a DLQ move. A
-successful final attempt completes normally. Handler panics are recovered and
-follow the same failure path as returned errors.
-
-## 6. Process several jobs concurrently
-
-Replace `runExample`; the starter's imports are sufficient. This publishes six
-numbered jobs and lets up to three handler calls run at once. Logs may appear
-in a different order from publication.
+## 6. Process jobs concurrently
 
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var number int
-		if err := json.Unmarshal(payload, &number); err != nil {
-			return err
-		}
-		log.Printf("processing job %d", number)
-		return nil
-	}
-
-	err := q.Consume(ctx, "numbered_job", handler,
-		sqlq.WithConsumerConcurrency(3),
-		sqlq.WithConsumerPrefetchCount(6),
-	)
-	if err != nil {
-		return err
-	}
-
-	for number := 1; number <= 6; number++ {
-		if err := q.Publish(ctx, "numbered_job", number); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+q.Consume(ctx, "numbered_job", handler,
+    sqlq.WithConsumerConcurrency(3),
+    sqlq.WithConsumerPrefetchCount(6))
 ```
 
-Concurrency limits active handler calls for this consumer. Prefetch controls
-the number claimed in a fetch and the buffer capacity; it is raised to at least
-concurrency. It is not a total cap on all claimed work. Handlers that share
-mutable application state must synchronize access to it.
+Concurrency caps active handler calls. Prefetch sets fetch size and buffer
+capacity, and is raised to at least concurrency; it is not a total cap on
+claimed jobs. [Full concurrency demo](demo/concurrency/README.md).
 
-## 7. Stop work when its deadline expires
-
-Replace `runExample`, add `time`, and remove `encoding/json` if unused. The
-simulated operation needs five seconds, but its handler gets a one-second
-budget. It observes cancellation, returns the context error, and goes to the
-DLQ because retries are disabled for this example.
+## 7. Stop work at its deadline
 
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(ctx context.Context, _ *sql.Tx, _ []byte) error {
-		work := time.NewTimer(5 * time.Second)
-		defer work.Stop()
-
-		select {
-		case <-work.C:
-			log.Print("work completed")
-			return nil
-		case <-ctx.Done():
-			log.Printf("work stopped: %v", ctx.Err())
-			return ctx.Err()
-		}
-	}
-
-	err := q.Consume(ctx, "slow_job", handler,
-		sqlq.WithConsumerJobTimeout(time.Second),
-		sqlq.WithConsumerMaxRetries(0),
-	)
-	if err != nil {
-		return err
-	}
-	return q.Publish(ctx, "slow_job", "takes too long")
-}
+q.Consume(ctx, "slow_job", handler,
+    sqlq.WithConsumerJobTimeout(time.Second),
+    sqlq.WithConsumerMaxRetries(0))
+// Handler: select on ctx.Done() while doing cancellable work.
 ```
 
-Timeouts cancel contexts; they cannot forcibly interrupt a callback. Pass the
-handler context to HTTP requests, database calls, and other operations that
-support cancellation. A handler that returns nil after its deadline still
-counts as failed.
+Timeouts cancel the handler context; they cannot interrupt work that ignores
+it. A handler returning `nil` after its deadline still fails.
+[Full timeout demo](demo/timeout/README.md).
 
 ## 8. Inspect dead-letter jobs
 
-After running the timeout example and waiting for its failure, restart the
-starter with this replacement `runExample`. Remove `encoding/json` if unused.
-It queries the same `queue.db`, prints up to ten failures of type `slow_job`,
-and registers no consumer or new job.
-
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	jobs, err := q.GetDeadLetterJobs(ctx, "slow_job", 10)
-	if err != nil {
-		return err
-	}
-	if len(jobs) == 0 {
-		log.Print("no slow_job failures found")
-		return nil
-	}
-
-	for _, job := range jobs {
-		log.Printf("id=%d retries=%d failed_at=%s reason=%s payload=%s",
-			job.OriginalID, job.RetryCount, job.FailedAt,
-			job.FailureReason, job.Payload)
-	}
-	return nil
-}
+jobs, _ := q.GetDeadLetterJobs(ctx, "slow_job", 10)
+// Each job includes OriginalID, RetryCount, FailedAt, FailureReason, Payload.
 ```
 
-Pass an empty job type (`""`) to inspect all types. Results are ordered by failure
-time, newest first. Use a positive limit; zero requests zero rows. The starter
-still waits for Ctrl-C after printing; a one-shot administration program can
-return immediately after this function instead.
+An empty type selects all types. Results are newest first; a zero limit returns
+no rows. [Full DLQ inspection demo](demo/inspect-dlq/README.md).
 
-## 9. Requeue one failure after fixing its handler
-
-This follows the previous two examples and uses the same database. Replace
-`runExample`; retain `encoding/json`. The new `slow_job` handler succeeds, then
-the example requeues only the newest failure of that type. It does nothing if
-there are no matching failures.
+## 9. Requeue a failure
 
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var message string
-		if err := json.Unmarshal(payload, &message); err != nil {
-			return err
-		}
-		log.Printf("fixed handler processed: %s", message)
-		return nil
-	}
-	if err := q.Consume(ctx, "slow_job", handler); err != nil {
-		return err
-	}
-
-	jobs, err := q.GetDeadLetterJobs(ctx, "slow_job", 1)
-	if err != nil {
-		return err
-	}
-	if len(jobs) == 0 {
-		log.Print("nothing to requeue")
-		return nil
-	}
-
-	id := jobs[0].OriginalID
-	if err := q.RequeueDeadLetterJob(ctx, id); err != nil {
-		return err
-	}
-	log.Printf("requeued original job %d", id)
-	return nil
-}
+jobs, _ := q.GetDeadLetterJobs(ctx, "slow_job", 1)
+q.RequeueDeadLetterJob(ctx, jobs[0].OriginalID)
 ```
 
-Requeue atomically removes the DLQ row and inserts a new pending job. The new
-job gets a new ID and creation time, zero retries, and no inherited trace
-context. `ErrJobNotFound` means the original ID is no longer in the DLQ. Fix the
-underlying failure before requeueing; otherwise the new job can fail again.
+Fix the handler first. Requeue removes the DLQ row and inserts a new pending
+job with a new ID, zero retries, and no inherited trace context. A missing row
+returns `ErrJobNotFound`. [Full requeue demo](demo/requeue-dlq/README.md).
 
-## 10. Save application state when a job reaches the DLQ
+## 10. Record terminal failure atomically
 
-Use the SQLite starter for this example. Replace `runExample`, add `errors`,
-and remove `encoding/json` if unused. This creates a small application table,
-publishes an intentionally failing job, and records its terminal failure in
-that table through a dead-letter hook.
-
-The hook receives the same transaction that moves the job into the DLQ. Its
-insert and the DLQ move either commit together or roll back together.
+A dead-letter hook shares the transaction that moves the job into the DLQ.
 
 ```go
-func runExample(ctx context.Context, db *sql.DB, q sqlq.JobsQueue) error {
-	_, err := db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS failed_tasks (
-			job_id INTEGER PRIMARY KEY,
-			reason TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		return err
-	}
-
-	handler := func(_ context.Context, _ *sql.Tx, _ []byte) error {
-		return errors.New("this task cannot be completed")
-	}
-
-	onDeadLetter := func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo,
-		_ []byte, handlerErr error) error {
-		_, err := tx.ExecContext(ctx,
-			"INSERT INTO failed_tasks (job_id, reason) VALUES (?, ?)",
-			info.ID, handlerErr.Error(),
-		)
-		return err
-	}
-
-	err = q.Consume(ctx, "terminal_task", handler,
-		sqlq.WithConsumerMaxRetries(0),
-		sqlq.WithConsumerOnDeadLetter(onDeadLetter),
-	)
-	if err != nil {
-		return err
-	}
-	return q.Publish(ctx, "terminal_task", "will fail")
+onDeadLetter := func(ctx context.Context, tx *sql.Tx,
+    info sqlq.JobInfo, payload []byte, cause error) error {
+    _, err := tx.ExecContext(ctx, "INSERT INTO failed_tasks ...", info.ID)
+    return err
 }
+q.Consume(ctx, "terminal_task", handler,
+    sqlq.WithConsumerMaxRetries(0),
+    sqlq.WithConsumerOnDeadLetter(onDeadLetter))
 ```
 
-After processing, `failed_tasks` and `dead_letter_queue` contain the same
-original job ID. For PostgreSQL, the insert placeholders would be `$1, $2`.
+Return an error to roll back the hook's writes and DLQ move. Never commit or
+roll back its supplied `tx`. On SQLite, use that `tx` for writes inside the
+hook; queue methods such as `Publish` can deadlock there.
+[Full dead-letter hook demo](demo/dead-letter-hook/README.md).
 
-If the hook returns an error, panics, or returns after its context is canceled,
-the move and its writes roll back. The job is rescheduled, its handler runs
-again, and another handler failure triggers the hook again. This can extend
-processing beyond the configured maximum retries. Hooks get a fresh handler
-timeout budget and are canceled on shutdown; they must cooperate with context
-cancellation.
-
-On SQLite, write through the hook's `tx`. Calling queue methods such as
-`Publish` inside the hook can deadlock because the queue's write mutex is
-already held. Ordinary handler writes also commit atomically with job
-completion when they use the supplied transaction.
-
-## 11. Wake a SQLite consumer when a job is published
-
-Replace `runExample` and add `time`. This enables local push hints so the
-consumer can poll early when this queue instance publishes a job. The ordinary
-one-second polling interval remains as a fallback.
+## 11. Wake a SQLite consumer on publish
 
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var message string
-		if err := json.Unmarshal(payload, &message); err != nil {
-			return err
-		}
-		log.Printf("notification: %s", message)
-		return nil
-	}
-
-	err := q.Consume(ctx, "notification", handler,
-		sqlq.WithAsyncPush(),
-		sqlq.WithAsyncPushRateLimit(60),
-		sqlq.WithConsumerPollInteval(time.Second),
-	)
-	if err != nil {
-		return err
-	}
-	return q.Publish(ctx, "notification", "new activity")
-}
+q.Consume(ctx, "notification", handler,
+    sqlq.WithAsyncPush(),
+    sqlq.WithAsyncPushRateLimit(60))
 ```
 
-`WithConsumerPollInteval` is the current API spelling. Push is SQLite-only;
-PostgreSQL returns `ErrPushNotSupported` when it is requested. Notifications
-are best-effort hints within one driver instance. Delayed jobs, retries,
-requeues, transactional publications, missed hints, and external writes still
-rely on polling. The rate
-limit applies to hints, not to the number of jobs processed.
+Push hints work only within one SQLite driver instance. Polling still handles
+delays, retries, requeues, transactional publications, missed hints, and
+external writes. PostgreSQL returns `ErrPushNotSupported`. The current poll
+option spelling is `WithConsumerPollInteval`.
+[Full SQLite push demo](demo/sqlite-push/README.md).
 
-## 12. Choose how long completed jobs and failures are kept
-
-Replace `runExample` and add `time`. This consumer checks hourly for completed
-jobs older than one day, deletes them in batches of 100, and retains its DLQ
-entries indefinitely by disabling automatic DLQ cleanup.
+## 12. Choose retention periods
 
 ```go
-func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var message string
-		if err := json.Unmarshal(payload, &message); err != nil {
-			return err
-		}
-		log.Printf("report: %s", message)
-		return nil
-	}
-
-	err := q.Consume(ctx, "report", handler,
-		sqlq.WithConsumerCleanupProcessedInterval(time.Hour),
-		sqlq.WithConsumerCleanupProcessedAge(24*time.Hour),
-		sqlq.WithConsumerCleanupBatch(100),
-		sqlq.WithConsumerCleanupDLQInterval(0),
-	)
-	if err != nil {
-		return err
-	}
-	return q.Publish(ctx, "report", "daily summary")
-}
+q.Consume(ctx, "report", handler,
+    sqlq.WithConsumerCleanupProcessedAge(24*time.Hour),
+    sqlq.WithConsumerCleanupBatch(100),
+    sqlq.WithConsumerCleanupDLQInterval(0)) // Disable DLQ cleanup.
 ```
 
-Cleanup belongs to a running consumer and affects only its job type. There is
-no queue-wide janitor for unregistered types. Each cleanup pass repeats batches
-until it has removed all eligible rows. A nonpositive cleanup interval disables
-that cleanup loop; setting the age to zero does not disable it.
+Cleanup runs only for registered job types. A nonpositive interval disables a
+cleanup loop; zero age does not.
+[Full cleanup demo](demo/cleanup/README.md).
 
 ## 13. Save an order and publish its job together
 
-Use the SQLite starter and replace `runExample`; no new imports are needed.
-This inserts an order and publishes a job carrying its ID in the same database
-transaction. If either operation fails, the deferred rollback removes both.
-After commit, the example starts a consumer that logs the order ID.
-
 ```go
-func runExample(ctx context.Context, db *sql.DB, q sqlq.JobsQueue) error {
-	_, err := db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS orders (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			description TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		return err
-	}
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() // Harmless after a successful commit.
-
-	result, err := tx.ExecContext(ctx,
-		"INSERT INTO orders (description) VALUES (?)", "a new order")
-	if err != nil {
-		return err
-	}
-	orderID, err := result.LastInsertId()
-	if err != nil {
-		return err
-	}
-
-	if err := q.PublishTx(ctx, tx, "process_order", orderID); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	handler := func(_ context.Context, _ *sql.Tx, payload []byte) error {
-		var orderID int64
-		if err := json.Unmarshal(payload, &orderID); err != nil {
-			return err
-		}
-		log.Printf("processing committed order %d", orderID)
-		return nil
-	}
-	return q.Consume(ctx, "process_order", handler)
-}
+tx, _ := db.BeginTx(ctx, nil)
+defer tx.Rollback()
+orderID := insertOrder(ctx, tx)
+q.PublishTx(ctx, tx, "process_order", orderID)
+tx.Commit()
 ```
 
-The transaction must belong to the queue's database. `PublishTx` neither commits
-nor rolls back it; your code owns that decision. The job becomes visible to
-other connections only after commit. SQLite transactional publications are
-picked up through polling after commit; local push hints apply to ordinary
-`Publish` calls. PostgreSQL supports the same transaction pattern, with its
-own SQL syntax for inserting and returning an order ID.
+`PublishTx` uses your transaction and never finishes it. If you created it,
+you commit or roll it back. A handler's or hook's supplied transaction belongs
+to the queue. The job is visible after commit; SQLite discovers transactional
+publications through polling. [Full transaction demo](demo/publish-tx/README.md).
 
 ## Configuration reference
 
@@ -700,6 +309,9 @@ These details describe the implementation in this checkout:
   errors without returning them. See `./sqlq.go:197`.
 
 ## Development
+
+CI builds, lints, and tests on the latest patch releases of Go 1.26 and 1.27.
+`make lint` uses the golangci-lint version recorded in `go.mod`.
 
 The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
 suite starts a database through Testcontainers and requires Docker. Integration

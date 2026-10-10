@@ -138,6 +138,8 @@ func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 // the job to the dead letter queue. handlerErr is the error returned by the final attempt.
 //
 // The move and the hook's writes through tx are committed together, and only if the hook returns nil.
+// The queue owns tx: hooks must not call Commit or Rollback, including in a defer.
+// Return an error to abort the transaction; return nil to allow the queue to commit.
 // If the hook returns an error or panics, the move is rolled back and the job is rescheduled
 // like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
 //
