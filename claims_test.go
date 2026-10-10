@@ -275,20 +275,27 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("committed and rolled back DLQ moves", func(t *testing.T) {
 		j := seed(1)[0]
+		count := func(query string) int {
+			t.Helper()
+			var n int
+			require.NoError(t, db.QueryRowContext(ctx, query).Scan(&n))
+			return n
+		}
+		inJobs := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d`, j.ID)
+		stillClaimed := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d AND claim_token = '%s'`, j.ID, j.ClaimToken)
+		inDLQ := fmt.Sprintf(`SELECT COUNT(*) FROM dead_letter_queue WHERE original_job_id = %d`, j.ID)
+
 		rejected := fmt.Errorf("hook rejected")
 		require.ErrorIs(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", func(*sql.Tx) error {
 			return rejected
 		}), rejected)
-		var count int
-		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&count))
-		require.Equal(t, 1, count)
-		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dead_letter_queue`).Scan(&count))
-		require.Zero(t, count)
+		require.Equal(t, 1, count(stillClaimed), "a rolled-back move must preserve the original job and its claim")
+		require.Zero(t, count(`SELECT COUNT(*) FROM dead_letter_queue`))
+
 		require.NoError(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", nil))
-		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&count))
-		require.Zero(t, count)
-		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM dead_letter_queue`).Scan(&count))
-		require.Equal(t, 1, count)
+		require.Zero(t, count(inJobs), "a committed move must delete the job")
+		require.Equal(t, 1, count(inDLQ))
+		require.Equal(t, 1, count(`SELECT COUNT(*) FROM dead_letter_queue`))
 	})
 
 	t.Run("canceled delivery releases jobs that never reached the channel", func(t *testing.T) {
