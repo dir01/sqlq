@@ -26,6 +26,12 @@ func TestPostgreSQL(t *testing.T) {
 
 	t.Cleanup(cleanup)
 
+	t.Run("Handler writes and completion share a transaction", func(t *testing.T) {
+		t.Parallel()
+
+		tc.TestConsumerTransaction(t.Context(), t)
+	})
+
 	t.Run("Publishing uses the caller's transaction", func(t *testing.T) {
 		t.Parallel()
 

@@ -2,6 +2,7 @@ package sqlq
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,8 +13,9 @@ import (
 func TestDriverSQLite(t *testing.T) {
 	t.Parallel()
 
-	db, err := sql.Open("sqlite3", "file:memdb1?mode=memory&cache=shared")
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "queue.db")+"?_journal_mode=WAL&_busy_timeout=1000")
 	require.NoError(t, err, "Failed to open SQLite database")
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
 
 	driver := newSQLiteDriver(db)
 
@@ -190,7 +192,9 @@ func TestDriverSQLite(t *testing.T) {
 		// If the assertion failed (current state), the following lines might
 		// not be reached, or jobs2 might contain the same job.
 
-		err = driver.markJobProcessed(t.Context(), jobID1) // Removed consumerName argument
+		err = runInTx(t.Context(), db, func(tx *sql.Tx) error {
+			return driver.markJobProcessed(t.Context(), tx, jobID1)
+		})
 		require.NoError(t, err, "Marking job processed for the first time failed")
 
 		// If jobs2 incorrectly contained the job, attempting to mark it

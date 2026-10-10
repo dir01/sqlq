@@ -29,6 +29,8 @@ type JobsQueue interface {
 	PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payload any, opts ...PublishOption) error
 
 	// Consume registers a handler function for a specific job type.
+	// The queue owns the handler's transaction: handlers must not commit or roll it back.
+	// Handler writes and job completion commit together on success; failures roll back.
 	Consume(
 		ctx context.Context,
 		jobType string,
@@ -255,6 +257,8 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 }
 
 // Consume registers a handler for a specific job type.
+// The queue commits the handler's transaction together with job completion on success,
+// and rolls it back on failure. Handlers must not commit or roll back the transaction.
 // ctx passed to handler will be a child of ctx passed to Consume.
 // Registering multiple handlers for same jobType will cause ErrDuplicateConsumer.
 func (q *sqlq) Consume(

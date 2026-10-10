@@ -8,8 +8,8 @@ It supports delayed jobs, configurable worker concurrency, retries with backoff,
 handler timeouts, panic recovery, a dead-letter queue (DLQ), transactional
 dead-letter hooks, automatic cleanup, and OpenTelemetry tracing.
 
-The current implementation has limitations around handler transactions and
-recovery of abandoned jobs. See [Current behavior and
+The current implementation has limitations around recovery of abandoned jobs.
+See [Current behavior and
 limitations](#current-behavior-and-limitations) before relying on those guarantees.
 
 ## Installation
@@ -496,8 +496,8 @@ cancellation.
 
 On SQLite, write through the hook's `tx`. Calling queue methods such as
 `Publish` inside the hook can deadlock because the queue's write mutex is
-already held. This atomic hook behavior does not apply to ordinary handler
-completion; see the transaction limitations below.
+already held. Ordinary handler writes also commit atomically with job
+completion when they use the supplied transaction.
 
 ## 11. Wake a SQLite consumer when a job is published
 
@@ -680,14 +680,12 @@ Schema definitions: `./driver_sqlite.go:51` and `./driver_postgres.go:33`.
 
 These details describe the implementation in this checkout:
 
-- **Handler writes and completion are not atomic.** The handler transaction
-  is committed even when the handler returns an error, unless it was already
-  rolled back or failed. Marking the job processed happens outside that
-  transaction, before commit. Commit and completion-update errors are traced
-  but do not automatically trigger a retry. SQLite handler writes can contend
-  with that separate completion update. The DLQ hook is the separate,
-  explicitly atomic path shown above. See `./consumer.go:243` and
-  `./consumer.go:308`.
+- **Handler writes and completion share a transaction.** Use the supplied `tx`
+  for database writes, and let the queue commit or roll it back. Success commits
+  those writes together with job completion. Handler errors, panics, timeouts,
+  and completion-update failures roll back the attempt. Completion and commit
+  errors enter the retry/DLQ path. External side effects are outside this
+  transaction and should be safe to repeat.
 - **Claims have no expiry or automatic recovery.** A crash or shutdown after
   claiming can leave jobs with `consumed_at` set and no worker to finish them.
   Shutdown does not drain or release every prefetched claim. Durable rows alone
@@ -700,9 +698,6 @@ These details describe the implementation in this checkout:
   can keep shutdown waiting. See `./consumer.go:174` and `./consumer.go:378`.
 - **Schema setup errors are visible only in tracing.** `Run` records schema
   errors without returning them. See `./sqlq.go:197`.
-- **A single-connection pool can block handler completion.** Successful
-  handling holds a transaction while marking the job processed through
-  `*sql.DB`. Avoid `SetMaxOpenConns(1)` with consumers. See `./consumer.go:243`.
 
 ## Development
 

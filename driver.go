@@ -36,9 +36,9 @@ type driver interface {
 	// subscribeForConsumer will post new jobs to a channel according to tokenBucket
 	subscribeForConsumer(ctx context.Context, jobType string, tokenBucket *tokenBucket) (<-chan struct{}, error)
 
-	// markJobProcessed executes the query for marking a job as processed
+	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	markJobProcessed(ctx context.Context, jobID int64) error
+	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	// Rescheduled jobs can be returned to consumers again

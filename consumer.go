@@ -196,8 +196,6 @@ func (cons *consumer) processJob(j *job) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to begin transaction")
-		// Attempt rollback, but ignore error as the transaction might not be valid
-		_ = tx.Rollback()
 		return
 	}
 
@@ -239,35 +237,28 @@ func (cons *consumer) processJob(j *job) {
 }
 
 // attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
-// and finishes tx before returning. It returns the handler's error.
+// and commits both changes together. Any failure is returned for retry or dead-lettering.
 func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, info JobInfo, tx *sql.Tx) error {
 	defer func() {
-		if err := tx.Commit(); err == nil {
-			// Happy path: Commit succeeded, we're done.
-			span.SetStatus(codes.Ok, "job processed successfully")
-
-			return
-		} else if !errors.Is(err, sql.ErrTxDone) {
-			span.RecordError(fmt.Errorf("failed to commit transaction: %w", err))
-			span.SetStatus(codes.Error, "commit failed")
-		}
-
 		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			span.AddEvent("Failed to rollback transaction in processJob", trace.WithAttributes(attribute.String("error", err.Error())))
 		}
 	}()
 
-	handlerErr := cons.handleJob(ctx, j, info, tx)
-
-	if handlerErr == nil {
-		// Happy path: Handler succeeded, mark done
-		if markErr := cons.markJobDone(ctx, j, tx); markErr != nil {
-			span.RecordError(fmt.Errorf("failed to mark job %d processed: %w", j.ID, markErr))
-			span.SetStatus(codes.Error, "failed to mark job processed")
-		}
+	if err := cons.handleJob(ctx, j, info, tx); err != nil {
+		return err
 	}
 
-	return handlerErr
+	if err := cons.markJobDone(ctx, j, tx); err != nil {
+		return fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	span.SetStatus(codes.Ok, "job processed successfully")
+	return nil
 }
 
 func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *sql.Tx) error {
@@ -305,12 +296,12 @@ func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *s
 	return handlerErr
 }
 
-func (cons *consumer) markJobDone(ctx context.Context, j *job, _ *sql.Tx) error {
+func (cons *consumer) markJobDone(ctx context.Context, j *job, tx *sql.Tx) error {
 	ctx, span := cons.tracer.Start(ctx, "sqlq.mark_processed")
 
 	defer span.End()
 
-	if markErr := cons.driver.markJobProcessed(ctx, j.ID); markErr != nil {
+	if markErr := cons.driver.markJobProcessed(ctx, tx, j.ID); markErr != nil {
 		span.RecordError(fmt.Errorf("failed to mark job processed: %w", markErr))
 		span.SetStatus(codes.Error, "mark processed failed")
 

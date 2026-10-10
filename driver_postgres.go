@@ -319,7 +319,7 @@ func (d *PostgresDriver) subscribeForConsumer(_ context.Context, _ string, _ *to
 }
 
 // markJobProcessed updates the jobs table to mark a job as successfully processed in PostgreSQL.
-func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64) error {
+func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
@@ -327,7 +327,7 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64) erro
 	))
 	defer span.End()
 
-	res, err := d.db.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET processed_at = NOW() WHERE id = $1 AND consumed_at IS NOT NULL AND processed_at IS NULL`,
 		jobID,
 	)
@@ -336,20 +336,18 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, jobID int64) erro
 		return err
 	}
 
-	rowsAffected, _ := res.RowsAffected()
-	if rowsAffected == 0 {
-		// This could happen if:
-		// 1. The job was already marked processed (processed_at IS NOT NULL).
-		// 2. The job was not consumed (consumed_at IS NULL).
-		// 3. The job failed and was rescheduled (consumed_at became NULL).
-		// 4. The job ID is incorrect.
-		// Log this as it might indicate an unexpected state or double processing attempt.
-		span.AddEvent("MarkJobProcessed found no matching 'consumed' row (consumed_at IS NOT NULL, processed_at IS NULL) to update", trace.WithAttributes(
-			attribute.Int64("sqlq.job_id", jobID),
-		))
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	if rowsAffected != 1 {
+		err := fmt.Errorf("job %d is no longer claimed or was already processed", jobID)
+		span.RecordError(err)
+		return err
 	}
 
-	return nil // Return nil even if rowsAffected is 0, goal is idempotency
+	return nil
 }
 
 // MarkJobFailedAndReschedule updates a job's state to failed, increments the retry count,

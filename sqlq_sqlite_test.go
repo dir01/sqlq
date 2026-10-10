@@ -1,6 +1,7 @@
 package sqlq_test
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -25,9 +26,8 @@ func TestSQLite(t *testing.T) {
 		assert.NoError(t, stopTracer())
 	})
 
-	// Dead-letter hook tests write to tables of their own outside the queue's write lock.
-	// SQLite's shared cache allows a single writer at a time, so those writes would make concurrent
-	// queue operations fail. That's why each of these tests gets a database of its own.
+	// Dead-letter hook tests hold write transactions while exercising failures and
+	// timeouts, so each gets a database of its own to avoid delaying unrelated tests.
 	t.Run("Dead letter hook and job info", func(t *testing.T) {
 		t.Parallel()
 
@@ -146,11 +146,13 @@ func TestSQLite(t *testing.T) {
 	})
 }
 
-// newSQLiteTestCase opens the named in-memory database and starts a queue on it.
+// newSQLiteTestCase opens an isolated database and starts a queue on it.
 func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCase {
 	t.Helper()
 
-	db, err := otelsql.Open("sqlite3", "file:"+dbName+"?mode=memory&cache=shared")
+	// WAL and a busy timeout let concurrent transactions wait for SQLite's writer
+	// lock. Shared-cache in-memory databases instead fail immediately with SQLITE_LOCKED.
+	db, err := otelsql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), dbName+".db")+"?_journal_mode=WAL&_busy_timeout=1000")
 	require.NoError(t, err, "Failed to open SQLite database")
 
 	q, err := sqlq.New(
