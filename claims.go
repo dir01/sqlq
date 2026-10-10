@@ -9,8 +9,20 @@ import (
 	"time"
 )
 
-// SQLite's clock is shared by all connections/processes. Local deadlines use the
-// request start time instead, so network/lock wait never adds to the local budget.
+// sqliteNow is the current time in Unix milliseconds, computed by SQLite. It is
+// the documented recipe (https://www.sqlite.org/lang_datefunc.html#examples),
+// which unlike unixepoch('now','subsec') predates SQLite 3.42, scaled to
+// milliseconds. ROUND absorbs float error that CAST alone would truncate to the
+// previous millisecond.
+//
+// It is used instead of a time.Now() parameter because SQLite evaluates 'now'
+// when the statement runs, after any wait for dbMutex or the write lock, so an
+// expiry check never compares against a timestamp taken before that wait. 'now'
+// is also fixed for the whole statement, so the claim UPDATE sets consumed_at
+// and claim_expires_at and checks the old expiry against one instant.
+//
+// Local deadlines (localClaimDeadline) use the request start time instead, so
+// lock wait never adds to the local budget.
 const sqliteNow = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000) AS INTEGER)"
 
 func claimKey(j job) string {
