@@ -16,7 +16,7 @@ func TestSQLite(t *testing.T) {
 	t.Parallel() // Run top-level test in parallel
 
 	tracerCtx := GracefulContext(t.Context(), 1*time.Second) // Leaves the tracer time to shut down
-	tracer, stopTracer, err := newTracer(tracerCtx, "localhost:4318")
+	tracer, stopTracer, err := newTracer(tracerCtx)
 	require.NoError(t, err)
 
 	tc := newSQLiteTestCase(t, "memdb1", tracer)
@@ -163,7 +163,7 @@ func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCa
 	)
 	require.NoError(t, err)
 
-	q.Run()
+	require.NoError(t, q.Run())
 
 	t.Cleanup(func() {
 		q.Shutdown()

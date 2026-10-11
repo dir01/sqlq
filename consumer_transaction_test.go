@@ -73,7 +73,7 @@ func TestAttemptJobTransactionFailure(t *testing.T) {
 			ctx, span := tracer.Start(ctx, "attempt")
 			defer span.End()
 
-			err = cons.attemptJob(ctx, span, &jobs[0], cons.jobInfo(&jobs[0]), tx)
+			_, err = cons.attemptJob(ctx, span, &jobs[0], cons.jobInfo(&jobs[0]), tx)
 			require.ErrorContains(t, err, scenario.wantError, "transaction failures must reach the retry/DLQ path")
 			require.ErrorIs(t, tx.Commit(), sql.ErrTxDone)
 

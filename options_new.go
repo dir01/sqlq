@@ -3,6 +3,7 @@ package sqlq
 import (
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -13,6 +14,14 @@ type NewOption func(*sqlq)
 func WithTracer(tracer trace.Tracer) NewOption {
 	return func(q *sqlq) {
 		q.tracer = tracer
+	}
+}
+
+// WithMeterProvider allows setting the OpenTelemetry MeterProvider.
+// If not set, the global MeterProvider will be used.
+func WithMeterProvider(provider metric.MeterProvider) NewOption {
+	return func(q *sqlq) {
+		q.meterProvider = provider
 	}
 }
 

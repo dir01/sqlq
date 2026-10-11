@@ -85,11 +85,10 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 			consumed_at INTEGER NULL, -- Milliseconds since epoch, indicates when the job was claimed
 			processed_at INTEGER NULL -- Milliseconds since epoch, indicates successful processing
 		)`,
-		// Removed job_consumers table definition
 
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
 			original_job_id INTEGER PRIMARY KEY, -- Use original job ID as PK

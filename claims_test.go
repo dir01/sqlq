@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -508,7 +509,7 @@ func consumeOnTestQueue(t *testing.T, queueOpts []NewOption, consOpts []Consumer
 	require.NoError(t, err)
 	q, ok := queue.(*sqlq)
 	require.True(t, ok)
-	q.Run()
+	require.NoError(t, q.Run())
 	t.Cleanup(q.Shutdown)
 	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
 	if err = q.Consume(t.Context(), "claims", handler, consOpts...); err != nil {
@@ -544,11 +545,21 @@ func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Du
 	return d.driver.extendClaim(ctx, j, timeout)
 }
 
+// noopMetrics returns instruments that record nothing, for consumers built without New.
+func noopMetrics() *sqlqMetrics {
+	m, err := newMetrics(metricnoop.NewMeterProvider().Meter("claims"))
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
 func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(context.Context, *sql.Tx, []byte) error) *consumer {
 	ctx, cancel := context.WithCancel(ctx)
 	return &consumer{ //nolint:exhaustruct
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
+		metrics:      noopMetrics(),
 		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
 		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
 		pollInterval: time.Millisecond, jobsChan: make(chan job, 1),

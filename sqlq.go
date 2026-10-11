@@ -12,6 +12,8 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 
 	"go.opentelemetry.io/otel/trace"
@@ -50,7 +52,7 @@ type JobsQueue interface {
 	Shutdown()
 
 	// Run performs initial setup like schema initialization.
-	Run()
+	Run() error
 }
 
 // DBType represents the supported database types.
@@ -96,6 +98,9 @@ var (
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
 	db                 *sql.DB
+	metrics            *sqlqMetrics
+	meterProvider      metric.MeterProvider
+	meter              metric.Meter
 	driver             driver
 	defaultBackoffFunc func(retryNum uint16) time.Duration
 	tracer             trace.Tracer
@@ -202,23 +207,36 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultCleanupDLQAge:            defaultCleanupDLQAge,
 		defaultCleanupBatch:             defaultCleanupBatch,
 		tracer:                          otel.Tracer(tracerName),
+		meterProvider:                   otel.GetMeterProvider(),
+		meter:                           nil,
+		metrics:                         nil,
 	}
 
 	for _, o := range opts {
 		o(q)
 	}
 
+	q.meter = q.meterProvider.Meter(meterName)
+	metrics, err := newMetrics(q.meter)
+	if err != nil {
+		return nil, err
+	}
+	q.metrics = metrics
+
 	return q, nil
 }
 
-func (q *sqlq) Run() {
+func (q *sqlq) Run() error {
 	initCtx, initSpan := q.tracer.Start(context.Background(), "sqlq.init_schema")
 	defer initSpan.End()
 
 	if err := q.driver.initSchema(initCtx); err != nil {
 		initSpan.RecordError(err)
-		// Consider if initialization failure should prevent startup
+		initSpan.SetStatus(codes.Error, "schema initialization failed")
+		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
+	initSpan.SetStatus(codes.Ok, "schema initialized successfully")
+	return nil
 }
 
 // Publish adds a new job to the queue
@@ -227,6 +245,7 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 		trace.WithAttributes(attribute.String("sqlq.job_type", jobType)),
 		trace.WithSpanKind(trace.SpanKindProducer),
 	)
+
 	defer span.End()
 
 	return q.PublishTx(ctx, nil, jobType, payload, opts...)
@@ -243,7 +262,10 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		),
 		trace.WithSpanKind(trace.SpanKindProducer),
 	)
+
 	defer span.End()
+
+	metricAttrs := metric.WithAttributes(attribute.String("sqlq.job_type", jobType))
 
 	options := &publishOptions{delay: 0}
 	for _, o := range opts {
@@ -253,8 +275,10 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		span.RecordError(err)
+		q.metrics.publishedErrCounter.Add(ctx, 1, metricAttrs)
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
+
 	span.SetAttributes(
 		attribute.Int("sqlq.payload_size", len(payloadBytes)),
 		attribute.Int("sqlq.delay_ms", int(options.delay.Milliseconds())),
@@ -267,8 +291,11 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	if err != nil {
 		// The driver method should record the specific DB error in its span. We record a higher-level error here.
 		span.RecordError(err)
+		q.metrics.publishedErrCounter.Add(ctx, 1, metricAttrs)
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
+
+	q.metrics.publishedCounter.Add(ctx, 1, metricAttrs)
 
 	return nil
 }
@@ -291,9 +318,10 @@ func (q *sqlq) Consume(
 		jobType: jobType,
 		handler: handler,
 		// Inject dependencies from sqlq
-		db:     q.db,
-		driver: q.driver,
-		tracer: q.tracer,
+		db:      q.db,
+		driver:  q.driver,
+		tracer:  q.tracer,
+		metrics: q.metrics,
 		// Set defaults from sqlq. Those might be overridden by opts later
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
@@ -367,6 +395,7 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 		attribute.String("sqlq.job_type", jobType),
 		attribute.Int("sqlq.limit", limit),
 	))
+
 	defer span.End()
 
 	jobs, err := q.driver.getDeadLetterJobs(ctx, jobType, limit)
@@ -374,6 +403,7 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 		span.RecordError(err)
 	} else {
 		span.SetAttributes(attribute.Int("sqlq.dlq_jobs_fetched", len(jobs)))
+		q.metrics.dlqFetchedCounter.Add(ctx, int64(len(jobs)), metric.WithAttributes(attribute.String("sqlq.job_type", jobType)))
 	}
 
 	return jobs, err
@@ -384,11 +414,14 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes(
 		attribute.Int64("sqlq.original_job_id", originalJobID),
 	))
+
 	defer span.End()
 
 	err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
 	if err != nil {
 		span.RecordError(err)
+	} else {
+		q.metrics.dlqRequeuedCounter.Add(ctx, 1)
 	}
 	return err
 }

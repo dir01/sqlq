@@ -168,6 +168,7 @@ func TestDriverSQLite(t *testing.T) {
 
 	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
 		t.Parallel() // Run subtest in parallel
+
 		jobType := "concurrent_race_test"
 		err := driver.insertJob(t.Context(), nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err, "Failed to insert job for race test")

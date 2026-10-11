@@ -19,7 +19,7 @@ func newPublishingSQLiteTestCase(t *testing.T) *TestCase {
 	require.NoError(t, err)
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite)
 	require.NoError(t, err)
-	q.Run()
+	require.NoError(t, q.Run())
 	t.Cleanup(func() {
 		q.Shutdown()
 		require.NoError(t, db.Close())

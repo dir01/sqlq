@@ -17,32 +17,21 @@ import (
 func setupBenchmarkDB(b *testing.B) (*sql.DB, func()) {
 	b.Helper()
 
-	// Use a unique in-memory DB for each benchmark run to avoid interference
-	// "file::memory:?cache=shared" allows multiple connections in the same process
-	// We add a unique identifier based on benchmark name/time if needed, but for simple cases,
-	// just recreating it might be sufficient if benchmarks run sequentially.
-	// Using a file-based DB might be more realistic for some benchmarks, but slower.
-	dbPath := fmt.Sprintf("file:bench_%s_%d.db?mode=memory&cache=shared", b.Name(), time.Now().UnixNano())
-	// dbPath := fmt.Sprintf("./bench_%s.db", b.Name()) // Option for file-based DB
-	// _ = os.Remove(dbPath) // Clean up previous file if exists
+	options := "?_journal_mode=wal"
+	dbPath := fmt.Sprintf("file:%s/bench_%s_%d.db%s", b.TempDir(), b.Name(), time.Now().UnixNano(), options)
 
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(b, err, "Failed to open SQLite database for benchmark")
 
-	// Optional: Configure connection pool for potentially better performance
-	db.SetMaxOpenConns(50) // Adjust based on expected load
-	db.SetMaxIdleConns(10)
+	db.SetMaxOpenConns(500)
+	db.SetMaxIdleConns(500)
 
 	cleanup := func() {
 		err := db.Close()
 		if err != nil {
 			b.Logf("Warning: Error closing benchmark database: %v", err)
 		}
-		// If using a file-based DB:
-		// err = os.Remove(dbPath)
-		// if err != nil && !os.IsNotExist(err) {
-		// 	b.Logf("Warning: Error removing benchmark database file %s: %v", dbPath, err)
-		// }
+		// db file will destroy itself by virtue of using b.TempDir()
 	}
 
 	return db, cleanup
@@ -56,11 +45,11 @@ func setupBenchmarkDB(b *testing.B) (*sql.DB, func()) {
 // goarch: arm64
 // pkg: github.com/dir01/sqlq
 // cpu: Apple M1 Pro
-// BenchmarkHighConcurrency
-// With polling alone
-// BenchmarkHighConcurrency-10          517           2184726 ns/op            7774 B/op        154 allocs/op
-// With polling and push
-// BenchmarkHighConcurrency-10         6561            210670 ns/op            9699 B/op        208 allocs/op
+
+// ### No options
+// BenchmarkHighConcurrency-10         1204            960542 ns/op           19868 B/op        238 allocs/op
+// ### ?_journal_mode=wal
+// BenchmarkHighConcurrency-10         5648            215926 ns/op           12469 B/op        194 allocs/op
 
 func BenchmarkHighConcurrency(b *testing.B) {
 	b.ReportAllocs()
@@ -82,7 +71,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	)
 	require.NoError(b, err)
 
-	q.Run()
+	require.NoError(b, q.Run())
 
 	var processedCount atomic.Int64
 	totalJobs := int64(b.N) // Total jobs to process in this benchmark run
@@ -100,7 +89,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	)
 
 	require.NoError(b, err)
-	q.Run()
+	require.NoError(b, q.Run())
 
 	payload := []byte(`{"data":"benchmark"}`)
 
