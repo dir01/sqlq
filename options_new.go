@@ -98,6 +98,7 @@ func WithDefaultCleanupBatch(batchSize uint16) NewOption {
 }
 
 // WithDefaultPrefetchCount sets default number of jobs to prefetch in a single query for a new consumer.
+// By default it equals the concurrency of each consumer, and it is never lower than that.
 // This value may be overridden per individual consumer, see WithConsumerPrefetchCount.
 func WithDefaultPrefetchCount(prefetchCount uint16) NewOption {
 	return func(o *sqlq) {
@@ -126,6 +127,16 @@ func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	return func(o *sqlq) {
 		if timeout > 0 {
 			o.defaultJobTimeout = timeout
+		}
+	}
+}
+
+// WithDefaultClaimTimeout sets the claim timeout for all consumers.
+// Default is twice the job timeout of each consumer. See WithConsumerClaimTimeout for details.
+func WithDefaultClaimTimeout(timeout time.Duration) NewOption {
+	return func(q *sqlq) {
+		if claimBudget(timeout) > 0 {
+			q.defaultClaimTimeout = timeout
 		}
 	}
 }

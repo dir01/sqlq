@@ -30,24 +30,26 @@ type driver interface {
 	insertJob(ctx context.Context, tx *sql.Tx, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
 
 	// getJobsForConsumer executes the query for finding jobs for a consumer
-	// Jobs returned once should not be returned unless they were explicitly rescheduled
-	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16) ([]job, error)
+	// Unprocessed jobs can be returned again after their claim expires.
+	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error)
+	extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error)
+	releaseClaim(ctx context.Context, j job) error
 
 	// subscribeForConsumer will post new jobs to a channel according to tokenBucket
 	subscribeForConsumer(ctx context.Context, jobType string, tokenBucket *tokenBucket) (<-chan struct{}, error)
 
 	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64) error
+	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
 	// Rescheduled jobs can be returned to consumers again
-	markJobFailedAndReschedule(ctx context.Context, jobID int64, errorMsg string, backoffDuration time.Duration) error
+	markJobFailedAndReschedule(ctx context.Context, jobID int64, claimToken string, errorMsg string, backoffDuration time.Duration) error
 
 	// moveToDeadLetterQueue moves a job to the dead letter queue.
 	// If inTx is not nil, it is called in the same transaction after the move,
 	// and an error from it rolls the move back and is returned.
-	moveToDeadLetterQueue(ctx context.Context, jobID int64, reason string, inTx func(tx *sql.Tx) error) error
+	moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error
 
 	// getDeadLetterJobs retrieves jobs from the dead letter queue
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)

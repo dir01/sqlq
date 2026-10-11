@@ -70,7 +70,7 @@ func TestDriverSQLite(t *testing.T) {
 		err := driver.insertJob(ctx, nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.getJobsForConsumer(ctx, jobType, 10)
+		jobs, err := driver.getJobsForConsumer(ctx, jobType, 10, time.Minute)
 		require.NoError(t, err)
 
 		require.Equal(t, 1, len(jobs))
@@ -86,7 +86,7 @@ func TestDriverSQLite(t *testing.T) {
 		err := driver.insertJob(t.Context(), nil, jobType, payload, 30*time.Minute, traceContext)
 		require.NoError(t, err)
 
-		jobs, err := driver.getJobsForConsumer(t.Context(), jobType, 10)
+		jobs, err := driver.getJobsForConsumer(t.Context(), jobType, 10, time.Minute)
 		require.NoError(t, err)
 
 		require.Equal(t, 0, len(jobs))
@@ -173,14 +173,14 @@ func TestDriverSQLite(t *testing.T) {
 		require.NoError(t, err, "Failed to insert job for race test")
 
 		// Simulate first consumer fetching the job
-		jobs1, err := driver.getJobsForConsumer(t.Context(), jobType, 1)
+		jobs1, err := driver.getJobsForConsumer(t.Context(), jobType, 1, time.Minute)
 		require.NoError(t, err, "First GetJobsForConsumer call failed")
 		require.Len(t, jobs1, 1, "First GetJobsForConsumer should fetch 1 job")
 		jobID1 := jobs1[0].ID
 
 		// Simulate second consumer (or same consumer polling again quickly)
 		// *before* the first one marks the job as processed
-		jobs2, err := driver.getJobsForConsumer(t.Context(), jobType, 1)
+		jobs2, err := driver.getJobsForConsumer(t.Context(), jobType, 1, time.Minute)
 		require.NoError(t, err, "Second GetJobsForConsumer call failed")
 
 		// *** This is the assertion that should FAIL with the current driver logic ***
@@ -193,7 +193,7 @@ func TestDriverSQLite(t *testing.T) {
 		// not be reached, or jobs2 might contain the same job.
 
 		err = runInTx(t.Context(), db, func(tx *sql.Tx) error {
-			return driver.markJobProcessed(t.Context(), tx, jobID1)
+			return driver.markJobProcessed(t.Context(), tx, jobID1, jobs1[0].ClaimToken)
 		})
 		require.NoError(t, err, "Marking job processed for the first time failed")
 
