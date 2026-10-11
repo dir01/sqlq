@@ -278,7 +278,8 @@ func TestDriverSQLiteWaitsForOtherWriters(t *testing.T) {
 		require.NoError(t, d.moveToDeadLetterQueue(t.Context(), j.ID, j.ClaimToken, "failed", nil))
 
 		requireWaitsForWriter(t, db, func() error {
-			return d.requeueDeadLetterJob(t.Context(), j.ID)
+			_, err := d.requeueDeadLetterJob(t.Context(), j.ID)
+			return err
 		})
 	})
 }

@@ -732,7 +732,7 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 }
 
 // requeueDeadLetterJob moves a job from the dead_letter_queue back into the main jobs table for reprocessing in SQLite, identifying the job by its original ID.
-func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) error {
+func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) (string, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.requeue_dead_letter_job", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.Int64("sqlq.original_job_id", originalJobID), // Use original_job_id in attribute
@@ -745,7 +745,7 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
-		return err
+		return "", err
 	}
 
 	// Defer rollback and check error
@@ -763,34 +763,30 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 
 	// reset retry count and scheduled_at = now.
 	// A single INSERT ... SELECT, so the transaction starts by writing; see moveToDeadLetterQueue.
-	res, err := tx.ExecContext(ctx, `
+	var jobType string
+	err = tx.QueryRowContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)
 		SELECT job_type, payload, 0, ?, ?
 		FROM dead_letter_queue WHERE original_job_id = ?
-	`, nowMs, nowMs, originalJobID)
+		RETURNING job_type
+	`, nowMs, nowMs, originalJobID).Scan(&jobType)
 	if err != nil {
 		span.RecordError(err)
-		return err // Rollback will happen
-	}
-	inserted, err := res.RowsAffected()
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-	if inserted == 0 {
-		span.RecordError(ErrJobNotFound)
-		return ErrJobNotFound
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrJobNotFound
+		}
+		return "", err // Rollback will happen
 	}
 
 	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE original_job_id = ?", originalJobID) // Use originalJobID in WHERE
 	if err != nil {
 		span.RecordError(err)
-		return err // Rollback will happen
+		return "", err // Rollback will happen
 	}
 
-	err = tx.Commit()
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		span.RecordError(err)
+		return "", err
 	}
-	return err
+	return jobType, nil
 }

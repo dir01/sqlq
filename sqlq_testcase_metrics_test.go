@@ -64,6 +64,9 @@ func (tc *TestCase) TestMetrics(ctx context.Context, t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, dlqJobs, 1)
 	require.Equal(t, int64(1), sumMetric(collectMetrics(t, tc.Metrics), "sqlq.jobs.dlq.fetched.count", forJob))
+
+	require.NoError(t, tc.Q.RequeueDeadLetterJob(ctx, dlqJobs[0].OriginalID))
+	require.Equal(t, int64(1), sumMetric(collectMetrics(t, tc.Metrics), "sqlq.jobs.dlq.requeued.count", forJob))
 }
 
 // collectMetrics reads everything the queue has recorded so far.

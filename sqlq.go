@@ -417,11 +417,12 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 
 	defer span.End()
 
-	err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
+	jobType, err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
 	if err != nil {
 		span.RecordError(err)
 	} else {
-		q.metrics.dlqRequeuedCounter.Add(ctx, 1)
+		span.SetAttributes(attribute.String("sqlq.job_type", jobType))
+		q.metrics.dlqRequeuedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sqlq.job_type", jobType)))
 	}
 	return err
 }
