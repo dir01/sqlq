@@ -19,14 +19,12 @@ import (
 func (tc *TestCase) TestMetrics(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	// The queue may be shared with other tests, so every check is narrowed to this job type.
+	// The queue is shared with other tests, so every check is narrowed to this job type.
 	jobType := "metrics_job"
 	forJob := attribute.String("sqlq.job_type", jobType)
 
 	// "ok" succeeds, "flaky" fails once and then succeeds, and "broken" fails both of its
 	// attempts and is dead-lettered. That is 5 attempts, 3 of which fail.
-	// A single worker keeps the counts exact on SQLite: a handler commit landing in the middle
-	// of a dead-letter move fails the move with "database is locked", which adds a retry.
 	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
 		var payload TestPayload
 		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
@@ -39,7 +37,7 @@ func (tc *TestCase) TestMetrics(ctx context.Context, t *testing.T) {
 		}
 
 		return nil
-	}, sqlq.WithConsumerMaxRetries(1), sqlq.WithConsumerConcurrency(1))
+	}, sqlq.WithConsumerMaxRetries(1))
 	require.NoError(t, err)
 
 	for _, message := range []string{"ok", "flaky", "broken"} {

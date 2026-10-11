@@ -605,40 +605,26 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 		}
 	}()
 
-	var job struct {
-		JobType     string
-		Payload     []byte
-		CreatedAtMs int64
-		RetryCount  int
-	}
-
-	err = tx.QueryRowContext(ctx, `
-		SELECT job_type, payload, created_at, retry_count
-		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
-	`, jobID, claimToken).Scan(&job.JobType, &job.Payload, &job.CreatedAtMs, &job.RetryCount)
-	if err != nil {
-		span.RecordError(err)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrClaimLost
-		}
-		return err
-	}
-
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	_, err = tx.ExecContext(ctx, `
+	// Copy the job with a single INSERT ... SELECT rather than a SELECT and then an INSERT.
+	// A transaction that starts by reading can't wait for another connection's write lock:
+	// SQLite fails it with "database is locked" at once. One that starts by writing waits.
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, jobID, job.JobType, job.Payload, job.CreatedAtMs, nowMs, job.RetryCount, reason) // Use jobID directly for original_job_id
+		SELECT id, job_type, payload, created_at, ?, retry_count, ?
+		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
+	`, nowMs, reason, jobID, claimToken)
+	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
 		return err // Rollback will happen
 	}
 
 	// Delete from jobs table (no CASCADE in SQLite by default, but job_consumers is gone anyway)
-	res, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
+	res, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
 	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
@@ -772,34 +758,28 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 		}
 	}()
 
-	var dlqJob struct { // Select only needed fields
-		JobType string
-		Payload []byte
-	}
-	err = tx.QueryRowContext(ctx, `
-		SELECT job_type, payload
-		FROM dead_letter_queue WHERE original_job_id = ?
-	`, originalJobID).Scan(&dlqJob.JobType, &dlqJob.Payload) // Use originalJobID in WHERE
-	if err != nil {
-		span.RecordError(err)
-		if errors.Is(err, sql.ErrNoRows) {
-			// Use ErrJobNotFound consistently
-			return ErrJobNotFound
-		}
-		return err
-	}
-
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	// reset retry count and scheduled_at = now
-	_, err = tx.ExecContext(ctx, `
+	// reset retry count and scheduled_at = now.
+	// A single INSERT ... SELECT, so the transaction starts by writing; see moveToDeadLetterQueue.
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)
-		VALUES (?, ?, 0, ?, ?)
-	`, dlqJob.JobType, dlqJob.Payload, nowMs, nowMs)
+		SELECT job_type, payload, 0, ?, ?
+		FROM dead_letter_queue WHERE original_job_id = ?
+	`, nowMs, nowMs, originalJobID)
 	if err != nil {
 		span.RecordError(err)
 		return err // Rollback will happen
+	}
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	if inserted == 0 {
+		span.RecordError(ErrJobNotFound)
+		return ErrJobNotFound
 	}
 
 	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE original_job_id = ?", originalJobID) // Use originalJobID in WHERE

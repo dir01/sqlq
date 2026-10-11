@@ -71,8 +71,7 @@ func TestSQLite(t *testing.T) {
 		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestMetrics")
 		defer span.End()
 
-		// Other tests' handler commits could also fail a dead-letter move here, so it gets its own database
-		newSQLiteTestCase(t, "memdb_metrics", tracer).TestMetrics(ctx, t)
+		tc.TestMetrics(ctx, t)
 	})
 
 	t.Run("Job execution timeout", func(t *testing.T) {
