@@ -13,6 +13,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -55,6 +56,15 @@ func TestPostgreSQL(t *testing.T) {
 		defer span.End()
 
 		tc.TestBasicPubMultiSub(ctx, t)
+	})
+
+	t.Run("Metrics are recorded", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestMetrics")
+		defer span.End()
+
+		tc.TestMetrics(ctx, t)
 	})
 
 	t.Run("Job execution timeout", func(t *testing.T) {
@@ -250,19 +260,21 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	tracer, stopTracer, err := newTracer(tracerCtx)
 	require.NoError(t, err)
 
+	metrics := sdkmetric.NewManualReader()
 	q, err := sqlq.New(
 		db,
 		sqlq.DBTypePostgres,
 		sqlq.WithDefaultPollInterval(50*time.Millisecond),
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithTracer(tracer),
+		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics))),
 	)
 	require.NoError(t, err)
 
 	err = q.Run()
 	require.NoError(t, err, "Failed to run queue (initialize schema)")
 
-	return &TestCase{Q: q, DB: db}, tracer, func() {
+	return &TestCase{Q: q, DB: db, Metrics: metrics}, tracer, func() {
 		q.Shutdown() // Ensure consumers are stopped before closing DB and terminating container
 		require.NoError(t, db.Close())
 		require.NoError(t, container.Terminate(tracerCtx))
