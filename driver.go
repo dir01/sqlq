@@ -55,7 +55,7 @@ type driver interface {
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
 	// requeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
+	requeueDeadLetterJob(ctx context.Context, dlqID int64) (jobType string, err error)
 
 	// cleanupJobs deletes old processed jobs for a specific job type.
 	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.

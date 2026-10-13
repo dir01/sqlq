@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -16,7 +17,7 @@ func TestSQLite(t *testing.T) {
 	t.Parallel() // Run top-level test in parallel
 
 	tracerCtx := GracefulContext(t.Context(), 1*time.Second) // Leaves the tracer time to shut down
-	tracer, stopTracer, err := newTracer(tracerCtx, "localhost:4318")
+	tracer, stopTracer, err := newTracer(tracerCtx)
 	require.NoError(t, err)
 
 	tc := newSQLiteTestCase(t, "memdb1", tracer)
@@ -62,6 +63,15 @@ func TestSQLite(t *testing.T) {
 		defer span.End()
 
 		tc.TestBasicPubMultiSub(ctx, t)
+	})
+
+	t.Run("Metrics are recorded", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestMetrics")
+		defer span.End()
+
+		tc.TestMetrics(ctx, t)
 	})
 
 	t.Run("Job execution timeout", func(t *testing.T) {
@@ -155,20 +165,22 @@ func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCa
 	db, err := otelsql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), dbName+".db")+"?_journal_mode=WAL&_busy_timeout=1000")
 	require.NoError(t, err, "Failed to open SQLite database")
 
+	metrics := sdkmetric.NewManualReader()
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithDefaultPollInterval(25*time.Millisecond),
 		sqlq.WithTracer(tracer),
+		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics))),
 	)
 	require.NoError(t, err)
 
-	q.Run()
+	require.NoError(t, q.Run())
 
 	t.Cleanup(func() {
 		q.Shutdown()
 		assert.NoError(t, db.Close())
 	})
 
-	return &TestCase{Q: q, DB: db}
+	return &TestCase{Q: q, DB: db, Metrics: metrics}
 }

@@ -14,6 +14,9 @@ test-short:
 	go test -timeout 1m -race -short -failfast -v ./...
 .PHONY: test-short
 
+test-short-otel:
+	OTLP_ENDPOINT="localhost:4318" make test-short
+
 start-jaeger:
 	docker run -d --rm --name jaeger \
 		-p 5778:5778 \

@@ -59,7 +59,9 @@ func run(driver, dsn string, dbType sqlq.DBType, example Example) error {
 	if err != nil {
 		return err
 	}
-	q.Run()
+	if err = q.Run(); err != nil {
+		return err
+	}
 	defer q.Shutdown()
 
 	if err = example(ctx, db, q); err != nil {

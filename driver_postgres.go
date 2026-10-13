@@ -583,7 +583,7 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 }
 
 // requeueDeadLetterJob moves a job from the dead_letter_queue back into the main jobs table for reprocessing in PostgreSQL, identifying the job by its original ID.
-func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) error {
+func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) (string, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.requeue_dlq_job", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.original_job_id", originalJobID), // Use original_job_id in attribute
@@ -594,7 +594,7 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 	if err != nil {
 		span.RecordError(err)
 		span.RecordError(err)
-		return err
+		return "", err
 	}
 	defer func() {
 		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
@@ -615,9 +615,9 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
 			// Use ErrJobNotFound consistently
-			return ErrJobNotFound
+			return "", ErrJobNotFound
 		}
-		return err
+		return "", err
 	}
 
 	// Insert back into the main queue with reset retry count and scheduled_at = NOW()
@@ -627,19 +627,19 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 	`, dlqJob.JobType, dlqJob.Payload) // Use ExecContext
 	if err != nil {
 		span.RecordError(err)
-		return err // Rollback will happen
+		return "", err // Rollback will happen
 	}
 
 	// Delete from the dead letter queue
 	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE original_job_id = $1", originalJobID) // Use originalJobID in WHERE
 	if err != nil {
 		span.RecordError(err)
-		return err // Rollback will happen
+		return "", err // Rollback will happen
 	}
 
-	err = tx.Commit()
-	if err != nil {
+	if err = tx.Commit(); err != nil {
 		span.RecordError(err)
+		return "", err
 	}
-	return err
+	return dlqJob.JobType, nil
 }

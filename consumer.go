@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -27,7 +28,8 @@ type consumer struct {
 	cancel                   context.CancelFunc                  // cancel() cancels ctx, TODO: consider alternatives, see https://go.dev/blog/context-and-structs
 	backoffFunc              func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with. Defaults to exponential back off with jitter
 	tracer                   trace.Tracer
-	jobsChan                 chan job // Written to by a db poller coroutine, consumed by worker goroutines
+	metrics                  *sqlqMetrics // Copied from sqlq
+	jobsChan                 chan job     // Written to by a db poller coroutine, consumed by worker goroutines
 	claims                   map[string]job
 	jobType                  string
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
@@ -163,6 +165,11 @@ func (cons *consumer) fetchJobs(ctx context.Context) error {
 	}
 	cons.claimsMutex.Unlock()
 
+	cons.metrics.fetchedCounter.Add(ctx,
+		int64(len(jobs)),
+		metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType)),
+	)
+
 	for _, job := range jobs {
 		select {
 		case <-ctx.Done():
@@ -177,6 +184,8 @@ func (cons *consumer) fetchJobs(ctx context.Context) error {
 
 // workerLoop processes jobs from the jobsChan.
 func (cons *consumer) workerLoop() {
+	metricAttrs := metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType))
+
 	for {
 		select {
 		case <-cons.ctx.Done():
@@ -185,7 +194,10 @@ func (cons *consumer) workerLoop() {
 			if !isOpen {
 				return
 			}
+
+			cons.metrics.activeJobsUpDown.Add(cons.ctx, 1, metricAttrs)
 			cons.processJob(&j)
+			cons.metrics.activeJobsUpDown.Add(cons.ctx, -1, metricAttrs)
 		}
 	}
 }
@@ -247,22 +259,40 @@ func (cons *consumer) processJob(j *job) {
 
 	defer span.End()
 
+	metricFailureReason := ""
+	handlerStartTime := time.Now()
+
+	defer func() {
+		duration := time.Since(handlerStartTime).Milliseconds()
+		metricAttrs := metric.WithAttributes(
+			attribute.String("sqlq.job_type", cons.jobType),
+			attribute.String("sqlq.failure_reason", metricFailureReason),
+		)
+
+		cons.metrics.handlerDurationHist.Record(ctx, duration, metricAttrs)
+		cons.metrics.consumedCounter.Add(ctx, 1, metricAttrs)
+	}()
+
 	info := cons.jobInfo(j)
 
 	tx, err := cons.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to begin transaction")
+
+		metricFailureReason = "fail_begin_tx"
+
 		return
 	}
 
 	// attemptJob finishes the handler's transaction before returning, so whatever the handler
 	// locked is released before the job is retried or dead-lettered (and the dead-letter hook runs).
-	handlerErr := cons.attemptJob(ctx, span, j, info, tx)
+	failureReason, handlerErr := cons.attemptJob(ctx, span, j, info, tx)
 	if handlerErr == nil {
 		settled = true
 		return
 	}
+	metricFailureReason = failureReason
 	if errors.Is(handlerErr, ErrClaimLost) || cons.ctx.Err() != nil {
 		return
 	}
@@ -275,6 +305,8 @@ func (cons *consumer) processJob(j *job) {
 	if !info.IsFinalAttempt() {
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+
+			metricFailureReason = "fail_retry"
 		} else {
 			settled = true
 		}
@@ -292,8 +324,12 @@ func (cons *consumer) processJob(j *job) {
 		span.RecordError(err)
 		log.Printf("sqlq: failed to move job %d of type %s to the dead letter queue, rescheduling it: %v", j.ID, cons.jobType, err)
 
+		metricFailureReason = "fail_move_dlq"
+
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+
+			metricFailureReason = "fail_retry"
 		} else {
 			settled = true
 		}
@@ -306,8 +342,9 @@ func (cons *consumer) processJob(j *job) {
 }
 
 // attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
-// and commits both changes together. Any failure is returned for retry or dead-lettering.
-func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, info JobInfo, tx *sql.Tx) error {
+// and commits both changes together. Any failure is returned for retry or dead-lettering,
+// together with the failure reason reported in metrics.
+func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, info JobInfo, tx *sql.Tx) (string, error) {
 	defer func() {
 		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 			span.AddEvent("Failed to rollback transaction in processJob", trace.WithAttributes(attribute.String("error", err.Error())))
@@ -315,19 +352,19 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 	}()
 
 	if err := cons.handleJob(ctx, j, info, tx); err != nil {
-		return err
+		return "fail_handle_job", err
 	}
 
 	if err := cons.markJobDone(ctx, j, tx); err != nil {
-		return fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
+		return "fail_mark_processed", fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return "fail_commit_tx", fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	span.SetStatus(codes.Ok, "job processed successfully")
-	return nil
+	return "", nil
 }
 
 func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *sql.Tx) error {
@@ -386,6 +423,7 @@ func (cons *consumer) markJobDone(ctx context.Context, j *job, tx *sql.Tx) error
 func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) error {
 	ctx, span := cons.tracer.Start(ctx, "sqlq.retry_job", trace.WithAttributes(
 		attribute.Int64("sqlq.job_id", job.ID),
+		attribute.String("sqlq.job_type", job.JobType),
 		attribute.Int("sqlq.retry_count", int(job.RetryCount)),
 		attribute.String("sqlq.error_message", errorMsg),
 	))
@@ -399,6 +437,8 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 		span.RecordError(err)
 		return fmt.Errorf("failed to mark job as failed and reschedule: %w", err)
 	}
+
+	cons.metrics.retriedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType)))
 
 	return nil
 }
@@ -428,6 +468,8 @@ func (cons *consumer) moveJobToDLQ(ctx context.Context, j *job, info JobInfo, ha
 	}
 
 	span.SetStatus(codes.Ok, "job moved to DLQ")
+
+	cons.metrics.dlqMovedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType)))
 
 	return nil
 }
@@ -514,54 +556,43 @@ func (cons *consumer) runDLQCleanupLoop() {
 
 // performProcessedCleanup calls the driver to delete old processed jobs.
 func (cons *consumer) performProcessedCleanup(driver driver, tracer trace.Tracer, processedMaxAge time.Duration) {
-	// Create a background context for the cleanup operation itself
-	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.processed", trace.WithAttributes(
-		attribute.String("sqlq.job_type", cons.jobType),
-		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
-		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
-	))
-	defer span.End()
-
-	// Pass 0 for dlqMaxAge to signal only processed cleanup
-	processedDeleted, err := driver.cleanupJobs(ctx, cons.jobType, processedMaxAge, cons.cleanupBatch)
-
-	span.SetAttributes(
-		attribute.Int64("sqlq.cleanup.processed_deleted", processedDeleted),
-	)
-
-	if err != nil {
-		// Use a standard logger or integrate with a proper logging library
-		log.Printf("sqlq: processed cleanup failed for job_type %s: %v", cons.jobType, err)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "processed cleanup failed")
-	} else {
-		span.SetStatus(codes.Ok, "processed cleanup completed")
-	}
+	cons.performCleanup(tracer, "processed", processedMaxAge, driver.cleanupJobs, cons.metrics.cleanupProcessedCount)
 }
 
 // performDLQCleanup calls the driver to delete old DLQ jobs.
 func (cons *consumer) performDLQCleanup(driver driver, tracer trace.Tracer, dlqMaxAge time.Duration) {
+	cons.performCleanup(tracer, "dlq", dlqMaxAge, driver.cleanupDeadLetterQueueJobs, cons.metrics.cleanupDLQCount)
+}
+
+// performCleanup deletes one batch of this consumer's jobs older than maxAge using cleanup.
+// kind ("processed" or "dlq") names the span and its attributes; deletedCounter counts deleted jobs.
+func (cons *consumer) performCleanup(
+	tracer trace.Tracer,
+	kind string,
+	maxAge time.Duration,
+	cleanup func(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error),
+	deletedCounter metric.Int64Counter,
+) {
 	// Create a background context for the cleanup operation itself
-	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.dlq", trace.WithAttributes(
+	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup."+kind, trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
-		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
+		attribute.String("sqlq.cleanup.age."+kind, maxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
 	))
 	defer span.End()
 
-	// Pass 0 for processedMaxAge to signal only DLQ cleanup
-	dlqDeleted, err := driver.cleanupDeadLetterQueueJobs(ctx, cons.jobType, dlqMaxAge, cons.cleanupBatch)
+	deleted, err := cleanup(ctx, cons.jobType, maxAge, cons.cleanupBatch)
 
 	span.SetAttributes(
-		attribute.Int64("sqlq.cleanup.dlq_deleted", dlqDeleted),
+		attribute.Int64("sqlq.cleanup."+kind+"_deleted", deleted),
 	)
 
 	if err != nil {
-		// Use a standard logger or integrate with a proper logging library
-		log.Printf("sqlq: dlq cleanup failed for job_type %s: %v", cons.jobType, err) // Corrected log message
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "dlq cleanup failed") // Corrected status message
+		span.SetStatus(codes.Error, kind+" cleanup failed")
 	} else {
-		span.SetStatus(codes.Ok, "dlq cleanup completed") // Corrected status message
+		span.SetStatus(codes.Ok, kind+" cleanup completed")
 	}
+
+	deletedCounter.Add(ctx, deleted, metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType)))
 }

@@ -19,12 +19,12 @@ func newPublishingSQLiteTestCase(t *testing.T) *TestCase {
 	require.NoError(t, err)
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite)
 	require.NoError(t, err)
-	q.Run()
+	require.NoError(t, q.Run())
 	t.Cleanup(func() {
 		q.Shutdown()
 		require.NoError(t, db.Close())
 	})
-	return &TestCase{Q: q, DB: db}
+	return &TestCase{Q: q, DB: db, Metrics: nil}
 }
 
 func TestPublishTxSQLite(t *testing.T) { //nolint:tparallel // Transaction subtests share one SQLite writer and run sequentially.

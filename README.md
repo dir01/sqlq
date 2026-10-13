@@ -73,14 +73,14 @@ the database.
 
 ```go
 q, _ := sqlq.New(db, sqlq.DBTypeSQLite)
-q.Run()
+_ = q.Run() // Returns schema setup errors
 q.Consume(ctx, "greeting", handleGreeting)
 q.Publish(ctx, "greeting", "hello")
 // On shutdown: q.Shutdown(), then db.Close()
 ```
 
 Handlers receive JSON bytes. Return `nil` for success or an error for retry/DLQ
-handling. `Run` creates the schema but reports schema errors only through tracing.
+handling. `Run` creates the schema and returns an error if that fails.
 [Full SQLite demo](demo/basic-sqlite/README.md).
 
 ## 2. Use PostgreSQL
@@ -301,6 +301,12 @@ OpenTelemetry tracer provider and text-map propagator to export traces and
 carry publisher context into handlers; driver tracers use the global provider.
 See `./sqlq_testutils_otel_test.go:17` for tracing setup used by the tests.
 
+The queue also records OpenTelemetry metrics, tagged with `sqlq.job_type`:
+published, fetched, consumed, retried, dead-lettered, requeued, and cleaned-up
+job counts, handler duration, and the number of jobs in progress. Failed
+attempts carry a `sqlq.failure_reason`. Metrics go to the global meter provider
+unless `WithMeterProvider` sets another. Instruments: `./metrics.go:13`.
+
 ## Storage
 
 `Run` creates two tables and their indexes using SQL embedded in the drivers.
@@ -339,8 +345,6 @@ These details describe the implementation in this checkout:
   prevent a paused process from resuming after another worker has taken over.
 - **Cancellation is cooperative.** Handler and DLQ hook contexts inherit shutdown
   cancellation. A callback that ignores its context can keep shutdown waiting.
-- **Schema setup errors are visible only in tracing.** `Run` records schema
-  errors without returning them. See `./sqlq.go:197`.
 
 ## Development
 
@@ -357,12 +361,14 @@ SQLQ_TEST_POSTGRES_DSN='postgres://user:password@localhost/testdb?sslmode=disabl
 
 The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
 suite starts a database through Testcontainers and requires Docker. Integration
-tests export traces to localhost:4318; the Makefile provides a Jaeger command.
+tests export traces only when `OTLP_ENDPOINT` is set; the Makefile provides a
+Jaeger command and a target that sends test traces to it.
 
 ```sh
 make build
 make start-jaeger
 make test-short  # Race detector; skips PostgreSQL.
+make test-short-otel  # Same, exporting traces to Jaeger.
 make test        # Race detector; includes PostgreSQL via Docker.
 make lint
 ```
