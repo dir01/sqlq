@@ -10,6 +10,9 @@ import (
 
 	"encoding/json"
 
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
+	"github.com/pressly/goose/v3/lock"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -29,154 +32,23 @@ func newPostgresDriver(db *sql.DB) *PostgresDriver {
 	return &PostgresDriver{db: db, tracer: otel.Tracer(pgTracerName)}
 }
 
-// initSchema creates the necessary tables and indexes for PostgreSQL if they don't exist.
-// It's idempotent and safe to call multiple times.
+// initSchema applies the queue's PostgreSQL migrations (see migrate). An advisory lock keeps
+// processes starting together from applying them twice.
 func (d *PostgresDriver) initSchema(ctx context.Context) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.init_schema", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 	))
 	defer span.End()
 
-	queries := []string{
-		`CREATE TABLE IF NOT EXISTS jobs (
-			id BIGSERIAL PRIMARY KEY,
-			job_type TEXT NOT NULL,
-			payload BYTEA,
-			created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			retry_count INTEGER NOT NULL DEFAULT 0,
-			last_error TEXT,
-			trace_context JSONB, -- Added for trace propagation (using JSONB for efficiency)
-			consumed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was claimed by a consumer
-			processed_at TIMESTAMP WITH TIME ZONE NULL -- Indicates when the job was successfully processed
-		)`,
-		// Removed job_consumers table definition
-		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claim_token TEXT NULL`,
-		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMP WITH TIME ZONE NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`,
-
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
-
-		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
-			original_job_id BIGINT PRIMARY KEY, -- Use original job ID as PK
-			job_type TEXT NOT NULL,
-			payload BYTEA,
-			created_at TIMESTAMP WITH TIME ZONE NOT NULL,
-			failed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			retry_count INTEGER NOT NULL DEFAULT 0,
-			failure_reason TEXT NOT NULL DEFAULT ''
-		)`,
-		// No separate ID index needed as original_job_id is PK
-		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`, // Index for filtering by type
-		// Dead-letter times were once TIMESTAMP WITHOUT TIME ZONE, a wall-clock time with no zone:
-		// failed_at in the session's time zone and created_at in the application's. Compared with an
-		// instant, they were off by the zone's offset, so cleanup could delete fresh jobs. Old values
-		// are read as wall-clock times in this session's time zone, which is right as long as the
-		// database's and application's zones have not changed. ALTER waits for any concurrent one to
-		// commit, and then converts each value back to the same instant.
-		postgresTimestampTZMigration("dead_letter_queue", "created_at"),
-		postgresTimestampTZMigration("dead_letter_queue", "failed_at"),
-		// Columns the queue reads were once nullable. Rows other writers left with NULL get the
-		// closest value known. Scanning NULL failed: a job without created_at could never be
-		// dead-lettered, one without retry_count failed every fetch of its type, blocking the
-		// rest, and one without scheduled_at was never fetched at all. Times come first, so each
-		// fill can use the other.
-		postgresNotNullMigration("jobs", "created_at", "COALESCE(scheduled_at, CURRENT_TIMESTAMP)"),
-		postgresNotNullMigration("jobs", "scheduled_at", "created_at"),
-		postgresNotNullMigration("jobs", "retry_count", "0"),
-		postgresNotNullMigration("dead_letter_queue", "failed_at", "COALESCE(created_at, CURRENT_TIMESTAMP)"),
-		postgresNotNullMigration("dead_letter_queue", "created_at", "failed_at"),
-		postgresNotNullMigration("dead_letter_queue", "retry_count", "0"),
-		postgresNotNullMigration("dead_letter_queue", "failure_reason", "''"),
-		// Job IDs were once 32-bit: publishing failed for good after 2^31 of them, cleanup or not.
-		postgresBigintMigration("jobs", "id"),
-		postgresBigintMigration("dead_letter_queue", "original_job_id"),
-	}
-
-	tx, err := d.db.BeginTx(ctx, nil)
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(postgresMigrationLockID), lock.WithLockTimeout(1, 300))
 	if err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return err
 	}
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent("Failed to rollback transaction", trace.WithAttributes(attribute.String("error", rErr.Error())))
-			// Log or handle the rollback error appropriately
-			// If the main function error 'err' is nil, you might want to assign rErr to it here.
-		}
-	}()
-
-	for _, query := range queries {
-		_, err = tx.ExecContext(ctx, query)
-		if err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to execute query (%s): %w", query, err)
-		}
-	}
-
-	err = tx.Commit()
-	if err != nil {
+	if err = migrate(ctx, d.db, database.DialectPostgres, "postgres", goose.WithSessionLocker(locker)); err != nil {
 		span.RecordError(err)
 	}
 	return err
-}
-
-// postgresTimestampTZMigration returns a statement that changes column of table, in the current
-// schema, from TIMESTAMP WITHOUT TIME ZONE to TIMESTAMP WITH TIME ZONE, reading its values in the
-// session's time zone. It does nothing if the column already has a time zone.
-func postgresTimestampTZMigration(table, column string) string {
-	return fmt.Sprintf(`DO $$
-		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
-					AND data_type = 'timestamp without time zone'
-			) THEN
-				ALTER TABLE %[1]s ALTER COLUMN %[2]s TYPE TIMESTAMP WITH TIME ZONE
-					USING %[2]s AT TIME ZONE current_setting('TimeZone');
-			END IF;
-		END $$`, table, column)
-}
-
-// postgresNotNullMigration returns a statement that sets column of table, in the current schema,
-// to fill where it is NULL and then makes it NOT NULL. It does nothing if the column is NOT NULL.
-func postgresNotNullMigration(table, column, fill string) string {
-	return fmt.Sprintf(`DO $$
-		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
-					AND is_nullable = 'YES'
-			) THEN
-				UPDATE %[1]s SET %[2]s = %[3]s WHERE %[2]s IS NULL;
-				ALTER TABLE %[1]s ALTER COLUMN %[2]s SET NOT NULL;
-			END IF;
-		END $$`, table, column, fill)
-}
-
-// postgresBigintMigration returns a statement that changes column of table, in the current schema,
-// from INTEGER to BIGINT, with the sequence it takes values from, if any. It does nothing if the
-// column is not INTEGER.
-func postgresBigintMigration(table, column string) string {
-	return fmt.Sprintf(`DO $$
-		DECLARE
-			seq TEXT;
-		BEGIN
-			IF EXISTS (
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
-					AND data_type = 'integer'
-			) THEN
-				ALTER TABLE %[1]s ALTER COLUMN %[2]s TYPE BIGINT;
-				seq := pg_get_serial_sequence('%[1]s', '%[2]s');
-				IF seq IS NOT NULL THEN
-					-- A maximum that was integer's becomes bigint's.
-					EXECUTE format('ALTER SEQUENCE %%s AS BIGINT', seq);
-				END IF;
-			END IF;
-		END $$`, table, column)
 }
 
 // cleanupJobs deletes old processed jobs for a specific job type in PostgreSQL.

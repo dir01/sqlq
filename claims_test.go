@@ -384,38 +384,6 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
 	})
-
-	if dbType == DBTypeSQLite {
-		t.Run("legacy migration finishes DLQ moves instead of recovering them", func(t *testing.T) {
-			jobs := seed(2)
-			// Old versions added the job to the DLQ, but deleted job 0 instead of this job.
-			_, err := db.ExecContext(ctx, `INSERT INTO dead_letter_queue
-				(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-				VALUES (?, 'claims', '{}', 0, 0, 3, 'failed')`, jobs[0].ID)
-			require.NoError(t, err)
-			require.NoError(t, execSQL(ctx, db, `DROP INDEX idx_jobs_available_claims`))
-			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_token`))
-			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_expires_at`))
-			require.NoError(t, d.initSchema(ctx))
-			recovered, err := other.getJobsForConsumer(ctx, "claims", 2, time.Minute)
-			require.NoError(t, err)
-			require.Len(t, recovered, 1)
-			require.Equal(t, jobs[1].ID, recovered[0].ID)
-		})
-	}
-
-	t.Run("legacy schema migration recovers abandoned but not processed jobs", func(t *testing.T) {
-		seed(2)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET processed_at = consumed_at WHERE id = (SELECT MIN(id) FROM jobs)`))
-		require.NoError(t, execSQL(ctx, db, `DROP INDEX idx_jobs_available_claims`))
-		require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_token`))
-		require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_expires_at`))
-		require.NoError(t, d.initSchema(ctx))
-		require.NoError(t, d.initSchema(ctx))
-		jobs, err := other.getJobsForConsumer(ctx, "claims", 2, time.Minute)
-		require.NoError(t, err)
-		require.Len(t, jobs, 1)
-	})
 }
 
 func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {

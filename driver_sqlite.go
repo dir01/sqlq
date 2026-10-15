@@ -14,6 +14,7 @@ import (
 
 	"encoding/json"
 
+	"github.com/pressly/goose/v3/database"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -80,122 +81,8 @@ func (d *SQLiteDriver) lock(ctx context.Context) error {
 
 func (d *SQLiteDriver) unlock() { <-d.dbLock }
 
-// sqliteTable is a table of the queue: its column definitions, the columns copied from an older
-// version of the table, and the value that fills each NOT NULL column it may have left NULL (see
-// sqliteRebuildNullable).
-type sqliteTable struct {
-	fill          map[string]string
-	name, columns string
-	copyColumns   []string
-}
-
-// sqliteRetryCount names the retry count column in both tables.
-const sqliteRetryCount = "retry_count"
-
-var sqliteJobsTable = sqliteTable{
-	name: "jobs",
-	columns: `id INTEGER PRIMARY KEY AUTOINCREMENT,
-		job_type TEXT NOT NULL,
-		payload BLOB,
-		created_at INTEGER NOT NULL, -- Milliseconds since epoch
-		scheduled_at INTEGER NOT NULL, -- Milliseconds since epoch
-		retry_count INTEGER NOT NULL DEFAULT 0,
-		last_error TEXT,
-		trace_context TEXT, -- Added for trace propagation
-		consumed_at INTEGER NULL, -- Milliseconds since epoch, indicates when the job was claimed
-		processed_at INTEGER NULL, -- Milliseconds since epoch, indicates successful processing
-		claim_token TEXT NULL,
-		claim_expires_at INTEGER NULL -- Milliseconds since epoch`,
-	copyColumns: []string{
-		"id", "job_type", "payload", "created_at", "scheduled_at", sqliteRetryCount, "last_error",
-		"trace_context", "consumed_at", "processed_at", "claim_token", "claim_expires_at",
-	},
-	fill: map[string]string{sqliteRetryCount: "0"},
-}
-
-var sqliteDLQTable = sqliteTable{
-	name: "dead_letter_queue",
-	columns: `original_job_id INTEGER PRIMARY KEY, -- Use original job ID as PK
-		job_type TEXT NOT NULL,
-		payload BLOB,
-		created_at INTEGER NOT NULL, -- Milliseconds since epoch
-		failed_at INTEGER NOT NULL, -- Milliseconds since epoch
-		retry_count INTEGER NOT NULL DEFAULT 0,
-		failure_reason TEXT NOT NULL DEFAULT ''`,
-	copyColumns: []string{"original_job_id", "job_type", "payload", "created_at", "failed_at", sqliteRetryCount, "failure_reason"},
-	fill:        map[string]string{sqliteRetryCount: "0", "failure_reason": "''"},
-}
-
-// sqliteColumns returns the columns of table, each with whether it is NOT NULL.
-func sqliteColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT name, "notnull" FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var name string
-		var notNull bool
-		if err := rows.Scan(&name, &notNull); err != nil {
-			return nil, err
-		}
-		columns[name] = notNull
-	}
-	return columns, rows.Err()
-}
-
-// sqliteRebuildNullable rebuilds table as it is defined now if any column it fills is nullable:
-// SQLite cannot add NOT NULL to an existing column. The copy fills NULLs. Dropping the
-// table drops its indexes, which initSchema creates afterwards, and its AUTOINCREMENT counter,
-// which is carried over: IDs must never be reused, since DLQ rows keep theirs.
-func sqliteRebuildNullable(ctx context.Context, tx *sql.Tx, table sqliteTable) error {
-	columns, err := sqliteColumns(ctx, tx, table.name)
-	if err != nil {
-		return err
-	}
-	nullable := false
-	values := make([]string, len(table.copyColumns))
-	for i, column := range table.copyColumns {
-		values[i] = column
-		if fill, ok := table.fill[column]; ok {
-			values[i] = "COALESCE(" + column + ", " + fill + ")"
-			nullable = nullable || !columns[column]
-		}
-	}
-	if !nullable {
-		return nil
-	}
-	var seq sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = ?`, table.name).Scan(&seq)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) && !strings.Contains(err.Error(), "no such table") {
-		return err
-	}
-	rebuilt := table.name + "_rebuilt"
-	for _, statement := range []string{
-		`CREATE TABLE ` + rebuilt + ` (` + table.columns + "\n)",
-		`INSERT INTO ` + rebuilt + ` (` + strings.Join(table.copyColumns, ", ") + `) SELECT ` + strings.Join(values, ", ") + ` FROM ` + table.name,
-		`DROP TABLE ` + table.name,
-		`ALTER TABLE ` + rebuilt + ` RENAME TO ` + table.name,
-	} {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("%s: %w", statement, err)
-		}
-	}
-	if seq.Valid {
-		// sqlite_sequence has no key on name: replace the copy's row, if it made one.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = ?`, table.name); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`, table.name, seq.Int64); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// initSchema creates the necessary tables and indexes for SQLite if they don't exist.
-// It's idempotent and safe to call multiple times.
+// initSchema applies the queue's SQLite migrations (see migrate). dbLock keeps this process's
+// other database work out of the way.
 func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.init_schema", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -208,69 +95,7 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	}
 	defer d.unlock()
 
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	// Defer rollback and check error
-	defer func() {
-		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
-			span.AddEvent("Failed to rollback transaction during InitSchema", trace.WithAttributes(attribute.String("error", rErr.Error())))
-		}
-	}()
-
-	for _, table := range []sqliteTable{sqliteJobsTable, sqliteDLQTable} {
-		if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+table.name+` (`+table.columns+"\n)"); err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to create table %s: %w", table.name, err)
-		}
-	}
-	// CREATE TABLE IF NOT EXISTS does not change an existing table, so add the new columns here.
-	columns, err := sqliteColumns(ctx, tx, sqliteJobsTable.name)
-	if err != nil {
-		return err
-	}
-	if _, ok := columns["claim_token"]; !ok {
-		// Old versions put failed jobs in the DLQ but did not delete them from jobs (they deleted
-		// id 0). Delete them now, or claim recovery would run them again. IDs are never reused
-		// (AUTOINCREMENT), so every jobs row with a DLQ ID is one of these.
-		if _, deleteErr := tx.ExecContext(ctx, `DELETE FROM jobs WHERE id IN (SELECT original_job_id FROM dead_letter_queue)`); deleteErr != nil {
-			return deleteErr
-		}
-	}
-	for _, column := range []struct{ name, definition string }{
-		{"claim_token", "TEXT NULL"}, {"claim_expires_at", "INTEGER NULL"},
-	} {
-		if _, ok := columns[column.name]; !ok {
-			if _, alterErr := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN `+column.name+` `+column.definition); alterErr != nil {
-				return alterErr
-			}
-		}
-	}
-	// Columns the queue reads were once nullable. Other writers could leave NULL there, and
-	// scanning it failed: a job without retry_count failed every fetch of its type, blocking the
-	// rest, and a DLQ row without one, or without a reason, every listing.
-	for _, table := range []sqliteTable{sqliteJobsTable, sqliteDLQTable} {
-		if err = sqliteRebuildNullable(ctx, tx, table); err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to make the columns of %s NOT NULL: %w", table.name, err)
-		}
-	}
-	for _, index := range []string{
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index for finding available jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
-		`CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`,
-		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`, // Index for filtering by type
-	} {
-		if _, err = tx.ExecContext(ctx, index); err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("failed to execute query (%s): %w", index, err)
-		}
-	}
-
-	err = tx.Commit()
+	err := migrate(ctx, d.db, database.DialectSQLite3, "sqlite")
 	if err != nil {
 		span.RecordError(err)
 	}
