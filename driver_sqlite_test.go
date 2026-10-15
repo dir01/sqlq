@@ -168,6 +168,7 @@ func TestDriverSQLite(t *testing.T) {
 
 	t.Run("Concurrent GetJobsForConsumer Race", func(t *testing.T) {
 		t.Parallel() // Run subtest in parallel
+
 		jobType := "concurrent_race_test"
 		err := driver.insertJob(t.Context(), nil, jobType, payload, 0, traceContext)
 		require.NoError(t, err, "Failed to insert job for race test")
@@ -208,5 +209,76 @@ func TestDriverSQLite(t *testing.T) {
 			// err = driver.MarkJobProcessed(t.Context(), jobID2, consumerName)
 			// require.Error(t, err, "Marking the *same* job processed a second time should fail due to UNIQUE constraint")
 		}
+	})
+}
+
+// A deferred SQLite transaction that reads and then writes doesn't wait out the busy timeout
+// when another connection is writing: the upgrade to a write fails with "database is locked"
+// at once. Driver transactions must start with a write, so SQLite waits for the lock instead.
+func TestDriverSQLiteWaitsForOtherWriters(t *testing.T) {
+	t.Parallel()
+
+	// setup opens a database of its own and claims a job in it.
+	setup := func(t *testing.T) (*sql.DB, *SQLiteDriver, job) {
+		t.Helper()
+
+		db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "queue.db")+"?_journal_mode=WAL&_busy_timeout=5000")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+		d := newSQLiteDriver(db)
+		require.NoError(t, d.initSchema(t.Context()))
+
+		require.NoError(t, d.insertJob(t.Context(), nil, "waits_for_writers", []byte(`{}`), 0, nil))
+		jobs, err := d.getJobsForConsumer(t.Context(), "waits_for_writers", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		return db, d, jobs[0]
+	}
+
+	// requireWaitsForWriter runs op while another connection holds the write lock.
+	// op must block until that writer commits, then succeed.
+	requireWaitsForWriter := func(t *testing.T, db *sql.DB, op func() error) {
+		t.Helper()
+
+		writer, err := db.BeginTx(t.Context(), nil)
+		require.NoError(t, err)
+		_, err = writer.ExecContext(t.Context(), `INSERT INTO jobs (job_type, created_at, scheduled_at) VALUES ('other_writer', 0, 0)`)
+		require.NoError(t, err)
+
+		opErr := make(chan error, 1)
+		go func() { opErr <- op() }()
+
+		select {
+		case err := <-opErr:
+			_ = writer.Rollback()
+			t.Fatalf("expected to wait for the other writer, returned early with: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		require.NoError(t, writer.Commit())
+		require.NoError(t, <-opErr)
+	}
+
+	t.Run("Move to dead letter queue", func(t *testing.T) {
+		t.Parallel()
+
+		db, d, j := setup(t)
+
+		requireWaitsForWriter(t, db, func() error {
+			return d.moveToDeadLetterQueue(t.Context(), j.ID, j.ClaimToken, "failed", nil)
+		})
+	})
+
+	t.Run("Requeue from dead letter queue", func(t *testing.T) {
+		t.Parallel()
+
+		db, d, j := setup(t)
+		require.NoError(t, d.moveToDeadLetterQueue(t.Context(), j.ID, j.ClaimToken, "failed", nil))
+
+		requireWaitsForWriter(t, db, func() error {
+			return d.requeueDeadLetterJob(t.Context(), j.ID)
+		})
 	})
 }

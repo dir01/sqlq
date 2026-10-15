@@ -276,7 +276,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	tracerCtx := GracefulContext(ctx, 1*time.Second)
-	tracer, stopTracer, err := newTracer(tracerCtx, "localhost:4318")
+	tracer, stopTracer, err := newTracer(tracerCtx)
 	require.NoError(t, err)
 
 	q, err := sqlq.New(

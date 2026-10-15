@@ -45,6 +45,9 @@ chaos-vm:
 	$(MAKE) -C tests/chaos vm-run
 .PHONY: chaos-vm
 
+test-short-otel:
+	OTLP_ENDPOINT="localhost:4318" make test-short
+
 start-jaeger:
 	docker run -d --rm --name jaeger \
 		-p 5778:5778 \
