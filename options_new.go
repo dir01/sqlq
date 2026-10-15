@@ -21,14 +21,18 @@ func WithTracer(tracer trace.Tracer) NewOption {
 //////////////////////////////////////////
 
 // WithDefaultPollInterval allows to configure default poll interval.
+// A zero or negative interval is ignored, as it is by WithConsumerPollInteval.
 // This value may be overridden per individual consumer, see WithConsumerPollInteval.
 func WithDefaultPollInterval(tick time.Duration) NewOption {
 	return func(q *sqlq) {
-		q.defaultPollInterval = tick
+		if tick > 0 {
+			q.defaultPollInterval = tick
+		}
 	}
 }
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
+// The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
 func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	return func(q *sqlq) {

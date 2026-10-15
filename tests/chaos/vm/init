@@ -1,0 +1,107 @@
+#!/bin/sh
+# PID 1 inside the network-isolated initramfs guest.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/lib/postgresql/15/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/shm /dev/pts
+mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /data
+ip link set lo up
+
+seed=1
+n=5000
+chaos=30s
+recovery=5m
+verification=5m
+probe=10s
+job_timeout=2s
+claim_timeout=10s
+lock_timeout=100ms
+for option in $(cat /proc/cmdline); do
+    case "$option" in
+        chaos.seed=*) seed=${option#*=} ;;
+        chaos.n=*) n=${option#*=} ;;
+        chaos.duration=*) chaos=${option#*=} ;;
+        chaos.recovery=*) recovery=${option#*=} ;;
+        chaos.verification=*) verification=${option#*=} ;;
+        chaos.probe=*) probe=${option#*=} ;;
+        chaos.job_timeout=*) job_timeout=${option#*=} ;;
+        chaos.claim_timeout=*) claim_timeout=${option#*=} ;;
+        chaos.lock_timeout=*) lock_timeout=${option#*=} ;;
+    esac
+done
+
+status=0
+mkdir -p /data/artifacts /run/postgresql /data/postgres
+chown postgres:postgres /run/postgresql /data/postgres
+su postgres -s /bin/sh -c 'initdb -D /data/postgres --auth=trust --no-locale --data-checksums' >/data/artifacts/postgres-init.log 2>&1 || status=1
+su postgres -s /bin/sh -c "pg_ctl -D /data/postgres -l /data/postgres/server.log -o '-h 127.0.0.1 -p 5432' -w start" >>/data/artifacts/postgres-init.log 2>&1 || status=1
+dsn='postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable'
+
+if [ "$status" = 0 ]; then
+    # Deterministic readiness gates use the actual guest databases. The restart
+    # test crashes only this disposable server, preserving its data directory.
+    export SQLQ_TEST_POSTGRES_DSN="$dsn"
+    export SQLQ_TEST_POSTGRES_DATA_DIR=/data/postgres
+    export GORACE='halt_on_error=1 atexit_sleep_ms=0'
+    printf '{"kind":"readiness_start"}\n'
+    if sqlq-readiness.test -test.v -test.run '^TestReadiness(SQLite|Postgres)$' -test.timeout 10m > /data/artifacts/readiness.log 2>&1; then
+        printf '{"kind":"readiness_end","result":0}\n'
+    else
+        printf '{"kind":"readiness_end","result":1}\n'
+        status=1
+    fi
+fi
+
+if [ "$status" = 0 ]; then
+    sqlq-chaos -driver sqlite -clock-probe "$probe" || status=1
+    sqlq-chaos -driver postgres -dsn "$dsn" -clock-probe "$probe" || status=1
+fi
+
+# Profiles deliberately include defaults/overrides, finite/unlimited retries,
+# push fallback across independent processes, cleanup and different pool sizes.
+run_profile() {
+    profile=$1
+    shift
+    printf '{"kind":"profile_start","profile":"%s"}\n' "$profile"
+    if "$@"; then
+        profile_result=0
+    else
+        profile_result=$?
+        status=1
+    fi
+    printf '{"kind":"profile_end","profile":"%s","result":%s}\n' "$profile" "$profile_result"
+}
+if [ "$status" = 0 ]; then
+    run_profile sqlite-finite sqlq-chaos -seed "$seed" -n "$n" -chaos "$chaos" -recovery "$recovery" -verification "$verification" \
+        -job-timeout "$job_timeout" -claim-timeout "$claim_timeout" -lock-timeout "$lock_timeout" -shutdown 30s -poll 100ms -backoff 200ms -fault-interval 1s \
+        -retries 0 -artifacts /data/artifacts/sqlite-finite
+    run_profile sqlite-push sqlq-chaos -seed "$((seed+1))" -n "$n" -chaos "$chaos" -recovery "$recovery" -verification "$verification" \
+        -job-timeout "$job_timeout" -claim-timeout "$claim_timeout" -lock-timeout "$lock_timeout" -shutdown 30s -poll 100ms -backoff 200ms -fault-interval 1s \
+        -processes 2 -workers 1 -prefetch 16 -pool 2 -retries -1 -push -push-rpm 60 \
+        -cleanup 2s -artifacts /data/artifacts/sqlite-push
+    run_profile postgres sqlq-chaos -driver postgres -dsn "$dsn" -seed "$((seed+2))" -n "$n" \
+        -chaos "$chaos" -recovery "$recovery" -verification "$verification" -job-timeout "$job_timeout" -claim-timeout "$claim_timeout" -lock-timeout "$lock_timeout" -shutdown 30s \
+        -poll 100ms -backoff 200ms -fault-interval 1s -retries 1 \
+        -workers 4 -prefetch 16 -pool 8 -cleanup 2s -artifacts /data/artifacts/postgres
+fi
+
+cp /data/postgres/server.log /data/artifacts/postgres-server.log 2>/dev/null || true
+if su postgres -s /bin/sh -c 'pg_ctl -D /data/postgres -m fast -w stop' >>/data/artifacts/postgres-init.log 2>&1; then
+    su postgres -s /bin/sh -c 'pg_checksums --check -D /data/postgres' >/data/artifacts/postgres-checksums.log 2>&1 || status=1
+else
+    status=1
+fi
+
+# Export durable host artifacts over the serial channel. No SSH/NAT/host sockets.
+printf '\nSQLQ_ARTIFACTS_BEGIN\n'
+tar -C /data -czf - artifacts | base64 -w 76
+printf '\nSQLQ_ARTIFACTS_END\nSQLQ_VM_RESULT=%s\n' "$status"
+sync
+poweroff -f
+# A failed poweroff must not cause PID 1 to exit and panic before serial drains.
+while :; do sleep 60; done

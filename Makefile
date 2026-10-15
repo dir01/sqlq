@@ -14,6 +14,36 @@ test-short:
 	go test -timeout 1m -race -short -failfast -v ./...
 .PHONY: test-short
 
+test-chaos:
+	$(MAKE) -C tests/chaos test
+.PHONY: test-chaos
+
+test-simulation-sqlite:
+	$(MAKE) -C tests/chaos test-simulation-sqlite
+.PHONY: test-simulation-sqlite
+
+test-simulation-psql:
+	$(MAKE) -C tests/chaos test-simulation-psql
+.PHONY: test-simulation-psql
+
+test-chaos-checks:
+	$(MAKE) -C tests/chaos checks
+.PHONY: test-chaos-checks
+
+test-checks:
+	go vet ./...
+	GOEXPERIMENT=cgocheck2 go test -timeout 2m -short -race -gcflags=all=-d=checkptr=2 -count=1 ./...
+	$(MAKE) test-chaos-checks
+.PHONY: test-checks
+
+chaos-vm-build:
+	$(MAKE) -C tests/chaos vm-build
+.PHONY: chaos-vm-build
+
+chaos-vm:
+	$(MAKE) -C tests/chaos vm-run
+.PHONY: chaos-vm
+
 start-jaeger:
 	docker run -d --rm --name jaeger \
 		-p 5778:5778 \
@@ -27,4 +57,3 @@ start-jaeger:
 		--set receivers.otlp.protocols.http.endpoint=0.0.0.0:4318 \
 		--set receivers.otlp.protocols.grpc.endpoint=0.0.0.0:4317
 .PHONY: start-jaeger
-

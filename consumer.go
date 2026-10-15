@@ -112,11 +112,14 @@ func (cons *consumer) fetchJobsLoop() {
 			span.SetAttributes(
 				attribute.String("job_type", cons.jobType),
 				attribute.Int("attempt", int(attempt)),
+				attribute.Int64("retry_delay_ms", fetchRetryBackoff(attempt, cons.pollInterval).Milliseconds()),
 			)
 			span.End()
 
-			backoffTimeout := exponentialBackoff(attempt)
-			attempt++
+			backoffTimeout := fetchRetryBackoff(attempt, cons.pollInterval)
+			if attempt < 16 {
+				attempt++
+			}
 			select {
 			case <-time.After(backoffTimeout):
 				continue
@@ -192,6 +195,8 @@ func (cons *consumer) workerLoop() {
 
 // processJob handles a single job fetched by the poller.
 func (cons *consumer) processJob(j *job) {
+	// settled means there is no claim left to release: the job's next state was committed,
+	// or the claim was already lost to another attempt.
 	settled := false
 	defer func() {
 		// During shutdown, keep the claim in the map. shutdown releases all claims after the workers stop.
@@ -199,9 +204,13 @@ func (cons *consumer) processJob(j *job) {
 			return
 		}
 		if !settled {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Derived from cons.ctx so that Shutdown does not wait for this release.
+			ctx, cancel := context.WithTimeout(cons.ctx, 5*time.Second)
 			defer cancel()
 			if err := cons.driver.releaseClaim(ctx, *j); err != nil && !errors.Is(err, ErrClaimLost) {
+				if cons.ctx.Err() != nil {
+					return // Shutdown began during the release; shutdown releases the claim.
+				}
 				log.Printf("sqlq: failed to release claim for job %d: %v", j.ID, err)
 			}
 		}
@@ -212,22 +221,9 @@ func (cons *consumer) processJob(j *job) {
 	if cons.ctx.Err() != nil {
 		return
 	}
-	remaining := time.Until(j.ClaimExpiresAt)
-	if remaining <= 0 {
+	var ok bool
+	if ok, settled = cons.ensureClaimTime(j); !ok {
 		return
-	}
-	if remaining < claimTimeNeeded(cons.jobTimeout) {
-		deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
-		if err != nil {
-			if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
-				log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)
-			}
-			return
-		}
-		j.ClaimExpiresAt = deadline
-		if time.Until(deadline) <= 0 || cons.ctx.Err() != nil {
-			return
-		}
 	}
 	parentCtx := otel.GetTextMapPropagator().Extract(cons.ctx, propagation.MapCarrier(j.TraceContext))
 	// For context propagation ^^^^^^^^^^^ to work, there should be something like
@@ -249,11 +245,24 @@ func (cons *consumer) processJob(j *job) {
 
 	info := cons.jobInfo(j)
 
-	tx, err := cons.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "failed to begin transaction")
-		return
+	var tx *sql.Tx
+	var err error
+	for {
+		tx, err = cons.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: false})
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to begin transaction")
+			return
+		}
+		// Beginning can wait for a pool connection, during which the claim can expire and another
+		// consumer can complete the job. Check the claim again before the handler runs.
+		if time.Until(j.ClaimExpiresAt) >= claimTimeNeeded(cons.jobTimeout) {
+			break
+		}
+		_ = tx.Rollback() // Extending the claim may need this connection.
+		if ok, settled = cons.ensureClaimTime(j); !ok {
+			return
+		}
 	}
 
 	// attemptJob finishes the handler's transaction before returning, so whatever the handler
@@ -264,6 +273,7 @@ func (cons *consumer) processJob(j *job) {
 		return
 	}
 	if errors.Is(handlerErr, ErrClaimLost) || cons.ctx.Err() != nil {
+		settled = errors.Is(handlerErr, ErrClaimLost)
 		return
 	}
 
@@ -275,6 +285,7 @@ func (cons *consumer) processJob(j *job) {
 	if !info.IsFinalAttempt() {
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+			settled = errors.Is(err, ErrClaimLost)
 		} else {
 			settled = true
 		}
@@ -285,6 +296,7 @@ func (cons *consumer) processJob(j *job) {
 	// Max retries exceeded or retries disabled, move to Dead Letter Queue
 	if err = cons.moveJobToDLQ(ctx, j, info, handlerErr); err != nil {
 		if errors.Is(err, ErrClaimLost) || cons.ctx.Err() != nil {
+			settled = errors.Is(err, ErrClaimLost)
 			return
 		}
 		// Reschedule the job rather than leave it consumed and never processed.
@@ -294,6 +306,7 @@ func (cons *consumer) processJob(j *job) {
 
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+			settled = errors.Is(err, ErrClaimLost)
 		} else {
 			settled = true
 		}
@@ -303,6 +316,28 @@ func (cons *consumer) processJob(j *job) {
 
 	span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
 	settled = true
+}
+
+// ensureClaimTime makes sure the claim on j lasts long enough to run the handler and record its result,
+// extending it if needed. It returns whether it does, and if not, whether the claim is already lost
+// (settled), so there is nothing to release.
+func (cons *consumer) ensureClaimTime(j *job) (bool, bool) {
+	remaining := time.Until(j.ClaimExpiresAt)
+	if remaining <= 0 {
+		return false, false
+	}
+	if remaining >= claimTimeNeeded(cons.jobTimeout) {
+		return true, false
+	}
+	deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
+	if err != nil {
+		if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
+			log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)
+		}
+		return false, errors.Is(err, ErrClaimLost)
+	}
+	j.ClaimExpiresAt = deadline
+	return time.Until(deadline) > 0 && cons.ctx.Err() == nil, false
 }
 
 // attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
@@ -319,7 +354,16 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 	}
 
 	if err := cons.markJobDone(ctx, j, tx); err != nil {
-		return fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
+		if !errors.Is(err, errMarkInFreshTx) {
+			return fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
+		}
+		// The handler wrote nothing, so there is nothing to commit with the mark.
+		_ = tx.Rollback()
+		if err = cons.markJobDoneInFreshTx(ctx, j); err != nil {
+			return fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
+		}
+		span.SetStatus(codes.Ok, "job processed successfully")
+		return nil
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -328,6 +372,27 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 
 	span.SetStatus(codes.Ok, "job processed successfully")
 	return nil
+}
+
+// markJobDoneInFreshTx marks a job processed in a transaction of its own. The mark is that transaction's
+// first statement, so it waits for the write lock instead of failing on a stale snapshot. If even that
+// wait times out, it keeps trying until the consumer stops, even once the claim has expired. Charging
+// the job a retry would need the same lock, and giving up would run a successful handler again. The
+// mark filters on the claim token, so it fails with ErrClaimLost if another worker took the job since.
+func (cons *consumer) markJobDoneInFreshTx(ctx context.Context, j *job) error {
+	delay := time.Millisecond
+	for {
+		err := runInTx(ctx, cons.db, func(tx *sql.Tx) error { return cons.markJobDone(ctx, j, tx) })
+		if !errors.Is(err, errMarkInFreshTx) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, 50*time.Millisecond)
+	}
 }
 
 func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *sql.Tx) error {
@@ -348,9 +413,11 @@ func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *s
 		return cons.handler(ctx, tx, j.Payload)
 	})
 
-	if handlerErr == nil && ctx.Err() != nil {
-		handlerErr = ctx.Err()
-		handlerSpan.SetAttributes(attribute.Bool("sqlq.job_timed_out", true))
+	if handlerErr == nil {
+		handlerErr = contextCompletionError(ctx)
+		if errors.Is(handlerErr, context.DeadlineExceeded) {
+			handlerSpan.SetAttributes(attribute.Bool("sqlq.job_timed_out", true))
+		}
 	}
 
 	if handlerErr != nil {
@@ -392,7 +459,8 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 
 	defer span.End()
 
-	backoff := cons.backoffFunc(job.RetryCount + 1)
+	// Preserve the uint16 callback API without wrapping long-lived retries to zero.
+	backoff := cons.backoffFunc(uint16(min(uint64(job.RetryCount)+1, 65535)))
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	if err := cons.driver.markJobFailedAndReschedule(ctx, job.ID, job.ClaimToken, errorMsg, backoff); err != nil {
@@ -455,10 +523,10 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	err := callRecovering("dead letter hook", func() error {
 		return cons.onDeadLetter(ctx, tx, info, payload, handlerErr)
 	})
-	if err == nil && ctx.Err() != nil {
+	if err == nil {
 		// As with handlers, a hook that outlived its context failed even if it returned nil:
 		// tx doesn't share ctx, so its writes would otherwise still be committed.
-		err = ctx.Err()
+		err = contextCompletionError(ctx)
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -466,6 +534,19 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	}
 
 	return err
+}
+
+// contextCompletionError also checks elapsed deadlines because cancellation is
+// delivered asynchronously. After a process pause (or scheduler delay), a
+// callback can return before the context's overdue timer callback executes.
+func contextCompletionError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // callRecovering calls f and turns a panic in it into an error,
@@ -514,8 +595,8 @@ func (cons *consumer) runDLQCleanupLoop() {
 
 // performProcessedCleanup calls the driver to delete old processed jobs.
 func (cons *consumer) performProcessedCleanup(driver driver, tracer trace.Tracer, processedMaxAge time.Duration) {
-	// Create a background context for the cleanup operation itself
-	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.processed", trace.WithAttributes(
+	// Cleanup must release blocked SQL/pool waits when the consumer shuts down.
+	ctx, span := tracer.Start(cons.ctx, "sqlq.consumer.cleanup.processed", trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
 		attribute.String("sqlq.cleanup.age.processed", processedMaxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),
@@ -541,8 +622,7 @@ func (cons *consumer) performProcessedCleanup(driver driver, tracer trace.Tracer
 
 // performDLQCleanup calls the driver to delete old DLQ jobs.
 func (cons *consumer) performDLQCleanup(driver driver, tracer trace.Tracer, dlqMaxAge time.Duration) {
-	// Create a background context for the cleanup operation itself
-	ctx, span := tracer.Start(context.Background(), "sqlq.consumer.cleanup.dlq", trace.WithAttributes(
+	ctx, span := tracer.Start(cons.ctx, "sqlq.consumer.cleanup.dlq", trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
 		attribute.String("sqlq.cleanup.age.dlq", dlqMaxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(cons.cleanupBatch)),

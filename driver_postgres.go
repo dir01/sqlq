@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"encoding/json"
@@ -38,12 +39,12 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS jobs (
-			id SERIAL PRIMARY KEY,
+			id BIGSERIAL PRIMARY KEY,
 			job_type TEXT NOT NULL,
 			payload BYTEA,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-			scheduled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-			retry_count INTEGER DEFAULT 0,
+			created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			retry_count INTEGER NOT NULL DEFAULT 0,
 			last_error TEXT,
 			trace_context JSONB, -- Added for trace propagation (using JSONB for efficiency)
 			consumed_at TIMESTAMP WITH TIME ZONE NULL, -- Indicates when the job was claimed by a consumer
@@ -59,16 +60,39 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index for cleaning up processed jobs
 
 		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
-			original_job_id INTEGER PRIMARY KEY, -- Use original job ID as PK
+			original_job_id BIGINT PRIMARY KEY, -- Use original job ID as PK
 			job_type TEXT NOT NULL,
 			payload BYTEA,
-			created_at TIMESTAMP,
-			failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			retry_count INTEGER,
-			failure_reason TEXT
+			created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+			failed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			failure_reason TEXT NOT NULL DEFAULT ''
 		)`,
 		// No separate ID index needed as original_job_id is PK
 		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`, // Index for filtering by type
+		// Dead-letter times were once TIMESTAMP WITHOUT TIME ZONE, a wall-clock time with no zone:
+		// failed_at in the session's time zone and created_at in the application's. Compared with an
+		// instant, they were off by the zone's offset, so cleanup could delete fresh jobs. Old values
+		// are read as wall-clock times in this session's time zone, which is right as long as the
+		// database's and application's zones have not changed. ALTER waits for any concurrent one to
+		// commit, and then converts each value back to the same instant.
+		postgresTimestampTZMigration("dead_letter_queue", "created_at"),
+		postgresTimestampTZMigration("dead_letter_queue", "failed_at"),
+		// Columns the queue reads were once nullable. Rows other writers left with NULL get the
+		// closest value known. Scanning NULL failed: a job without created_at could never be
+		// dead-lettered, one without retry_count failed every fetch of its type, blocking the
+		// rest, and one without scheduled_at was never fetched at all. Times come first, so each
+		// fill can use the other.
+		postgresNotNullMigration("jobs", "created_at", "COALESCE(scheduled_at, CURRENT_TIMESTAMP)"),
+		postgresNotNullMigration("jobs", "scheduled_at", "created_at"),
+		postgresNotNullMigration("jobs", "retry_count", "0"),
+		postgresNotNullMigration("dead_letter_queue", "failed_at", "COALESCE(created_at, CURRENT_TIMESTAMP)"),
+		postgresNotNullMigration("dead_letter_queue", "created_at", "failed_at"),
+		postgresNotNullMigration("dead_letter_queue", "retry_count", "0"),
+		postgresNotNullMigration("dead_letter_queue", "failure_reason", "''"),
+		// Job IDs were once 32-bit: publishing failed for good after 2^31 of them, cleanup or not.
+		postgresBigintMigration("jobs", "id"),
+		postgresBigintMigration("dead_letter_queue", "original_job_id"),
 	}
 
 	tx, err := d.db.BeginTx(ctx, nil)
@@ -97,6 +121,62 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 		span.RecordError(err)
 	}
 	return err
+}
+
+// postgresTimestampTZMigration returns a statement that changes column of table, in the current
+// schema, from TIMESTAMP WITHOUT TIME ZONE to TIMESTAMP WITH TIME ZONE, reading its values in the
+// session's time zone. It does nothing if the column already has a time zone.
+func postgresTimestampTZMigration(table, column string) string {
+	return fmt.Sprintf(`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
+					AND data_type = 'timestamp without time zone'
+			) THEN
+				ALTER TABLE %[1]s ALTER COLUMN %[2]s TYPE TIMESTAMP WITH TIME ZONE
+					USING %[2]s AT TIME ZONE current_setting('TimeZone');
+			END IF;
+		END $$`, table, column)
+}
+
+// postgresNotNullMigration returns a statement that sets column of table, in the current schema,
+// to fill where it is NULL and then makes it NOT NULL. It does nothing if the column is NOT NULL.
+func postgresNotNullMigration(table, column, fill string) string {
+	return fmt.Sprintf(`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
+					AND is_nullable = 'YES'
+			) THEN
+				UPDATE %[1]s SET %[2]s = %[3]s WHERE %[2]s IS NULL;
+				ALTER TABLE %[1]s ALTER COLUMN %[2]s SET NOT NULL;
+			END IF;
+		END $$`, table, column, fill)
+}
+
+// postgresBigintMigration returns a statement that changes column of table, in the current schema,
+// from INTEGER to BIGINT, with the sequence it takes values from, if any. It does nothing if the
+// column is not INTEGER.
+func postgresBigintMigration(table, column string) string {
+	return fmt.Sprintf(`DO $$
+		DECLARE
+			seq TEXT;
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = '%[1]s' AND column_name = '%[2]s'
+					AND data_type = 'integer'
+			) THEN
+				ALTER TABLE %[1]s ALTER COLUMN %[2]s TYPE BIGINT;
+				seq := pg_get_serial_sequence('%[1]s', '%[2]s');
+				IF seq IS NOT NULL THEN
+					-- A maximum that was integer's becomes bigint's.
+					EXECUTE format('ALTER SEQUENCE %%s AS BIGINT', seq);
+				END IF;
+			END IF;
+		END $$`, table, column)
 }
 
 // cleanupJobs deletes old processed jobs for a specific job type in PostgreSQL.
@@ -233,8 +313,10 @@ func (d *PostgresDriver) insertJob(
 		query = "INSERT INTO jobs (job_type, payload, trace_context) VALUES ($1, $2, $3)"
 		args = []any{jobType, payload, string(traceContextJSON)}
 	} else {
-		query = "INSERT INTO jobs (job_type, payload, scheduled_at, trace_context) VALUES ($1, $2, NOW() + $3, $4)"
-		args = []any{jobType, payload, delay.String(), string(traceContextJSON)}
+		// clock_timestamp, not NOW: in a caller's transaction, NOW is when that transaction began,
+		// which would shorten the delay by the transaction's age.
+		query = "INSERT INTO jobs (job_type, payload, scheduled_at, trace_context) VALUES ($1, $2, clock_timestamp() + $3 * interval '1 microsecond', $4)"
+		args = []any{jobType, payload, delay.Microseconds(), string(traceContextJSON)}
 	}
 
 	var executor sqlExecutor = d.db
@@ -291,7 +373,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
-			var createdAt sql.NullTime // The schema allows NULL, and failing to scan would strand the claimed job
+			var createdAt sql.NullTime // NOT NULL now, but failing to scan would strand the claimed job
 			j.JobType = jobType        // Set job type as it's not returned by RETURNING
 
 			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken); err != nil {
@@ -342,6 +424,16 @@ func (d *PostgresDriver) subscribeForConsumer(_ context.Context, _ string, _ *to
 }
 
 // markJobProcessed updates the jobs table to mark a job as successfully processed in PostgreSQL.
+// markProcessedLockAttempts bounds how often markJobProcessed waits out a lock timeout.
+const markProcessedLockAttempts = 3
+
+// isLockTimeout reports whether err is PostgreSQL's lock_not_available (55P03), the lock_timeout error.
+// Matched by SQLSTATE so that any database/sql driver exposing it (pgx, lib/pq) works.
+func isLockTimeout(err error) bool {
+	var stateErr interface{ SQLState() string }
+	return errors.As(err, &stateErr) && stateErr.SQLState() == "55P03"
+}
+
 func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -350,10 +442,30 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 	))
 	defer span.End()
 
-	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = clock_timestamp() WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`,
-		jobID, claimToken,
-	)
+	// A competing claim query can briefly lock this row although it doesn't take it: its FOR UPDATE
+	// rechecks the row's newer, claimed version and keeps the lock until that query's transaction
+	// commits. With a short lock_timeout, the update below could then time out after the handler
+	// succeeded. Retry it from a savepoint, which keeps the handler's writes.
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT sqlq_mark_processed`); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	var res sql.Result
+	var err error
+	for attempt := 1; ; attempt++ {
+		res, err = tx.ExecContext(ctx,
+			`UPDATE jobs SET processed_at = clock_timestamp() WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`,
+			jobID, claimToken,
+		)
+		if err == nil || attempt == markProcessedLockAttempts || !isLockTimeout(err) {
+			break
+		}
+		span.AddEvent("lock timeout marking job processed, retrying", trace.WithAttributes(attribute.Int("sqlq.attempt", attempt)))
+		if _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT sqlq_mark_processed`); rbErr != nil {
+			span.RecordError(rbErr)
+			return err
+		}
+	}
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -371,6 +483,13 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 	}
 
 	return nil
+}
+
+// postgresText returns s as text PostgreSQL can store: its text type rejects NUL bytes and,
+// in a UTF-8 database, invalid UTF-8, and either would keep a job's failure from being
+// recorded. Each is replaced with U+FFFD.
+func postgresText(s string) string {
+	return strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", "\uFFFD"), "\uFFFD")
 }
 
 // MarkJobFailedAndReschedule updates a job's state to failed, increments the retry count,
@@ -399,15 +518,15 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 	// Update the job: increment retry, set error, schedule, clear consumption/processing state
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET
-			retry_count = retry_count + 1,
+			retry_count = CASE WHEN retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END,
 			last_error = $1,
-			scheduled_at = NOW() + $2::interval,
+			scheduled_at = clock_timestamp() + $2 * interval '1 microsecond',
 			consumed_at = NULL,
 			claim_token = NULL,
 			claim_expires_at = NULL,
 			processed_at = NULL
 		WHERE id = $3 AND claim_token = $4 AND processed_at IS NULL`,
-		errorMsg, backoffDuration.String(), jobID, claimToken,
+		postgresText(errorMsg), backoffDuration.Microseconds(), jobID, claimToken,
 	)
 	err = checkClaimResult(res, err)
 	if err != nil {
@@ -450,7 +569,7 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		CreatedAt  time.Time
 		JobType    string
 		Payload    []byte
-		RetryCount uint16
+		RetryCount uint32
 	}
 	err = tx.QueryRowContext(ctx, `
 		SELECT job_type, payload, created_at, retry_count
@@ -470,7 +589,7 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		INSERT INTO dead_letter_queue
 		(original_job_id, job_type, payload, created_at, retry_count, failure_reason)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, jobID, j.JobType, j.Payload, j.CreatedAt, j.RetryCount, reason) // Use jobID directly for original_job_id
+	`, jobID, j.JobType, j.Payload, j.CreatedAt, j.RetryCount, postgresText(reason)) // Use jobID directly for original_job_id
 	if err != nil {
 		span.RecordError(err)
 		return err // Rollback will happen
@@ -602,14 +721,16 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 		}
 	}()
 
-	// Get the job from the dead letter queue
+	// Atomically take the DLQ row. A concurrent requeue waits and then observes
+	// no row, rather than committing a second replacement. An INSERT failure
+	// rolls back this DELETE too, so the failed job remains recoverable.
 	var dlqJob struct { // Select only needed fields
 		JobType string
 		Payload []byte
 	}
 	err = tx.QueryRowContext(ctx, `
-		SELECT job_type, payload
-		FROM dead_letter_queue WHERE original_job_id = $1
+		DELETE FROM dead_letter_queue WHERE original_job_id = $1
+		RETURNING job_type, payload
 	`, originalJobID).Scan(&dlqJob.JobType, &dlqJob.Payload) // Use originalJobID in WHERE
 	if err != nil {
 		span.RecordError(err)
@@ -625,13 +746,6 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 		INSERT INTO jobs (job_type, payload, retry_count, scheduled_at)
 		VALUES ($1, $2, 0, NOW())
 	`, dlqJob.JobType, dlqJob.Payload) // Use ExecContext
-	if err != nil {
-		span.RecordError(err)
-		return err // Rollback will happen
-	}
-
-	// Delete from the dead letter queue
-	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE original_job_id = $1", originalJobID) // Use originalJobID in WHERE
 	if err != nil {
 		span.RecordError(err)
 		return err // Rollback will happen
