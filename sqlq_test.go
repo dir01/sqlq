@@ -22,6 +22,8 @@ type TestPayload struct {
 type TestCase struct {
 	Q  sqlq.JobsQueue
 	DB *sql.DB // The database Q works on, for tests that need tables of their own
+	// DBType is the type of DB, for tests that need a queue of their own on it.
+	DBType sqlq.DBType
 }
 
 // GracefulContext creates a context that inherits values from its parent

@@ -155,7 +155,7 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 // cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 // It deletes DLQ jobs older than maxAge, in batches.
 func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) { //nolint
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_jobs", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.cleanup_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
 		attribute.String("sqlq.job_type", jobType),
 		attribute.String("sqlq.cleanup.age", maxAge.String()),
@@ -331,7 +331,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 				ORDER BY id
 				LIMIT ?
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+			RETURNING id, payload, retry_count, trace_context, created_at, scheduled_at, claim_token
 		`, claimToken, claimTimeout.Milliseconds(), jobType, prefetchCount)
 		if err != nil {
 			return fmt.Errorf("failed to claim jobs: %w", err)
@@ -344,12 +344,13 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		for rows.Next() {
 			var j job
 			var traceContextJSON sql.NullString
-			var createdAtMs int64
+			var createdAtMs, scheduledAtMs int64
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &scheduledAtMs, &j.ClaimToken); err != nil {
 				return fmt.Errorf("failed to scan claimed job: %w", err) // Return error to rollback
 			}
 			j.CreatedAt = time.UnixMilli(createdAtMs)
+			j.ScheduledAt = time.UnixMilli(scheduledAtMs)
 			j.ClaimExpiresAt = deadline
 
 			// Deserialize trace context
@@ -575,8 +576,6 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 		return err // Rollback will happen
 	}
 
-	// No need to delete from job_consumers anymore
-
 	err = tx.Commit()
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to commit transaction for reschedule: %w", err))
@@ -630,15 +629,13 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 		return err // Rollback will happen
 	}
 
-	// Delete from jobs table (no CASCADE in SQLite by default, but job_consumers is gone anyway)
+	// Delete from jobs table
 	res, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
 	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)
 	}
-
-	// No need to delete from job_consumers
 
 	if inTx != nil {
 		if err = inTx(tx); err != nil {
@@ -652,6 +649,21 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 		span.RecordError(err)
 	}
 	return err
+}
+
+// getReadyJobStats counts the jobs of jobType that a consumer can claim now, in SQLite.
+// It does not take dbLock: it only reads, and the metrics callback must not delay queue writes.
+func (d *SQLiteDriver) getReadyJobStats(ctx context.Context, jobType string) (readyJobStats, error) {
+	var stats readyJobStats
+	var lagMs int64
+	err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(`+sqliteNow+` - MIN(scheduled_at), 0)
+		FROM jobs
+		WHERE job_type = ? AND processed_at IS NULL AND scheduled_at <= `+sqliteNow+`
+		AND (claim_expires_at IS NULL OR claim_expires_at <= `+sqliteNow+`)
+	`, jobType).Scan(&stats.count, &lagMs)
+	stats.lag = time.Duration(lagMs) * time.Millisecond
+	return stats, err
 }
 
 // getDeadLetterJobs retrieves jobs from the dead_letter_queue table in SQLite, optionally filtered by job type.
@@ -700,12 +712,8 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 	if err != nil {
 		return nil, err
 	}
-	// Defer close and check error
 	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			// Cannot add to span here as it's not available, log instead or ignore.
-			fmt.Printf("WARN: Failed to close rows in queryDeadLetterJobs helper: %v\n", closeErr)
-		}
+		_ = rows.Close() // rows.Err reports read errors; a Close error after that changes nothing.
 	}()
 
 	var jobs []DeadLetterJob

@@ -42,8 +42,8 @@ func TestPollIntervalHelper(t *testing.T) { //nolint:paralleltest // A subproces
 	defer func() { require.NoError(t, db.Close()) }()
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollInterval(tick))
 	require.NoError(t, err)
-	q.Run()
-	defer q.Shutdown()
+	require.NoError(t, q.Run(t.Context()))
+	defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 	processed := make(chan struct{})
 	require.NoError(t, q.Consume(t.Context(), "poll", func(context.Context, *sql.Tx, []byte) error {
 		close(processed)

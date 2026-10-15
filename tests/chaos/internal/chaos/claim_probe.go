@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/dir01/sqlq"
@@ -20,11 +21,12 @@ func AcceptedClaimTimeout(ctx context.Context, jobTimeout, claimTimeout time.Dur
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1) // Each connection would have a database of its own.
-	q, err := sqlq.New(db, sqlq.DBTypeSQLite)
+	// The probe creates no tables, so the polls of an accepted consumer fail. Their logs mean nothing here.
+	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithLogger(slog.New(slog.DiscardHandler)))
 	if err != nil {
 		return 0, 0, err
 	}
-	defer q.Shutdown()
+	defer shutdown(q)
 	for rejected := 0; ; rejected++ {
 		err := q.Consume(ctx, "claim_probe", func(context.Context, *sql.Tx, []byte) error { return nil },
 			sqlq.WithConsumerJobTimeout(jobTimeout), sqlq.WithConsumerClaimTimeout(claimTimeout))

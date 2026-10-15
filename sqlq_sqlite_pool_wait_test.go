@@ -65,7 +65,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 		q, err := sqlq.New(db, sqlq.DBTypeSQLite, opts...)
 		require.NoError(t, err)
 		t.Cleanup(func() {
-			q.Shutdown()
+			assert.NoError(t, q.Shutdown(context.Background()))
 			assert.NoError(t, db.Close())
 		})
 		return q, db
@@ -75,7 +75,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 	tracer := &poolHoldingTracer{Tracer: noop.NewTracerProvider().Tracer("pool-wait"), db: nil, holding: make(chan struct{}), once: sync.Once{}, hold: 3 * jobTimeout}
 	waiting, waitingDB := newQueue(tracer)
 	tracer.db = waitingDB
-	waiting.Run()
+	require.NoError(t, waiting.Run(ctx))
 	other, _ := newQueue(nil)
 
 	var staleCalls, otherCalls atomic.Int32

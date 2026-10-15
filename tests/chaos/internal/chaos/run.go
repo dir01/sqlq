@@ -130,7 +130,7 @@ func Run(ctx context.Context, c Config, command Command, observers ...func(Event
 	if err != nil {
 		return summary, err
 	}
-	defer q.Shutdown()
+	defer shutdown(q)
 	if err := initialize(ctx, c, db, q); err != nil {
 		return summary, err
 	}

@@ -105,8 +105,16 @@ func queue(c Config, db *sql.DB, tracers ...trace.Tracer) (sqlq.JobsQueue, error
 	return sqlq.New(db, sqlq.DBType(c.Driver), opts...)
 }
 
+// shutdown stops q and waits with no time limit, as services that rely on Shutdown alone do.
+// Shutdown returns an error only when its context ends, so it returns nil here.
+func shutdown(q sqlq.JobsQueue) {
+	_ = q.Shutdown(context.Background())
+}
+
 func initialize(ctx context.Context, c Config, db *sql.DB, q sqlq.JobsQueue) error {
-	q.Run()
+	if err := q.Run(ctx); err != nil {
+		return err
+	}
 	if c.SideDB != "" {
 		if err := createSideDB(ctx, c); err != nil {
 			return err
@@ -197,7 +205,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		if sideQ, err = queue(c, sideDB, tracer); err != nil {
 			return err
 		}
-		defer sideQ.Shutdown()
+		defer shutdown(sideQ)
 	}
 	// Application database work outlives the queue: services usually stop the
 	// queue first and release their own connections afterwards.
@@ -205,7 +213,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 	var app sync.WaitGroup
 	defer app.Wait()
 	defer stopApp()
-	defer q.Shutdown()
+	defer shutdown(q)
 	defer func() { metrics.emit(e, db) }()
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -222,9 +230,9 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		go func() {
 			defer close(shutdownDone)
 			<-ctx.Done()
-			q.Shutdown()
+			shutdown(q)
 			if sideQ != nil {
-				sideQ.Shutdown()
+				shutdown(sideQ)
 			}
 			e.emit("shutdown_returned", -1, "")
 		}()
@@ -439,7 +447,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		e.emit("kept_attempt", -1, fmt.Sprintf("retry=%d", info.RetryCount))
 		return errors.New(keptFailure + faultText)
 		// Each SQLite poll takes the write lock too, even when it finds nothing (see DLQ cleanup).
-	}, sqlq.WithConsumerMaxRetries(1), sqlq.WithConsumerPollInteval(50*c.Poll))
+	}, sqlq.WithConsumerMaxRetries(1), sqlq.WithConsumerPollInterval(50*c.Poll))
 	if err != nil {
 		return err
 	}

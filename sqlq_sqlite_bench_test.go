@@ -82,7 +82,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	)
 	require.NoError(b, err)
 
-	q.Run()
+	require.NoError(b, q.Run(b.Context()))
 
 	var processedCount atomic.Int64
 	totalJobs := int64(b.N) // Total jobs to process in this benchmark run
@@ -95,12 +95,12 @@ func BenchmarkHighConcurrency(b *testing.B) {
 
 	err = q.Consume(
 		b.Context(), jobType, handler,
-		sqlq.WithConsumerPollInteval(100*time.Millisecond),
+		sqlq.WithConsumerPollInterval(100*time.Millisecond),
 		sqlq.WithAsyncPush(),
 	)
 
 	require.NoError(b, err)
-	q.Run()
+	require.NoError(b, q.Run(b.Context()))
 
 	payload := []byte(`{"data":"benchmark"}`)
 
@@ -145,5 +145,5 @@ func BenchmarkHighConcurrency(b *testing.B) {
 	require.Empty(b, dlqJobs, "DLQ should be empty after successful benchmark run")
 
 	// Cleanup
-	q.Shutdown()
+	require.NoError(b, q.Shutdown(b.Context()))
 }

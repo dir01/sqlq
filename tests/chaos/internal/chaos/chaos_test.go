@@ -121,7 +121,7 @@ func TestOracleRejectsCorruption(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer q.Shutdown()
+			defer shutdown(q)
 			if err := initialize(t.Context(), c, db, q); err != nil {
 				t.Fatal(err)
 			}

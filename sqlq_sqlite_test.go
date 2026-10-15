@@ -1,6 +1,7 @@
 package sqlq_test
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -44,6 +45,15 @@ func TestSQLite(t *testing.T) {
 		defer span.End()
 
 		newSQLiteTestCase(t, "memdb_dlq_hook_failure", tracer).TestDLQHookFailure(ctx, t)
+	})
+
+	t.Run("Metrics", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestSQLite.TestMetrics")
+		defer span.End()
+
+		newSQLiteTestCase(t, "memdb_metrics", tracer).TestMetrics(ctx, t)
 	})
 
 	t.Run("Basic pub/sub", func(t *testing.T) {
@@ -163,12 +173,12 @@ func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCa
 	)
 	require.NoError(t, err)
 
-	q.Run()
+	require.NoError(t, q.Run(t.Context()))
 
 	t.Cleanup(func() {
-		q.Shutdown()
+		assert.NoError(t, q.Shutdown(context.Background()))
 		assert.NoError(t, db.Close())
 	})
 
-	return &TestCase{Q: q, DB: db}
+	return &TestCase{Q: q, DB: db, DBType: sqlq.DBTypeSQLite}
 }

@@ -38,6 +38,12 @@ func TestPostgreSQL(t *testing.T) {
 		tc.TestPublishTx(t.Context(), t)
 	})
 
+	t.Run("Metrics", func(t *testing.T) {
+		t.Parallel()
+
+		tc.TestMetrics(t.Context(), t)
+	})
+
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
 
@@ -282,9 +288,9 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	)
 	require.NoError(t, err)
 
-	q.Run()
+	require.NoError(t, q.Run(t.Context()))
 
-	return &TestCase{Q: q, DB: db}, tracer, func() {
+	return &TestCase{Q: q, DB: db, DBType: sqlq.DBTypePostgres}, tracer, func() {
 		require.NoError(t, db.Close())
 		require.NoError(t, container.Terminate(tracerCtx))
 		require.NoError(t, stopTracer())

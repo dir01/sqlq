@@ -32,9 +32,9 @@ func TestAcceptedClaimTimeoutRunsHandler(t *testing.T) {
 			require.NoError(t, err)
 			q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollInterval(10*time.Millisecond))
 			require.NoError(t, err)
-			q.Run()
+			require.NoError(t, q.Run(t.Context()))
 			t.Cleanup(func() {
-				q.Shutdown()
+				assert.NoError(t, q.Shutdown(context.Background()))
 				assert.NoError(t, db.Close())
 			})
 			ran := make(chan struct{}, 1)

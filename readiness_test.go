@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,7 +177,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				}
 				awaitReadiness(t, "cleanup waiting for a pool connection", func() bool { return cleanupDB.Stats().WaitCount > 0 })
 				done := make(chan struct{})
-				go func() { cons.shutdown(); close(done) }()
+				go func() { assert.NoError(t, cons.shutdown(t.Context())); close(done) }()
 				select {
 				case <-done:
 				case <-time.After(5 * time.Second):
@@ -329,7 +330,7 @@ func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) 
 				return countReadiness(t, db, `SELECT count(*) FROM pg_stat_activity WHERE application_name='`+f.schema+`' AND wait_event_type='Lock'`) > 0
 			})
 			done := make(chan struct{})
-			go func() { cons.shutdown(); close(done) }()
+			go func() { assert.NoError(t, cons.shutdown(t.Context())); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):

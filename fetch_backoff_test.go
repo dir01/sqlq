@@ -3,6 +3,7 @@ package sqlq
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	cons := &consumer{                                         //nolint:exhaustruct // Only the polling loop is exercised.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"),
 		pollInterval: 5 * time.Millisecond, prefetchCount: 1, concurrency: 1,
-		claims: make(map[string]job),
+		claims: make(map[string]heldClaim), logger: slog.New(slog.DiscardHandler),
 	}
 	done := make(chan struct{})
 	go func() { defer close(done); cons.fetchJobsLoop() }()
