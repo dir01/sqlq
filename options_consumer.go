@@ -71,6 +71,8 @@ func WithConsumerPollInterval(interval time.Duration) ConsumerOption {
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
 // The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
+// If fn panics, the panic is logged and the retry uses the built-in exponential backoff with jitter,
+// capped at 24 hours.
 // Consume returns ErrNilBackoffFunc if fn is nil.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
 func WithConsumerBackoffFunc(fn func(uint16) time.Duration) ConsumerOption {
