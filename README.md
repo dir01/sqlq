@@ -431,13 +431,15 @@ SQLQ_TEST_POSTGRES_DSN='postgres://user:password@localhost/testdb?sslmode=disabl
 
 The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
 suite starts a database through Testcontainers and requires Docker. Integration
-tests export traces to localhost:4318; the Makefile provides a Jaeger command.
+tests export traces only when `OTLP_ENDPOINT` is set; `make test-short-otel`
+sets it to localhost:4318, and the Makefile provides a Jaeger command.
 
 ```sh
 make build
+make test-short       # Race detector; skips PostgreSQL.
+make test             # Race detector; includes PostgreSQL via Docker.
 make start-jaeger
-make test-short  # Race detector; skips PostgreSQL.
-make test        # Race detector; includes PostgreSQL via Docker.
+make test-short-otel  # As test-short, and exports traces to Jaeger.
 make lint
 ```
 

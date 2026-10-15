@@ -30,8 +30,8 @@ func TestFetchRetryBackoff(t *testing.T) {
 
 type transientFetchDriver struct {
 	driver
-	calls     int
 	recovered chan struct{}
+	calls     int
 }
 
 func (d *transientFetchDriver) getJobsForConsumer(context.Context, string, uint16, time.Duration) ([]job, error) {

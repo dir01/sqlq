@@ -24,9 +24,20 @@ func (c delayedDeadlineContext) Deadline() (time.Time, bool) {
 	return c.deadline, true
 }
 
+// The callbacks that TestCallbackDeadlineTransaction runs.
+const (
+	handlerCallback    = "handler"
+	deadLetterCallback = "dead-letter hook"
+)
+
+// deadlineCounts are the rows that TestCallbackDeadlineTransaction counts after a callback.
+type deadlineCounts struct {
+	effects, poison, pending, processed, dlq int
+}
+
 func TestCallbackDeadlineTransaction(t *testing.T) {
 	t.Parallel()
-	for _, callback := range []string{"handler", "dead-letter hook"} {
+	for _, callback := range []string{handlerCallback, deadLetterCallback} {
 		for _, expired := range []bool{true, false} {
 			name := callback + "/live"
 			if expired {
@@ -76,7 +87,7 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 				}
 				// No local timeout is necessary: the callback inherits ctx's
 				// deadline. This exposes timer-delivery lag without sleeps/signals.
-				if callback == "handler" {
+				if callback == handlerCallback {
 					tx, beginErr := db.BeginTx(base, nil)
 					require.NoError(t, beginErr)
 					defer func() { _ = tx.Rollback() }()
@@ -93,24 +104,25 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 					require.NoError(t, err)
 				}
 
-				counts := make(map[string]int)
-				for name, query := range map[string]string{
-					"effects":   "SELECT COUNT(*) FROM effects",
-					"poison":    "SELECT COUNT(*) FROM jobs WHERE job_type='poison'",
-					"pending":   "SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NULL",
-					"processed": "SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NOT NULL",
-					"dlq":       "SELECT COUNT(*) FROM dead_letter_queue",
-				} {
-					var count int
-					require.NoError(t, db.QueryRowContext(base, query).Scan(&count))
-					counts[name] = count
+				count := func(query string) int {
+					var n int
+					require.NoError(t, db.QueryRowContext(base, query).Scan(&n))
+					return n
 				}
-				if expired {
-					require.Equal(t, map[string]int{"effects": 0, "poison": 0, "pending": 1, "processed": 0, "dlq": 0}, counts)
-				} else if callback == "handler" {
-					require.Equal(t, map[string]int{"effects": 1, "poison": 1, "pending": 0, "processed": 1, "dlq": 0}, counts)
-				} else {
-					require.Equal(t, map[string]int{"effects": 1, "poison": 1, "pending": 0, "processed": 0, "dlq": 1}, counts)
+				counts := deadlineCounts{
+					effects:   count("SELECT COUNT(*) FROM effects"),
+					poison:    count("SELECT COUNT(*) FROM jobs WHERE job_type='poison'"),
+					pending:   count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NULL"),
+					processed: count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NOT NULL"),
+					dlq:       count("SELECT COUNT(*) FROM dead_letter_queue"),
+				}
+				switch {
+				case expired:
+					require.Equal(t, deadlineCounts{effects: 0, poison: 0, pending: 1, processed: 0, dlq: 0}, counts)
+				case callback == handlerCallback:
+					require.Equal(t, deadlineCounts{effects: 1, poison: 1, pending: 0, processed: 1, dlq: 0}, counts)
+				default:
+					require.Equal(t, deadlineCounts{effects: 1, poison: 1, pending: 0, processed: 0, dlq: 1}, counts)
 				}
 			})
 		}
