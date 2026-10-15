@@ -125,6 +125,9 @@ type sqlq struct {
 	meterProvider      metric.MeterProvider
 	// Stops the callback that reports queue depth and lag. Shutdown calls Unregister.
 	metricsRegistration metric.Registration
+	metricsCtx          context.Context
+	cancelMetrics       context.CancelFunc
+	metricsDone         chan struct{} // Closed after Unregister returns.
 	logger              *slog.Logger
 	metrics             *metrics
 	consumersMap        map[string]*consumer // jobType -> consumer
@@ -234,6 +237,9 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		tracer:                          otel.Tracer(tracerName),
 		meterProvider:                   otel.GetMeterProvider(),
 		metricsRegistration:             nil,
+		metricsCtx:                      nil,
+		cancelMetrics:                   nil,
+		metricsDone:                     nil,
 		metrics:                         nil,
 		logger:                          slog.Default(),
 	}
@@ -453,21 +459,35 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 // Shutdown stops the job processing. Consume fails with ErrShutDown from then on.
 func (q *sqlq) Shutdown(ctx context.Context) error {
 	q.consumersMapMutex.Lock()
+	firstShutdown := !q.shutDown
 	q.shutDown = true
 	consumers := slices.Collect(maps.Values(q.consumersMap))
 	q.consumersMapMutex.Unlock()
 
-	// The application closes the database after Shutdown, so stop the metrics callback's queries.
-	if err := q.metricsRegistration.Unregister(); err != nil {
-		q.logger.ErrorContext(ctx, "sqlq: failed to unregister the metrics callback", slog.Any("error", err))
+	// Collection may be waiting for a connection held by a handler. Cancel both
+	// before unregistering, which can wait for active collection to finish.
+	for _, cons := range consumers {
+		cons.cancel()
+	}
+	q.cancelMetrics()
+	if firstShutdown {
+		go func() {
+			defer close(q.metricsDone)
+			if err := q.metricsRegistration.Unregister(); err != nil {
+				q.logger.ErrorContext(ctx, "sqlq: failed to unregister the metrics callback", slog.Any("error", err))
+			}
+		}()
 	}
 
 	errs := make([]error, len(consumers))
 	var wg sync.WaitGroup
+	wg.Go(func() { <-q.metricsDone })
 	for i, cons := range consumers {
 		wg.Go(func() { errs[i] = cons.shutdown(ctx) })
 	}
-	wg.Wait()
+	if err := waitContext(ctx, &wg); err != nil {
+		return err
+	}
 
 	for _, err := range errs {
 		if err != nil {

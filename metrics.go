@@ -86,8 +86,11 @@ func (q *sqlq) setUpMetrics() error {
 		return err
 	}
 	q.metrics = m // Before the callback is registered: the callback uses it.
+	q.metricsCtx, q.cancelMetrics = context.WithCancel(context.Background())
+	q.metricsDone = make(chan struct{})
 	q.metricsRegistration, err = meter.RegisterCallback(q.observeQueue, m.queueDepth, m.queueLag)
 	if err != nil {
+		q.cancelMetrics()
 		return fmt.Errorf("failed to register metrics callback: %w", err)
 	}
 	return nil
@@ -105,10 +108,23 @@ func (q *sqlq) observeQueue(ctx context.Context, o metric.Observer) error {
 		return nil
 	}
 
+	// Preserve the collector's context while also interrupting pool and query
+	// waits when the queue shuts down.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopCancelOnShutdown := context.AfterFunc(q.metricsCtx, cancel)
+	defer stopCancelOnShutdown()
+
 	var errs []error
 	for _, jobType := range jobTypes {
+		if q.metricsCtx.Err() != nil {
+			return nil
+		}
 		stats, err := q.driver.getReadyJobStats(ctx, jobType)
 		if err != nil {
+			if q.metricsCtx.Err() != nil {
+				return nil // Shutdown interrupted collection; that is no failure.
+			}
 			errs = append(errs, fmt.Errorf("failed to read queue depth of %s: %w", jobType, err))
 			continue
 		}
