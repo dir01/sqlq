@@ -4,6 +4,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -13,17 +14,6 @@ type driver interface {
 	// initSchema creates the necessary tables if they don't exist
 	// It should be safe to call multiple times, even though there is no reason to do so
 	initSchema(ctx context.Context) error
-
-	/*
-		type job struct {
-			JobType      string
-			CreatedAt    time.Time
-			TraceContext map[string]string
-			Payload      []byte
-			ID           int64
-			RetryCount   uint16
-		}
-	*/
 
 	// insertJob inserts through tx when provided, otherwise through the database.
 	// The caller owns committing or rolling back tx.
@@ -40,6 +30,8 @@ type driver interface {
 
 	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
+	// It returns errMarkInFreshTx when tx made no writes and could not become a writer;
+	// the caller may then roll tx back and mark the job in a new transaction.
 	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
@@ -55,7 +47,7 @@ type driver interface {
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
 	// requeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-	requeueDeadLetterJob(ctx context.Context, dlqID int64) (jobType string, err error)
+	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
 	// cleanupJobs deletes old processed jobs for a specific job type.
 	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
@@ -64,7 +56,22 @@ type driver interface {
 	// cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
+
+	// getReadyJobStats counts the jobs of jobType that a consumer can claim now, and finds how long
+	// the oldest of them has been due. The metrics callback calls it.
+	getReadyJobStats(ctx context.Context, jobType string) (readyJobStats, error)
 }
+
+// readyJobStats describes the jobs of one type that a consumer can claim now: due and not claimed.
+type readyJobStats struct {
+	lag   time.Duration // How long the oldest of them has been due. Zero when there are none.
+	count int64
+}
+
+// errMarkInFreshTx is returned by markJobProcessed when the handler's transaction wrote nothing
+// but could not be upgraded to a write transaction. Marking the job in a new transaction then
+// loses nothing.
+var errMarkInFreshTx = errors.New("handler transaction wrote nothing and could not become a writer")
 
 // sqlExecutor is implemented by both *sql.DB and *sql.Tx.
 type sqlExecutor interface {

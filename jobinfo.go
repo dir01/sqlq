@@ -12,13 +12,15 @@ type JobInfo struct {
 	JobType    string
 	ID         int64
 	MaxRetries int32 // -1 means unlimited
-	RetryCount uint16
+	// RetryCount saturates at 2^31-1, the database counter limit. Unlimited
+	// retries continue at that value; finite limits still reach a final attempt.
+	RetryCount uint32
 }
 
 // IsFinalAttempt reports whether a failure of the current attempt will move the job
 // to the dead letter queue instead of scheduling another retry.
 func (ji JobInfo) IsFinalAttempt() bool {
-	return ji.MaxRetries != infiniteRetries && int32(ji.RetryCount) >= ji.MaxRetries
+	return ji.MaxRetries != infiniteRetries && ji.RetryCount >= uint32(ji.MaxRetries)
 }
 
 type jobInfoCtxKey struct{}

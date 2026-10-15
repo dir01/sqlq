@@ -6,13 +6,36 @@ test:
 	go test -timeout 3m -race -v ./...
 .PHONY: test
 
+# The linter has a module file of its own, so that its dependencies stay out of the library's.
 lint:
-	go tool golangci-lint run
+	go tool -modfile=tools/go.mod golangci-lint run
 .PHONY: lint
 
 test-short:
 	go test -timeout 1m -race -short -failfast -v ./...
 .PHONY: test-short
+
+test-chaos:
+	$(MAKE) -C tests/chaos test
+.PHONY: test-chaos
+
+test-simulation-sqlite:
+	$(MAKE) -C tests/chaos test-simulation-sqlite
+.PHONY: test-simulation-sqlite
+
+test-simulation-psql:
+	$(MAKE) -C tests/chaos test-simulation-psql
+.PHONY: test-simulation-psql
+
+test-chaos-checks:
+	$(MAKE) -C tests/chaos checks
+.PHONY: test-chaos-checks
+
+test-checks:
+	go vet ./...
+	GOEXPERIMENT=cgocheck2 go test -timeout 2m -short -race -gcflags=all=-d=checkptr=2 -count=1 ./...
+	$(MAKE) test-chaos-checks
+.PHONY: test-checks
 
 test-short-otel:
 	OTLP_ENDPOINT="localhost:4318" make test-short
@@ -30,4 +53,3 @@ start-jaeger:
 		--set receivers.otlp.protocols.http.endpoint=0.0.0.0:4318 \
 		--set receivers.otlp.protocols.grpc.endpoint=0.0.0.0:4317
 .PHONY: start-jaeger
-

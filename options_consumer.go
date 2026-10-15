@@ -3,6 +3,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"math"
 	"time"
 )
 
@@ -10,11 +11,15 @@ import (
 type ConsumerOption func(*consumer)
 
 // WithConsumerClaimTimeout sets how long a consumer holds a fetched job before other
-// consumers can take it. Default is twice the job timeout (30 minutes with defaults).
+// consumers can take it. Default is twice the job timeout (30 minutes with defaults), or
+// the shortest accepted timeout if that is longer.
 // The time starts at fetch, so time in the buffer counts. Before a worker starts a handler,
 // it extends the claim if less than the job timeout plus a margin is left. Claims are not
 // renewed while the handler runs. Consume returns ErrClaimTimeoutTooShort if the claim
-// timeout is not longer than the job timeout. Values under 2ms are ignored.
+// timeout is shorter than the job timeout plus that margin (half the job timeout, at most one
+// minute) plus a quarter of the job timeout (at most one second) for the extension itself,
+// plus 2ms. Twice the job timeout is enough for any job timeout of 8ms or more.
+// Values under 2ms are ignored.
 func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
 	return func(c *consumer) {
 		if claimBudget(timeout) > 0 {
@@ -34,7 +39,7 @@ func WithConsumerConcurrency(concurrency uint16) ConsumerOption {
 }
 
 // WithConsumerCleanupBatch sets the number of jobs to delete in a single cleanup batch for this consumer.
-// Default is 1000.
+// Default is 500.
 func WithConsumerCleanupBatch(batchSize uint16) ConsumerOption {
 	return func(o *consumer) {
 		if batchSize > 0 {
@@ -54,9 +59,9 @@ func WithConsumerPrefetchCount(prefetchCount uint16) ConsumerOption {
 	}
 }
 
-// WithConsumerPollInteval sets how frequently to check for new jobs for a given consumer
+// WithConsumerPollInterval sets how frequently to check for new jobs for a given consumer
 // You may also configure default value for all consumers, see WithDefaultPollInterval.
-func WithConsumerPollInteval(interval time.Duration) ConsumerOption {
+func WithConsumerPollInterval(interval time.Duration) ConsumerOption {
 	return func(o *consumer) {
 		if interval > 0 {
 			o.pollInterval = interval
@@ -65,6 +70,10 @@ func WithConsumerPollInteval(interval time.Duration) ConsumerOption {
 }
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
+// The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
+// If fn panics, the panic is logged and the retry uses the built-in exponential backoff with jitter,
+// capped at 24 hours.
+// Consume returns ErrNilBackoffFunc if fn is nil.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
 func WithConsumerBackoffFunc(fn func(uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
@@ -142,10 +151,11 @@ func WithAsyncPush() ConsumerOption {
 }
 
 // WithAsyncPushRateLimit says how many times per minute should async notifications
-// from a publisher be delivered, at most
+// from a publisher be delivered, at most. Zero or less means no limit, and more than
+// 65535 is taken as 65535.
 func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
-		o.asyncPushMaxRPM = uint16(rpm)
+		o.asyncPushMaxRPM = uint16(min(max(rpm, 0), math.MaxUint16))
 	}
 }
 

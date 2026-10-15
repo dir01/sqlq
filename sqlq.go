@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,7 +18,6 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
-
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -48,11 +50,18 @@ type JobsQueue interface {
 	// RequeueDeadLetterJob moves a job from the dead letter queue back to the main queue, identified by its original job ID.
 	RequeueDeadLetterJob(ctx context.Context, originalJobID int64) error
 
-	// Shutdown gracefully stops all consumers and background processes.
-	Shutdown()
+	// Shutdown stops all consumers and their background work, and waits for them to stop.
+	// It cancels the consumers first, so ctx limits only the wait. If ctx ends first, Shutdown
+	// returns ctx's error: a handler that ignores its context keeps running, and the job it holds
+	// becomes available again when its claim expires. Do not give a context that is already done,
+	// such as the one that a shutdown signal canceled.
+	// Consume fails with ErrShutDown once Shutdown has been called.
+	Shutdown(ctx context.Context) error
 
-	// Run performs initial setup like schema initialization.
-	Run() error
+	// Run creates or migrates the queue's tables. Call it before Publish and Consume, and stop if it
+	// returns an error. ctx limits the wait, which on PostgreSQL includes the wait for the lock that
+	// keeps processes from migrating at the same time.
+	Run(ctx context.Context) error
 }
 
 // DBType represents the supported database types.
@@ -68,6 +77,9 @@ const (
 var (
 	// ErrDuplicateConsumer is returned when Consume is called multiple times for the same job type.
 	ErrDuplicateConsumer = errors.New(".Consume was called twice for same job type")
+	// ErrShutDown is returned when Consume is called once Shutdown has been, even while Shutdown is
+	// still waiting for consumers: a consumer started then would outlive it.
+	ErrShutDown = errors.New("queue is shut down")
 	// ErrUnsupportedDBType is returned when an unsupported database type is provided to New.
 	ErrUnsupportedDBType = errors.New("unsupported database type")
 	// ErrMaxRetriesExceeded indicates a job failed more times than its configured maximum retries.
@@ -76,11 +88,17 @@ var (
 	ErrJobNotFound = errors.New("job not found")
 	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
-	// ErrClaimTimeoutTooShort means the claim timeout is not longer than the job timeout,
-	// so a handler could still run after another consumer took its job.
-	ErrClaimTimeoutTooShort = errors.New("claim timeout must be longer than job timeout")
+	// ErrClaimTimeoutTooShort means the claim timeout cannot cover the job timeout and the margin
+	// a worker needs before it starts a handler (see WithConsumerClaimTimeout), so handlers would
+	// either outlive their claims or never start.
+	ErrClaimTimeoutTooShort = errors.New("claim timeout is too short for the job timeout")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
+	// ErrNilHandler is returned when Consume is given a nil handler.
+	ErrNilHandler = errors.New("handler is nil")
+	// ErrNilBackoffFunc is returned when Consume would use a nil backoff function, given by
+	// WithConsumerBackoffFunc or WithDefaultBackoffFunc.
+	ErrNilBackoffFunc = errors.New("backoff function is nil")
 )
 
 var (
@@ -97,23 +115,27 @@ var (
 
 // sqlq implements the JobsQueue interface using SQL databases
 type sqlq struct {
-	db                 *sql.DB
-	metrics            *sqlqMetrics
-	meterProvider      metric.MeterProvider
-	meter              metric.Meter
-	driver             driver
-	defaultBackoffFunc func(retryNum uint16) time.Duration
-	tracer             trace.Tracer
-	consumersMap       map[string]*consumer // jobType -> consumer
-	dbType             DBType
-	consumersMapMutex  sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
-
+	db     *sql.DB
+	driver driver
 	// Function for calculating how much of a delay to use when rescheduling a failed job.
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
+	defaultBackoffFunc func(retryNum uint16) time.Duration
+	tracer             trace.Tracer
+	meterProvider      metric.MeterProvider
+	// Stops the callback that reports queue depth and lag. Shutdown calls Unregister.
+	metricsRegistration metric.Registration
+	metricsCtx          context.Context
+	cancelMetrics       context.CancelFunc
+	metricsDone         chan struct{} // Closed after Unregister returns.
+	logger              *slog.Logger
+	metrics             *metrics
+	consumersMap        map[string]*consumer // jobType -> consumer
+	dbType              DBType
+	consumersMapMutex   sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
 
 	// How often to poll database for new jobs. Default is 100ms.
-	// Individual consumers may override this using WithConsumerPollInteval.
+	// Individual consumers may override this using WithConsumerPollInterval.
 	defaultPollInterval time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
@@ -154,6 +176,9 @@ type sqlq struct {
 	// Default number of jobs to delete in a single cleanup batch. Default is 500.
 	// Individual consumers may override this using WithConsumerCleanupBatch.
 	defaultCleanupBatch uint16
+
+	// Set by Shutdown, under consumersMapMutex. Consume fails once it is.
+	shutDown bool
 }
 
 type job struct {
@@ -163,10 +188,12 @@ type job struct {
 	ClaimExpiresAt time.Time
 	JobType        string
 	CreatedAt      time.Time
-	TraceContext   map[string]string
-	Payload        []byte
-	ID             int64
-	RetryCount     uint16
+	// ScheduledAt is when the job became due, by the database clock.
+	ScheduledAt  time.Time
+	TraceContext map[string]string
+	Payload      []byte
+	ID           int64
+	RetryCount   uint32
 }
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue
@@ -178,7 +205,7 @@ type DeadLetterJob struct {
 	FailedAt      time.Time
 	Payload       []byte
 	OriginalID    int64 // This is the primary key now
-	RetryCount    uint16
+	RetryCount    uint32
 }
 
 // New creates a new JobsQueue
@@ -194,6 +221,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		driver:                          dbDriver,
 		consumersMap:                    make(map[string]*consumer),
 		consumersMapMutex:               sync.RWMutex{},
+		shutDown:                        false,
 		defaultPollInterval:             100 * time.Millisecond,
 		defaultConcurrency:              defaultConcurrency,
 		defaultPrefetchCount:            0,
@@ -208,34 +236,34 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultCleanupBatch:             defaultCleanupBatch,
 		tracer:                          otel.Tracer(tracerName),
 		meterProvider:                   otel.GetMeterProvider(),
-		meter:                           nil,
+		metricsRegistration:             nil,
+		metricsCtx:                      nil,
+		cancelMetrics:                   nil,
+		metricsDone:                     nil,
 		metrics:                         nil,
+		logger:                          slog.Default(),
 	}
 
 	for _, o := range opts {
 		o(q)
 	}
 
-	q.meter = q.meterProvider.Meter(meterName)
-	metrics, err := newMetrics(q.meter)
-	if err != nil {
+	if err := q.setUpMetrics(); err != nil {
 		return nil, err
 	}
-	q.metrics = metrics
 
 	return q, nil
 }
 
-func (q *sqlq) Run() error {
-	initCtx, initSpan := q.tracer.Start(context.Background(), "sqlq.init_schema")
-	defer initSpan.End()
+func (q *sqlq) Run(ctx context.Context) error {
+	ctx, span := q.tracer.Start(ctx, "sqlq.init_schema")
+	defer span.End()
 
-	if err := q.driver.initSchema(initCtx); err != nil {
-		initSpan.RecordError(err)
-		initSpan.SetStatus(codes.Error, "schema initialization failed")
-		return fmt.Errorf("failed to initialize schema: %w", err)
+	if err := q.driver.initSchema(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "schema setup failed")
+		return fmt.Errorf("failed to set up queue schema: %w", err)
 	}
-	initSpan.SetStatus(codes.Ok, "schema initialized successfully")
 	return nil
 }
 
@@ -245,7 +273,6 @@ func (q *sqlq) Publish(ctx context.Context, jobType string, payload any, opts ..
 		trace.WithAttributes(attribute.String("sqlq.job_type", jobType)),
 		trace.WithSpanKind(trace.SpanKindProducer),
 	)
-
 	defer span.End()
 
 	return q.PublishTx(ctx, nil, jobType, payload, opts...)
@@ -262,10 +289,7 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 		),
 		trace.WithSpanKind(trace.SpanKindProducer),
 	)
-
 	defer span.End()
-
-	metricAttrs := metric.WithAttributes(attribute.String("sqlq.job_type", jobType))
 
 	options := &publishOptions{delay: 0}
 	for _, o := range opts {
@@ -275,10 +299,8 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		span.RecordError(err)
-		q.metrics.publishedErrCounter.Add(ctx, 1, metricAttrs)
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
-
 	span.SetAttributes(
 		attribute.Int("sqlq.payload_size", len(payloadBytes)),
 		attribute.Int("sqlq.delay_ms", int(options.delay.Milliseconds())),
@@ -291,11 +313,9 @@ func (q *sqlq) PublishTx(ctx context.Context, tx *sql.Tx, jobType string, payloa
 	if err != nil {
 		// The driver method should record the specific DB error in its span. We record a higher-level error here.
 		span.RecordError(err)
-		q.metrics.publishedErrCounter.Add(ctx, 1, metricAttrs)
 		return fmt.Errorf("failed to insert job: %w", err)
 	}
-
-	q.metrics.publishedCounter.Add(ctx, 1, metricAttrs)
+	q.metrics.published.Add(ctx, 1, metric.WithAttributes(attribute.String(jobTypeAttr, jobType)))
 
 	return nil
 }
@@ -312,6 +332,9 @@ func (q *sqlq) Consume(
 	handler func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error,
 	opts ...ConsumerOption,
 ) error {
+	if handler == nil {
+		return fmt.Errorf("%w: cannot consume %s", ErrNilHandler, jobType)
+	}
 	consCtx, cancel := context.WithCancel(ctx)
 
 	cons := &consumer{
@@ -322,6 +345,7 @@ func (q *sqlq) Consume(
 		driver:  q.driver,
 		tracer:  q.tracer,
 		metrics: q.metrics,
+		logger:  q.logger.With(slog.String("job_type", jobType)),
 		// Set defaults from sqlq. Those might be overridden by opts later
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
@@ -329,7 +353,7 @@ func (q *sqlq) Consume(
 		pollInterval:             q.defaultPollInterval,
 		jobTimeout:               q.defaultJobTimeout,
 		claimTimeout:             q.defaultClaimTimeout,
-		claims:                   make(map[string]job),
+		claims:                   make(map[string]heldClaim),
 		backoffFunc:              q.defaultBackoffFunc,
 		cleanupBatch:             q.defaultCleanupBatch,
 		cleanupProcessedInterval: q.defaultCleanupProcessedInterval,
@@ -341,6 +365,7 @@ func (q *sqlq) Consume(
 		onDeadLetter:             nil,
 		// Initialize consumer-specific fields
 		jobsChan:    nil, // Will be initialized below
+		fetchWg:     sync.WaitGroup{},
 		workerWg:    sync.WaitGroup{},
 		claimsMutex: sync.Mutex{},
 		ctx:         consCtx,
@@ -353,6 +378,10 @@ func (q *sqlq) Consume(
 	}
 
 	// Options sanity checks and adjustments
+	if cons.backoffFunc == nil {
+		cancel()
+		return fmt.Errorf("%w: cannot consume %s", ErrNilBackoffFunc, jobType)
+	}
 	// Prefetch follows concurrency unless set. A smaller explicit value is raised:
 	// it would only leave workers idle between polls.
 	if cons.prefetchCount < cons.concurrency {
@@ -360,11 +389,12 @@ func (q *sqlq) Consume(
 	}
 	if cons.claimTimeout == 0 {
 		// Leaves about as much claim time for the buffer as for the handler.
-		cons.claimTimeout = 2 * cons.jobTimeout
+		cons.claimTimeout = max(2*cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
 	}
-	if cons.claimTimeout <= cons.jobTimeout {
+	if cons.claimTimeout < minClaimTimeout(cons.jobTimeout) {
 		cancel()
-		return fmt.Errorf("%w: claim timeout %s, job timeout %s", ErrClaimTimeoutTooShort, cons.claimTimeout, cons.jobTimeout)
+		return fmt.Errorf("%w: claim timeout %s, job timeout %s, at least %s needed",
+			ErrClaimTimeoutTooShort, cons.claimTimeout, cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
 	}
 	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
 		cancel()
@@ -377,6 +407,11 @@ func (q *sqlq) Consume(
 	cons.jobsChan = make(chan job, cons.prefetchCount)
 
 	q.consumersMapMutex.Lock()
+	if q.shutDown {
+		q.consumersMapMutex.Unlock()
+		cancel()
+		return fmt.Errorf("%w: cannot consume %s", ErrShutDown, jobType)
+	}
 	if _, exists := q.consumersMap[jobType]; exists {
 		q.consumersMapMutex.Unlock()
 		cancel()
@@ -395,7 +430,6 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 		attribute.String("sqlq.job_type", jobType),
 		attribute.Int("sqlq.limit", limit),
 	))
-
 	defer span.End()
 
 	jobs, err := q.driver.getDeadLetterJobs(ctx, jobType, limit)
@@ -403,7 +437,6 @@ func (q *sqlq) GetDeadLetterJobs(ctx context.Context, jobType string, limit int)
 		span.RecordError(err)
 	} else {
 		span.SetAttributes(attribute.Int("sqlq.dlq_jobs_fetched", len(jobs)))
-		q.metrics.dlqFetchedCounter.Add(ctx, int64(len(jobs)), metric.WithAttributes(attribute.String("sqlq.job_type", jobType)))
 	}
 
 	return jobs, err
@@ -414,32 +447,52 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 	ctx, span := q.tracer.Start(ctx, "sqlq.requeue_dlq_job", trace.WithAttributes(
 		attribute.Int64("sqlq.original_job_id", originalJobID),
 	))
-
 	defer span.End()
 
-	jobType, err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
+	err := q.driver.requeueDeadLetterJob(ctx, originalJobID)
 	if err != nil {
 		span.RecordError(err)
-	} else {
-		span.SetAttributes(attribute.String("sqlq.job_type", jobType))
-		q.metrics.dlqRequeuedCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sqlq.job_type", jobType)))
 	}
 	return err
 }
 
-// Shutdown stops the job processing
-func (q *sqlq) Shutdown() {
-	wg := sync.WaitGroup{}
-
+// Shutdown stops the job processing. Consume fails with ErrShutDown from then on.
+func (q *sqlq) Shutdown(ctx context.Context) error {
 	q.consumersMapMutex.Lock()
-	for _, cons := range q.consumersMap {
-		wg.Add(1)
-		go func(c *consumer) {
-			defer wg.Done()
-			c.shutdown()
-		}(cons)
-	}
+	firstShutdown := !q.shutDown
+	q.shutDown = true
+	consumers := slices.Collect(maps.Values(q.consumersMap))
 	q.consumersMapMutex.Unlock()
 
-	wg.Wait()
+	// Collection may be waiting for a connection held by a handler. Cancel both
+	// before unregistering, which can wait for active collection to finish.
+	for _, cons := range consumers {
+		cons.cancel()
+	}
+	q.cancelMetrics()
+	if firstShutdown {
+		go func() {
+			defer close(q.metricsDone)
+			if err := q.metricsRegistration.Unregister(); err != nil {
+				q.logger.ErrorContext(ctx, "sqlq: failed to unregister the metrics callback", slog.Any("error", err))
+			}
+		}()
+	}
+
+	errs := make([]error, len(consumers))
+	var wg sync.WaitGroup
+	wg.Go(func() { <-q.metricsDone })
+	for i, cons := range consumers {
+		wg.Go(func() { errs[i] = cons.shutdown(ctx) })
+	}
+	if err := waitContext(ctx, &wg); err != nil {
+		return err
+	}
+
+	for _, err := range errs {
+		if err != nil {
+			return err // Each one is ctx's error.
+		}
+	}
+	return nil
 }

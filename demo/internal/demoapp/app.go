@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/dir01/sqlq"
 	_ "github.com/jackc/pgx/v5/stdlib" // Register the PostgreSQL driver for the demos.
@@ -59,10 +60,17 @@ func run(driver, dsn string, dbType sqlq.DBType, example Example) error {
 	if err != nil {
 		return err
 	}
-	if err = q.Run(); err != nil {
+	if err = q.Run(ctx); err != nil {
 		return err
 	}
-	defer q.Shutdown()
+	defer func() {
+		// ctx is already done after a signal, so give Shutdown a new context with a time limit.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if shutdownErr := q.Shutdown(shutdownCtx); shutdownErr != nil {
+			log.Printf("shut down queue: %v", shutdownErr)
+		}
+	}()
 
 	if err = example(ctx, db, q); err != nil {
 		return err

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -242,7 +244,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
-		require.Equal(t, uint16(1), jobs[0].RetryCount)
+		require.Equal(t, uint32(1), jobs[0].RetryCount)
 		require.NotEqual(t, j.ClaimToken, jobs[0].ClaimToken)
 	})
 
@@ -265,7 +267,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("handler did not start")
 		}
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 3, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
@@ -305,13 +307,13 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
-		cons.workerWg.Go(func() { _ = cons.fetchJobs(cons.ctx) })
+		cons.fetchWg.Go(func() { _ = cons.fetchJobs(cons.ctx) })
 		require.Eventually(t, func() bool {
 			cons.claimsMutex.Lock()
 			defer cons.claimsMutex.Unlock()
 			return len(cons.claims) == 3
 		}, 5*time.Second, time.Millisecond)
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 3, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
@@ -331,7 +333,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 6, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 2, "unneeded jobs remain available to other consumers")
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 	})
 
 	if dbType == DBTypeSQLite {
@@ -385,38 +387,6 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
 	})
-
-	if dbType == DBTypeSQLite {
-		t.Run("legacy migration finishes DLQ moves instead of recovering them", func(t *testing.T) {
-			jobs := seed(2)
-			// Old versions added the job to the DLQ, but deleted job 0 instead of this job.
-			_, err := db.ExecContext(ctx, `INSERT INTO dead_letter_queue
-				(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-				VALUES (?, 'claims', '{}', 0, 0, 3, 'failed')`, jobs[0].ID)
-			require.NoError(t, err)
-			require.NoError(t, execSQL(ctx, db, `DROP INDEX idx_jobs_available_claims`))
-			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_token`))
-			require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_expires_at`))
-			require.NoError(t, d.initSchema(ctx))
-			recovered, err := other.getJobsForConsumer(ctx, "claims", 2, time.Minute)
-			require.NoError(t, err)
-			require.Len(t, recovered, 1)
-			require.Equal(t, jobs[1].ID, recovered[0].ID)
-		})
-	}
-
-	t.Run("legacy schema migration recovers abandoned but not processed jobs", func(t *testing.T) {
-		seed(2)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET processed_at = consumed_at WHERE id = (SELECT MIN(id) FROM jobs)`))
-		require.NoError(t, execSQL(ctx, db, `DROP INDEX idx_jobs_available_claims`))
-		require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_token`))
-		require.NoError(t, execSQL(ctx, db, `ALTER TABLE jobs DROP COLUMN claim_expires_at`))
-		require.NoError(t, d.initSchema(ctx))
-		require.NoError(t, d.initSchema(ctx))
-		jobs, err := other.getJobsForConsumer(ctx, "claims", 2, time.Minute)
-		require.NoError(t, err)
-		require.Len(t, jobs, 1)
-	})
 }
 
 func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
@@ -456,6 +426,22 @@ func TestConsumeClaimTimeout(t *testing.T) {
 		{
 			"claim timeout equal to job timeout is rejected", ErrClaimTimeoutTooShort, nil,
 			[]ConsumerOption{WithConsumerClaimTimeout(defaultJobTimeout)}, 0,
+		},
+		{
+			"claim timeout shorter than a worker needs before it starts a handler is rejected", ErrClaimTimeoutTooShort, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1100 * time.Millisecond)}, 0,
+		},
+		{
+			"claim timeout with no time for its extension is rejected", ErrClaimTimeoutTooShort, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(claimTimeNeeded(time.Second) + 2*time.Millisecond)}, 0,
+		},
+		{
+			"shortest claim timeout is accepted", nil, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1752 * time.Millisecond)}, 1752 * time.Millisecond,
+		},
+		{
+			"default covers a very short job timeout", nil, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(4 * time.Millisecond)}, 9 * time.Millisecond,
 		},
 		{
 			"queue claim timeout shorter than consumer job timeout is rejected", ErrClaimTimeoutTooShort,
@@ -509,8 +495,8 @@ func consumeOnTestQueue(t *testing.T, queueOpts []NewOption, consOpts []Consumer
 	require.NoError(t, err)
 	q, ok := queue.(*sqlq)
 	require.True(t, ok)
-	require.NoError(t, q.Run())
-	t.Cleanup(q.Shutdown)
+	require.NoError(t, q.Run(t.Context()))
+	t.Cleanup(func() { assert.NoError(t, q.Shutdown(context.Background())) })
 	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
 	if err = q.Consume(t.Context(), "claims", handler, consOpts...); err != nil {
 		return nil, err
@@ -545,26 +531,26 @@ func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Du
 	return d.driver.extendClaim(ctx, j, timeout)
 }
 
-// noopMetrics returns instruments that record nothing, for consumers built without New.
-func noopMetrics() *sqlqMetrics {
-	m, err := newMetrics(metricnoop.NewMeterProvider().Meter("claims"))
-	if err != nil {
-		panic(err)
-	}
-	return m
-}
-
 func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(context.Context, *sql.Tx, []byte) error) *consumer {
 	ctx, cancel := context.WithCancel(ctx)
 	return &consumer{ //nolint:exhaustruct
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
-		metrics:      noopMetrics(),
+		logger: slog.New(slog.DiscardHandler), metrics: noopMetrics(),
 		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
-		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
+		claims: make(map[string]heldClaim), concurrency: 1, prefetchCount: 1,
 		pollInterval: time.Millisecond, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
+}
+
+// noopMetrics returns instruments that record nothing, for consumers that tests build directly.
+func noopMetrics() *metrics {
+	m, err := newMetrics(metricnoop.NewMeterProvider().Meter("test"))
+	if err != nil {
+		panic(err)
+	}
+	return m
 }
 
 // TestClaimCrashHelper runs in a child process that the parent test kills.

@@ -21,6 +21,18 @@ func claimKey(j job) string {
 	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
 }
 
+// heldClaim is a claim in consumer.claims. started is set when a worker starts the job.
+// A worker does not start a job once shutdown has begun, so shutdown can release the claims
+// of jobs that are not started while handlers still run.
+type heldClaim struct {
+	job     job
+	started bool
+}
+
+// claimReleaseTimeout is the most time that one release of claims can use: the release of one claim
+// after a failed attempt, or each of the two releases at shutdown.
+const claimReleaseTimeout = 5 * time.Second
+
 // claimBudget returns how long a worker can count on a claim, from the time it asked for it.
 // It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
 // It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
@@ -44,6 +56,15 @@ func localClaimDeadline(timeout time.Duration) time.Time {
 // processJob extends the claim first when less time is left.
 func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
 	return jobTimeout + min(time.Minute, jobTimeout/2)
+}
+
+// minClaimTimeout returns the shortest claim timeout a consumer accepts for jobTimeout:
+// a claim just extended must still have claimTimeNeeded left once the extension's round trip
+// and the wait for a connection are over. A quarter of the job timeout, at most one second,
+// is left for those, and 2ms more for claimBudget's rounding. With less, a worker would extend
+// the claim again and again and never start the handler.
+func minClaimTimeout(jobTimeout time.Duration) time.Duration {
+	return claimTimeNeeded(jobTimeout) + min(time.Second, jobTimeout/4) + 2*time.Millisecond
 }
 
 // newClaimToken returns a random string for one claim request (128 random bits, base32).

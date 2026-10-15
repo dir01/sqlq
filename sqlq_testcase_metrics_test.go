@@ -3,116 +3,122 @@ package sqlq_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/dir01/sqlq"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
+// TestMetrics checks the queue's metrics: published jobs, attempts by result, attempt durations,
+// job lags, and the depth and lag of the queue. It uses a queue of its own on tc's database.
 func (tc *TestCase) TestMetrics(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	// The queue is shared with other tests, so every check is narrowed to this job type.
-	jobType := "metrics_job"
-	forJob := attribute.String("sqlq.job_type", jobType)
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 
-	// "ok" succeeds, "flaky" fails once and then succeeds, and "broken" fails both of its
-	// attempts and is dead-lettered. That is 5 attempts, 3 of which fail.
-	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, payloadBytes []byte) error {
-		var payload TestPayload
-		if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-			return err
-		}
-
-		info, _ := sqlq.JobInfoFromContext(ctx)
-		if payload.Message == "broken" || (payload.Message == "flaky" && info.RetryCount == 0) {
-			return errors.New("simulated failure")
-		}
-
-		return nil
-	}, sqlq.WithConsumerMaxRetries(1))
+	reader := sdkmetric.NewManualReader()
+	q, err := sqlq.New(tc.DB, tc.DBType,
+		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))),
+		sqlq.WithDefaultPollInterval(10*time.Millisecond),
+		sqlq.WithDefaultMaxRetries(0),
+		sqlq.WithDefaultCleanupProcessedInterval(0),
+		sqlq.WithDefaultCleanupDLQInterval(0),
+	)
 	require.NoError(t, err)
+	require.NoError(t, q.Run(ctx))
+	defer func() { require.NoError(t, q.Shutdown(ctx)) }()
 
-	for _, message := range []string{"ok", "flaky", "broken"} {
-		require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: message}))
+	release := make(chan struct{})
+	succeed := func(context.Context, *sql.Tx, []byte) error { return nil }
+	fail := func(context.Context, *sql.Tx, []byte) error { return errors.New("simulated failure") }
+	block := func(ctx context.Context, _ *sql.Tx, _ []byte) error {
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	require.Error(t, tc.Q.Publish(ctx, jobType, make(chan int)), "A channel can't be marshaled to JSON")
+	require.NoError(t, q.Consume(ctx, "metrics_ok", succeed))
+	require.NoError(t, q.Consume(ctx, "metrics_failed", fail))
+	// One worker and a buffer of one: two blocked jobs are claimed, and the others are ready.
+	require.NoError(t, q.Consume(ctx, "metrics_blocked", block,
+		sqlq.WithConsumerConcurrency(1), sqlq.WithConsumerPrefetchCount(1)))
 
-	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		rm := collectMetrics(c, tc.Metrics)
+	for jobType, count := range map[string]int{"metrics_ok": 2, "metrics_failed": 1, "metrics_blocked": 5} {
+		for range count {
+			require.NoError(t, q.Publish(ctx, jobType, TestPayload{Message: "metrics"}))
+		}
+	}
 
-		assert.Equal(c, int64(3), sumMetric(rm, "sqlq.jobs.published.count", forJob))
-		assert.Equal(c, int64(1), sumMetric(rm, "sqlq.jobs.published.errors.count", forJob))
-		assert.Equal(c, int64(5), sumMetric(rm, "sqlq.jobs.fetched.count", forJob))
-		assert.Equal(c, int64(5), sumMetric(rm, "sqlq.jobs.consumed.count", forJob))
-		assert.Equal(c, int64(2), sumMetric(rm, "sqlq.jobs.consumed.count", forJob, attribute.String("sqlq.failure_reason", "")))
-		assert.Equal(c, int64(3), sumMetric(rm, "sqlq.jobs.consumed.count", forJob, attribute.String("sqlq.failure_reason", "fail_handle_job")))
-		assert.Equal(c, int64(5), sumMetric(rm, "sqlq.jobs.handler.duration", forJob))
-		assert.Equal(c, int64(2), sumMetric(rm, "sqlq.jobs.retried.count", forJob))
-		assert.Equal(c, int64(1), sumMetric(rm, "sqlq.jobs.dlq.moved.count", forJob))
-		assert.Equal(c, int64(0), sumMetric(rm, "sqlq.jobs.active.count", forJob))
-	}, 5*time.Second, 25*time.Millisecond)
-
-	dlqJobs, err := tc.Q.GetDeadLetterJobs(ctx, jobType, 10)
-	require.NoError(t, err)
-	require.Len(t, dlqJobs, 1)
-	require.Equal(t, int64(1), sumMetric(collectMetrics(t, tc.Metrics), "sqlq.jobs.dlq.fetched.count", forJob))
-
-	require.NoError(t, tc.Q.RequeueDeadLetterJob(ctx, dlqJobs[0].OriginalID))
-	require.Equal(t, int64(1), sumMetric(collectMetrics(t, tc.Metrics), "sqlq.jobs.dlq.requeued.count", forJob))
-}
-
-// collectMetrics reads everything the queue has recorded so far.
-func collectMetrics(t require.TestingT, reader *sdkmetric.ManualReader) metricdata.ResourceMetrics {
+	jobType := func(name string) attribute.KeyValue { return attribute.String("sqlq.job_type", name) }
+	result := func(name string) attribute.KeyValue { return attribute.String("sqlq.result", name) }
 	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.Eventually(t, func() bool {
+		return reader.Collect(ctx, &rm) == nil &&
+			metricValue(rm, "sqlq.job.attempts", jobType("metrics_ok"), result("success")) == 2 &&
+			metricValue(rm, "sqlq.job.attempts", jobType("metrics_failed"), result("dead_letter")) == 1 &&
+			metricValue(rm, "sqlq.queue.depth", jobType("metrics_blocked")) == 3
+	}, 10*time.Second, 20*time.Millisecond, "attempts and queue depth were not reported")
 
-	return rm
+	require.InDelta(t, 2, metricValue(rm, "sqlq.jobs.published", jobType("metrics_ok")), 0)
+	require.InDelta(t, 5, metricValue(rm, "sqlq.jobs.published", jobType("metrics_blocked")), 0)
+	require.InDelta(t, 2, metricValue(rm, "sqlq.job.duration", jobType("metrics_ok"), result("success")), 0,
+		"the duration histogram must count each attempt")
+	require.InDelta(t, 2, metricValue(rm, "sqlq.job.lag", jobType("metrics_ok")), 0,
+		"the lag histogram must count each started job")
+	require.Positive(t, metricValue(rm, "sqlq.queue.lag", jobType("metrics_blocked")),
+		"ready jobs have been due for some time")
+	require.Zero(t, metricValue(rm, "sqlq.queue.depth", jobType("metrics_ok")))
+	require.Zero(t, metricValue(rm, "sqlq.queue.lag", jobType("metrics_ok")))
+
+	close(release)
+	require.Eventually(t, func() bool {
+		return reader.Collect(ctx, &rm) == nil &&
+			metricValue(rm, "sqlq.job.attempts", jobType("metrics_blocked"), result("success")) == 5 &&
+			metricValue(rm, "sqlq.queue.depth", jobType("metrics_blocked")) == 0
+	}, 10*time.Second, 20*time.Millisecond, "blocked jobs did not finish")
 }
 
-// sumMetric adds up the data points of the named instrument that carry all of attrs.
-// For a histogram, it adds up how many values were recorded.
-func sumMetric(rm metricdata.ResourceMetrics, name string, attrs ...attribute.KeyValue) int64 {
-	matches := func(set attribute.Set) bool {
-		for _, kv := range attrs {
-			if v, ok := set.Value(kv.Key); !ok || v != kv.Value {
-				return false
-			}
-		}
-
-		return true
-	}
-
-	var total int64
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
+// metricValue returns the value of the named metric's data point with exactly attrs: the value of
+// a sum or a gauge, or the count of a histogram. It returns -1 if there is no such data point.
+func metricValue(rm metricdata.ResourceMetrics, name string, attrs ...attribute.KeyValue) float64 {
+	want := attribute.NewSet(attrs...)
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
 			if m.Name != name {
 				continue
 			}
-
 			switch data := m.Data.(type) {
 			case metricdata.Sum[int64]:
-				for _, dp := range data.DataPoints {
-					if matches(dp.Attributes) {
-						total += dp.Value
-					}
-				}
-			case metricdata.Histogram[int64]:
-				for _, dp := range data.DataPoints {
-					if matches(dp.Attributes) {
-						total += int64(dp.Count)
+				return pointValue(data.DataPoints, want)
+			case metricdata.Gauge[int64]:
+				return pointValue(data.DataPoints, want)
+			case metricdata.Gauge[float64]:
+				return pointValue(data.DataPoints, want)
+			case metricdata.Histogram[float64]:
+				for _, point := range data.DataPoints {
+					if point.Attributes.Equals(&want) {
+						return float64(point.Count)
 					}
 				}
 			}
 		}
 	}
+	return -1
+}
 
-	return total
+func pointValue[N int64 | float64](points []metricdata.DataPoint[N], want attribute.Set) float64 {
+	for _, point := range points {
+		if point.Attributes.Equals(&want) {
+			return float64(point.Value)
+		}
+	}
+	return -1
 }

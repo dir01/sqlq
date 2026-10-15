@@ -8,12 +8,10 @@ import (
 	"time"
 
 	"github.com/dir01/sqlq"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -40,6 +38,12 @@ func TestPostgreSQL(t *testing.T) {
 		tc.TestPublishTx(t.Context(), t)
 	})
 
+	t.Run("Metrics", func(t *testing.T) {
+		t.Parallel()
+
+		tc.TestMetrics(t.Context(), t)
+	})
+
 	t.Run("Basic pub/sub", func(t *testing.T) {
 		t.Parallel()
 
@@ -56,15 +60,6 @@ func TestPostgreSQL(t *testing.T) {
 		defer span.End()
 
 		tc.TestBasicPubMultiSub(ctx, t)
-	})
-
-	t.Run("Metrics are recorded", func(t *testing.T) {
-		t.Parallel()
-
-		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestMetrics")
-		defer span.End()
-
-		tc.TestMetrics(ctx, t)
 	})
 
 	t.Run("Job execution timeout", func(t *testing.T) {
@@ -166,7 +161,7 @@ func TestPostgreSQL(t *testing.T) {
 		tc.TestDLQGetLimit(ctx, t)
 	})
 
-	t.Run("Job with NULL created_at is still delivered", func(t *testing.T) {
+	t.Run("Job without created_at is rejected", func(t *testing.T) {
 		t.Parallel()
 
 		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestNullCreatedAt")
@@ -174,38 +169,45 @@ func TestPostgreSQL(t *testing.T) {
 
 		tc.TestNullCreatedAt(ctx, t)
 	})
+
+	t.Run("Sub-millisecond backoff respects retry limit", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestSubMillisecondBackoffRetryLimit")
+		defer span.End()
+
+		tc.TestSubMillisecondBackoffRetryLimit(ctx, t)
+	})
+
+	t.Run("PublishTx delay is measured from publish time", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestPublishTxDelayFromPublishTime")
+		defer span.End()
+
+		tc.TestPublishTxDelayFromPublishTime(ctx, t)
+	})
+
+	t.Run("Marking processed outlasts a transient row lock", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestMarkProcessedOutlastsTransientRowLock")
+		defer span.End()
+
+		tc.TestMarkProcessedOutlastsTransientRowLock(ctx, t)
+	})
 }
 
-// TestNullCreatedAt checks that a job whose created_at is NULL, which the PostgreSQL schema allows
-// (unlike SQLite's), is delivered with a zero CreatedAt instead of being claimed and dropped.
+// TestNullCreatedAt checks that a job cannot be stored without created_at. The column was once
+// nullable, and a job without one could never be dead-lettered.
 func (tc *TestCase) TestNullCreatedAt(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	jobType := "null_created_at_test"
-	infos := make(chan sqlq.JobInfo, 1)
-
-	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
-		info, _ := sqlq.JobInfoFromContext(ctx)
-		infos <- info
-		return nil
-	})
-	require.NoError(t, err)
-
-	_, err = tc.DB.ExecContext(ctx,
+	_, err := tc.DB.ExecContext(ctx,
 		"INSERT INTO jobs (job_type, payload, created_at) VALUES ($1, $2, NULL)",
-		jobType, []byte(`{"message":"null created_at"}`),
+		"null_created_at_test", []byte(`{"message":"null created_at"}`),
 	)
-	require.NoError(t, err)
-
-	select {
-	case info := <-infos:
-		require.True(t, info.CreatedAt.IsZero())
-	case <-ctx.Done():
-		t.Fatal("job with NULL created_at was not delivered")
-	}
+	require.ErrorContains(t, err, "violates not-null constraint")
 }
 
 func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
@@ -213,6 +215,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	ctx := t.Context()
 	ctx = GracefulContext(ctx, 100*time.Millisecond) // for shutting down mainly
 
+	// Initialize only necessary fields for testcontainers request
 	req := testcontainers.ContainerRequest{ //nolint:exhaustruct
 		Name:         "sqlq_postgres",
 		Image:        "postgres:14",
@@ -242,16 +245,32 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 
 	dsn := fmt.Sprintf("postgres://testuser:testpass@%s:%s/testdb?sslmode=disable", host, mappedPort.Port())
 
+	// Connect to the database with retry logic
 	var db *sql.DB
 
-	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		db, err = otelsql.Open("pgx", dsn)
-		assert.NoError(collect, err)
+	// Try to connect with retries
+	var connectErr error
+	for range 10 {
+		db, connectErr = otelsql.Open("pgx", dsn)
+		if connectErr != nil {
+			time.Sleep(1 * time.Second)
+			continue
+		}
 
-		err = db.Ping()
-		assert.NoError(collect, err)
-	}, 10*time.Second, 100*time.Millisecond)
+		// Verify connection
+		connectErr = db.Ping()
+		if connectErr == nil {
+			fmt.Println("Successfully connected to the database!")
 
+			break
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	require.NoError(t, connectErr, "Failed to ping Postgres database after multiple attempts")
+
+	// Set connection pool parameters
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(25)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -260,22 +279,18 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	tracer, stopTracer, err := newTracer(tracerCtx)
 	require.NoError(t, err)
 
-	metrics := sdkmetric.NewManualReader()
 	q, err := sqlq.New(
 		db,
 		sqlq.DBTypePostgres,
 		sqlq.WithDefaultPollInterval(50*time.Millisecond),
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithTracer(tracer),
-		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics))),
 	)
 	require.NoError(t, err)
 
-	err = q.Run()
-	require.NoError(t, err, "Failed to run queue (initialize schema)")
+	require.NoError(t, q.Run(t.Context()))
 
-	return &TestCase{Q: q, DB: db, Metrics: metrics}, tracer, func() {
-		q.Shutdown() // Ensure consumers are stopped before closing DB and terminating container
+	return &TestCase{Q: q, DB: db, DBType: sqlq.DBTypePostgres}, tracer, func() {
 		require.NoError(t, db.Close())
 		require.NoError(t, container.Terminate(tracerCtx))
 		require.NoError(t, stopTracer())
