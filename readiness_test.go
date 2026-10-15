@@ -19,18 +19,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests are also compiled into the VM image. PostgreSQL uses the guest's
-// existing server, never a nested Docker container. Each suite owns its schema.
+// PostgreSQL uses an existing server named by SQLQ_TEST_POSTGRES_DSN, never a
+// Docker container. Each suite owns its schema.
 func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // Scenarios share a database and deliberately mutate its state.
 	t.Parallel()
 	f := readinessFixture{kind: DBTypeSQLite, dsn: "file:" + filepath.Join(t.TempDir(), "readiness.db") + "?_journal_mode=WAL&_busy_timeout=1000&_synchronous=FULL", schema: ""}
 	testReadiness(t, f)
 }
 
-func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // May restart the dedicated VM database server.
+func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // May restart the dedicated database server.
 	dsn := os.Getenv("SQLQ_TEST_POSTGRES_DSN")
 	if testing.Short() || dsn == "" {
-		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database (the VM supplies it)")
+		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database")
 	}
 	f := readinessFixture{kind: DBTypePostgres, dsn: dsn, schema: "readiness_" + strings.ToLower(newClaimToken())}
 	admin, err := sql.Open("pgx", dsn)

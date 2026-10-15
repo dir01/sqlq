@@ -12,8 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// proxy impairs real PostgreSQL TCP traffic. All timers run inside the guest
-// when used in the VM. Control/verification connections bypass the proxy.
+// proxy impairs real PostgreSQL TCP traffic. Control/verification connections
+// bypass the proxy.
 type proxy struct {
 	listener      net.Listener
 	target        string
@@ -35,7 +35,7 @@ func newProxy(ctx context.Context, dsn string) (*proxy, string, error) {
 	if net.ParseIP(pc.Host) == nil && pc.Host != "localhost" {
 		return nil, "", fmt.Errorf("chaos proxy requires a numeric TCP host or localhost")
 	}
-	// Keep authentication intact, but use plain guest-internal TCP. SSL cannot
+	// Keep authentication intact, but use plain local TCP. SSL cannot
 	// retain hostname verification when the destination is replaced by a proxy.
 	if pc.TLSConfig != nil {
 		return nil, "", fmt.Errorf("chaos proxy requires sslmode=disable")

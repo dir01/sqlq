@@ -37,14 +37,6 @@ test-checks:
 	$(MAKE) test-chaos-checks
 .PHONY: test-checks
 
-chaos-vm-build:
-	$(MAKE) -C tests/chaos vm-build
-.PHONY: chaos-vm-build
-
-chaos-vm:
-	$(MAKE) -C tests/chaos vm-run
-.PHONY: chaos-vm
-
 test-short-otel:
 	OTLP_ENDPOINT="localhost:4318" make test-short
 

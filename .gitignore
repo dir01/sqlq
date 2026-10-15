@@ -1,6 +1,4 @@
 .aider*
 /demo/queue.db*
 /chaos-artifacts*/
-/chaos-vm-image*/
-/chaos-vm-results*/
 /tests/chaos/simulation-artifacts/

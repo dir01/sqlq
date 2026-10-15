@@ -1,4 +1,4 @@
-.PHONY: test checks test-simulation-sqlite test-simulation-psql vm-build vm-run
+.PHONY: test checks test-simulation-sqlite test-simulation-psql
 
 SIMULATION_ARGS ?=
 SIMULATION_OUTPUT ?= $(CURDIR)/simulation-artifacts
@@ -19,9 +19,3 @@ test:
 checks:
 	go vet ./...
 	GOEXPERIMENT=cgocheck2 go test -timeout 2m -short -race -gcflags=all=-d=checkptr=2 -count=1 ./...
-
-vm-build:
-	sh vm/build.sh
-
-vm-run:
-	go run ./cmd/sqlq-chaos-vm

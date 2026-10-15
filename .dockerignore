@@ -1,8 +1,0 @@
-.git
-chaos-artifacts*
-chaos-vm-image*
-chaos-vm-results*
-**/chaos-artifacts*
-**/chaos-vm-image*
-**/chaos-vm-results*
-tests/chaos/artifacts

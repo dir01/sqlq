@@ -15,8 +15,7 @@ claim ownership, transactional completion, and at-least-once execution semantics
 Run seeded real-database simulation tests with `make test-simulation-sqlite` or
 `make test-simulation-psql` (requires Docker). They use ordinary Go tests with
 consumer process kills, timeouts, network faults, and a factorial correctness
-oracle. See [Simulation and chaos testing](tests/chaos/README.md) for controls
-and the optional accelerated-clock VM runner.
+oracle. See [Simulation and chaos testing](tests/chaos/README.md) for controls.
 
 ## Installation
 

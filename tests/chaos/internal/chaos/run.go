@@ -34,7 +34,7 @@ type Summary struct {
 	Tasks               int            `json:"tasks"`
 	Elapsed             time.Duration  `json:"elapsed_ns"`
 	ChaosAttempts       int            `json:"chaos_attempts"`
-	TasksPerSecond      float64        `json:"tasks_per_guest_second"`
+	TasksPerSecond      float64        `json:"tasks_per_second"`
 	Coverage            map[string]int `json:"coverage"`
 	Verified            bool           `json:"verified"`
 	Passed              bool           `json:"passed"`

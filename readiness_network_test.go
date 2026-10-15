@@ -244,7 +244,7 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 	t.Run("database-crash-restart", func(t *testing.T) {
 		data := os.Getenv("SQLQ_TEST_POSTGRES_DATA_DIR")
 		if data == "" {
-			t.Skip("VM supplies SQLQ_TEST_POSTGRES_DATA_DIR for its disposable PostgreSQL server")
+			t.Skip("set SQLQ_TEST_POSTGRES_DATA_DIR to a disposable local PostgreSQL server's data directory")
 		}
 		require.NoError(t, publisher.Publish(t.Context(), "recovery", "restart-inflight"))
 		select {

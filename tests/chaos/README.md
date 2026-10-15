@@ -7,8 +7,7 @@ handler attempts are expected. There is no application deduplication to hide
 duplicate commits.
 
 The tests use the production queue and drivers without replacing their clocks
-or transactions. The default workflow runs natively on Linux/macOS with real time.
-An optional QEMU runner provides accelerated virtual time for timer-heavy tests.
+or transactions. The tests run natively on Linux/macOS with real time.
 
 Everything for this setup lives in this separate Go module:
 
@@ -17,16 +16,12 @@ tests/chaos/
 ├── go.mod / go.sum        # depends on the local sqlq library via replace ../..
 ├── internal/chaos/       # ordinary Go simulation tests and shared fault/oracle helpers
 ├── cmd/sqlq-chaos/        # optional standalone workload/supervisor
-├── cmd/sqlq-chaos-vm/     # optional host VM launcher
-├── vm/                   # optional VM image builder and guest init
 └── README.md / Makefile
 ```
 
 Commands below run from the repository root. `go -C tests/chaos` runs in the
-test module; relative image and artifact paths resolve inside `tests/chaos`.
-The builder also places relative output directories there. Absolute paths can
-be used to store outputs elsewhere. Existing images/results at the project root
-can be accessed with paths such as `../../chaos-vm-image-checks-v2`.
+test module; relative artifact paths resolve inside `tests/chaos`. Absolute paths
+can be used to store outputs elsewhere.
 
 ## Quick start
 
@@ -85,12 +80,11 @@ clocks, and seeds do not reproduce OS scheduling.
 `simulation_test.go` is the entry point. Workers are subprocesses of the same
 compiled Go test binary, selected by `TestWorkerProcess`. This keeps real
 SIGKILL/SIGSTOP behavior and race instrumentation without a worker script,
-separately built executable, custom kernel, QEMU or image-building step. Shared
+separately built executable. Shared
 Go helpers retain the supervisor, TCP fault proxy, transactional workload and
 independent oracle. PostgreSQL TCP faults affect only worker connections through
 the test's own proxy. SQLite integrity/foreign-key checks, goroutine leak checks
-and bounded SQL pool drainage remain enabled. Offline PostgreSQL page-checksum
-validation is specific to the optional VM path.
+and bounded SQL pool drainage remain enabled.
 
 On Linux, worker launches use `/proc/self/exe` so a long exploration can keep
 restarting workers even if an external temporary-directory cleanup removes the
@@ -127,7 +121,7 @@ go -C tests/chaos run ./cmd/sqlq-chaos -n 50000 -max-range 100 -seed 42 \
 # No deliberate faults; useful for debugging the workload itself:
 go -C tests/chaos run ./cmd/sqlq-chaos -chaos 0 -artifacts chaos-artifacts-healthy
 
-# PostgreSQL: use TCP and sslmode=disable for the guest-local chaos proxy.
+# PostgreSQL: use TCP and sslmode=disable for the local chaos proxy.
 go -C tests/chaos run ./cmd/sqlq-chaos -driver postgres \
   -dsn 'postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable' \
   -seed 43 -artifacts chaos-artifacts-pg
@@ -175,7 +169,7 @@ healthy ones, and requeues DLQ jobs through the public API. It does not manufact
 missing work or edit results. A separate recovery deadline bounds convergence.
 
 Verification has its own `-verification` budget, separate from recovery. Phase
-and periodic progress records show whether the guest is still processing jobs or
+and periodic progress records show whether the run is still processing jobs or
 checking the result. Summaries retain the last known completed/pending/DLQ counts
 and elapsed recovery/verification times, including on deadline failures.
 
@@ -282,13 +276,6 @@ DLQ requeue. Cleanup cannot delete the independent correctness evidence.
 
 ### Deterministic readiness gates
 
-New VM images also contain `sqlq-readiness.test`, compiled from the library's
-tests with the image's standard/race/ASan instrumentation. Before the factorial
-profiles, the guest runs `TestReadinessSQLite` and `TestReadinessPostgres` against
-its actual databases. A failing readiness gate fails the VM run; complete test
-output is exported in `artifacts/readiness.log`. Rebuild the image to include
-these tests.
-
 The gates cover:
 
 - Retry counts crossing 65,535, finite retry limits above that boundary, and
@@ -345,9 +332,9 @@ SQLQ_TEST_POSTGRES_DSN='postgres://user:password@localhost/testdb?sslmode=disabl
 ```
 
 The PostgreSQL suite uses a fresh schema and needs an isolated test server.
-Its crash/restart subtest runs only when `SQLQ_TEST_POSTGRES_DATA_DIR` is set;
-the VM supplies `/data/postgres` and runs `pg_ctl` as its `postgres` OS user.
-Native runs without that setting explicitly skip the crash/restart subtest.
+Its crash/restart subtest runs only when `SQLQ_TEST_POSTGRES_DATA_DIR` is set
+to a disposable local server's data directory, which the test stops and restarts
+with `runuser -u postgres -- pg_ctl`; runs without it skip the subtest.
 Consumer/database process crashes do not simulate storage power loss.
 
 The added SQLite gates passed natively with `-race`, `checkptr=2`, and
@@ -366,8 +353,7 @@ last seed need not run all three profiles. The first 30-minute attempt stopped
 at roughly 21 minutes because the temporary Go worker executable pathname had
 disappeared. The Linux procfs launch fix passed an unlink regression, a replay
 of seed 500167, and the complete 30-minute rerun. These runs found no queue
-correctness failures. The new PostgreSQL readiness variants compile and are
-wired into the VM; execution of those variants remains to be validated there.
+correctness failures.
 
 ### Randomized factorial faults
 
@@ -399,69 +385,7 @@ requested process/network faults; a seed does not guarantee every boundary case.
 A nonzero chaos budget with no observed handler attempts fails. Increase the
 workload/budget when more scenario coverage is needed.
 
-## Isolated accelerated VM
-
-### Apple Silicon: native ARM64 guest and execution modes
-
-The image builder defaults to the current machine's architecture. Its third
-argument explicitly selects `arm64` or `amd64` (aliases `aarch64`/`x86_64` also
-work). On Apple Silicon, build ARM64 to avoid x86 emulation during both Docker
-builds and QEMU execution:
-
-```sh
-sh tests/chaos/vm/build.sh chaos-vm-image-arm64 standard arm64
-go -C tests/chaos run ./cmd/sqlq-chaos-vm -image chaos-vm-image-arm64 \
-  -seed 42 -n 5000 -job-timeout 30s -claim-timeout 2m -lock-timeout 10s \
-  -recovery 10m -verification 5m -host-timeout 30m \
-  -output chaos-vm-results-arm64-tcg
-```
-
-Use ARM-native Go (`go version` should show `darwin/arm64`) and Homebrew QEMU
-(`qemu-system-aarch64 --version`). Image `image.json` metadata selects the QEMU
-executable, machine and console automatically. Older x86 images remain supported
-via kernel-header detection; their relative paths from this module start with
-`../../`. `-arch` can specify custom images, but a mismatch with known image
-metadata is rejected.
-
-| Options | CPU execution | Clock behavior |
-| --- | --- | --- |
-| `-accel tcg -clock accelerated` (default) | ARM software emulation on ARM | `icount`, idle timer skipping |
-| `-accel tcg -clock realtime` | Same ARM emulated CPU | Ordinary real-time timers |
-| `-accel hvf -clock realtime` | macOS hardware virtualization, host CPU | Ordinary real-time timers |
-
-`-clock auto` chooses accelerated time for TCG and real time for HVF. HVF requires
-macOS and a guest matching the host architecture; it cannot use `icount`. There
-is no silent fallback between modes. Both use one vCPU for comparable workloads.
-The ARM guest uses `virt`, GICv3, PL011 console (`ttyAMA0`), and a low-memory layout
-to avoid Apple Silicon IPA-range issues; RAM is limited to 3 GiB (2 GiB default).
-TCG uses a Cortex-A72 model; HVF uses the host CPU model. ARM TCG remains software
-emulation, so any improvement must be measured.
-
-For a matched chaos comparison, repeat the command above with a fresh output
-directory and either `-accel hvf` or `-clock realtime`. Keep seeds, image,
-instrumentation, budgets and timeout settings unchanged. Real-time modes may
-spend roughly two minutes waiting for abandoned claims in each profile.
-
-For a quicker CPU/SQL comparison without injected faults or abandoned-claim
-waits, run the same command with `-chaos 0 -probe 1s` in all three modes. A healthy
-run starts its consumers once instead of killing/replacing an unnecessary first
-wave. Seeds reproduce workload construction, not OS scheduling or exact fault
-outcomes.
-
-`host-summary.json` records host/guest architecture, accelerator, clock mode,
-per-profile host seconds, guest seconds, and verified tasks per host second.
-`execution.json` and `launch.json` capture mode selection and the exact invocation.
-Compare only passing runs. Probe acceleration is separate from useful workload
-throughput; total host seconds additionally include boot, database initialization,
-clock probes, checksum verification and artifact export.
-
-Architecture/mode selection, legacy image detection, result validation, and
-timing collection are tested with synthetic QEMU subprocesses. Native ARM64 TCG
-guest boot and the standard `5000!` profiles have been validated on the user's
-Mac. HVF boot/performance remain unvalidated; Docker and QEMU are unavailable in
-the implementation environment.
-
-### Runtime and build checks
+## Runtime and build checks
 
 Final consumers now shut down gracefully within `-shutdown` and must finish their
 checks before the run can pass. Go's `goroutineleak` profile is collected after
@@ -485,25 +409,18 @@ Available checks:
 | Graceful shutdown deadline and process reaping | Final consumers |
 | Closed SQL pools / no checked-out connections | Shutdown and verification |
 | SQLite `integrity_check` and `foreign_key_check` | After convergence |
-| PostgreSQL page checksums | VM database initialized with checksums; offline check after server shutdown |
-| `go vet` | Check target and VM image build |
-| Strong pointer checking (`checkptr=2`) | Check target and all VM build profiles |
-| Strong cgo pointer checking (`cgocheck2`) | Check target and all VM build profiles |
-| Race detector | Check target and optional `race` VM image |
-| AddressSanitizer for C memory access | Optional `asan` VM image; separate from race |
+| `go vet` | Check target |
+| Strong pointer checking (`checkptr=2`) | Check target |
+| Strong cgo pointer checking (`cgocheck2`) | Check target |
+| Race detector | Check target and simulation targets |
 
-Build profiles are `standard`, `race`, and `asan`. All VM profiles use Go 1.27,
-leak checks, `checkptr=2`, and `cgocheck2`. Instrumentation changes timing and CPU
-cost; compare profiles separately rather than treating them as identical speed
-benchmarks. Race reports stay on stderr and halt the worker immediately.
+Instrumentation changes timing and CPU cost; compare instrumented and plain runs
+separately rather than treating them as identical speed benchmarks. Race reports
+stay on stderr and halt the worker immediately.
 
 ```sh
 make test-chaos-checks
 make test-checks # All packages, short mode; PostgreSQL integration is separate.
-sh tests/chaos/vm/build.sh chaos-vm-image-checks standard
-# Optional, separately budgeted instrumentation runs:
-sh tests/chaos/vm/build.sh chaos-vm-image-race race
-sh tests/chaos/vm/build.sh chaos-vm-image-asan asan
 ```
 
 Each process writes `*-runtime.json`, `*-goroutineleak.txt`, and
@@ -519,126 +436,15 @@ so instrumented startup is allowed to reach the queue. Network delay units are
 capped at one second; increasing compute deadlines does not multiply every SQL
 protocol chunk's delay into minutes.
 
-### Rerunning the initial failed Apple Silicon run
-
-The saved seed-42 run had correct, nonduplicated intermediate results in both
-SQLite profiles, but neither committed its root task. PostgreSQL was missing 548
-tasks and had heavy lock-timeout churn. The idle probes measured approximately
-148x and 105x, but those ratios do not describe computation throughput.
-
-Rebuild into a fresh directory to include the new checks, diagnostics, and
-timeout controls. Start with a smaller workload and more permissive compute/lock
-timeouts under x86 emulation:
-
-```sh
-sh tests/chaos/vm/build.sh chaos-vm-image-checks standard amd64
-go -C tests/chaos run ./cmd/sqlq-chaos-vm -image chaos-vm-image-checks \
-  -seed 42 -n 5000 -job-timeout 30s -claim-timeout 2m -lock-timeout 10s \
-  -recovery 10m -verification 5m -host-timeout 30m \
-  -output chaos-vm-results-42-checks-small
-```
-
-Once that passes, use `-n 50000` with a fresh output directory. Guest timeout
-values are configurable; raising only recovery cannot help a handler whose CPU
-work always exceeds its per-job deadline. Existing image directories are not
-overwritten. No change to source code updates an already-built image.
-
-Requirements: Docker for **building** the image, QEMU's `qemu-system-aarch64` or `qemu-system-x86_64` for
-execution, and Go for the host launcher. Building uses network access to fetch dependencies.
-Running creates no external NIC (`-nic none`). Go, PostgreSQL, SQLite, the proxy,
-and all fault-control timers run inside the guest. Results leave through serial
-output, not networking.
-
-```sh
-sh tests/chaos/vm/build.sh
-go -C tests/chaos run ./cmd/sqlq-chaos-vm -seed 17 -output chaos-vm-results-17
-
-# Larger workload and guest-time budgets:
-go -C tests/chaos run ./cmd/sqlq-chaos-vm -seed 42 -n 50000 \
-  -chaos 2m -recovery 10m -verification 10m -host-timeout 30m \
-  -output chaos-vm-results-42
-```
-
-The accelerated guest uses a Debian initramfs, one emulated CPU, and QEMU TCG `icount` with
-`align=off,sleep=off`. QEMU documents `sleep=off` as jumping immediately to the
-next timer deadline when the virtual CPU sleeps. The fixed RTC is driven by VM time. `-shift` controls
-nanoseconds per emulated instruction as an exponent; it is **not** a requested
-100×/1000× multiplier. Idle-time warping can accelerate waits, while increasing
-shift also makes CPU work consume more guest time and can trigger more deadlines.
-
-Each guest runs clock-coherence probes followed by three profiles:
-
-1. SQLite with finite retries and DLQ recovery.
-2. SQLite with unlimited retries, push registration, cleanup, and a small pool.
-3. PostgreSQL with network faults, more workers, and cleanup.
-
-Clock probes compare Go monotonic elapsed time, Go wall time, and database clock
-elapsed time. The host prints probe acceleration immediately and records it in
-`host-summary.json`. Workload
-summaries record tasks per guest second; divide verified task totals by host
-execution time to assess useful throughput. A high clock ratio alone does not
-establish useful speedup.
-
-The host has an independent watchdog. Successful guest shutdown delivers a
-compressed artifacts archive, which is saved and extracted with path/link checks.
-On a watchdog timeout inspect `console.log`; the guest may not have delivered its
-archive yet. Guest storage is tmpfs: this tests database recovery after consumer
-death, not persistence across a VM power failure. Exact machine record/replay and
-multi-CPU deterministic scheduling are not implemented.
-
 ### Validation status
 
-SQLite subprocess chaos, independent oracle corruption tests, TCP proxy impairment,
-local clock probing, and the host launcher's watchdog/artifact handling are tested
-without VM tooling (the launcher tests use a synthetic QEMU subprocess).
 A native SQLite run of `50000!` with seed 42 verified 1,949 tasks in approximately
-5.2 seconds, including a 3-second chaos phase; this is not a VM acceleration benchmark.
-A subsequent native run with race detection, `checkptr=2`, `cgocheck2`, leak
-detection, and SQLite integrity checks also verified all 1,949 tasks, in roughly
-6.6 seconds. Final consumers and supervisor reported zero detected leaks.
-An AddressSanitizer build also passed a native `5000!` run (209 tasks), with
-`cgocheck2`, `checkptr=2`, leak checks and database integrity checks enabled.
-Intentional leaks, hung shutdown, unexpected worker exits, and sanitizer evidence
-are covered by negative regression tests.
-
-An initial user run on Apple Silicon successfully booted the original x86 guest
-and measured about 148x/105x acceleration on idle clock probes. Both SQLite
-profiles left only their root task unfinished, while PostgreSQL experienced
-substantial lock-timeout churn. Full `50000!` convergence in the VM is not yet
-validated. New images add independent phase budgets, progress diagnostics,
-configurable compute/lock timeouts, and the runtime checks above. PostgreSQL
-simulation now starts its database automatically with Testcontainers. Docker,
-QEMU, and PostgreSQL are unavailable in the implementation environment.
-
-The subsequent check-enabled `5000!` VM run passed SQLite finite retries (209
-tasks) and PostgreSQL (185 tasks), with zero detected leaks and no residual jobs.
-PostgreSQL's offline check scanned 2,886 blocks and found zero bad checksums.
-Its SQLite push profile aborted during chaos on the old immediate pool-close
-assertion; saved stacks had already drained by the time they were collected.
-The bounded pool-drain fix has deterministic positive/negative native regression
-tests. Idle probe ratios for this run were about 141x and 103x; total host
-execution took about 145 seconds.
-
-The rebuilt v2 standard-profile `5000!` VM baseline passed all three profiles:
-SQLite finite retries (209 tasks), SQLite push (207 tasks), and PostgreSQL
-(185 tasks). All had zero pending/DLQ jobs, zero detected leaks, and closed
-database pools. PostgreSQL scanned 2,891 blocks with zero bad checksums. Host
-execution took about 154 seconds; idle probe ratios were about 148x and 88x.
-This validates the standard check-enabled small guest workload and pool-drain
-fix. VM race/ASan profiles and full `50000!` convergence remain unvalidated.
-
-The native ARM64 standard-profile TCG run also passed all three `5000!` profiles,
-with the same task counts, zero detected leaks, and zero residual jobs/connections.
-PostgreSQL found zero bad checksums across 2,892 blocks. Total host runtime was
-174.6 seconds versus the earlier x86 run's 153.7 seconds: this single sample does
-not demonstrate an overall speedup. Idle probes improved to about 300x/139x.
-Per-profile host times were 48.0 seconds (SQLite finite), 33.8 seconds (SQLite
-push), and 67.4 seconds (PostgreSQL). The remaining roughly 25.4 seconds covered
-boot, setup, checksum verification and artifact export.
-Matched subsequent ARM64 no-chaos measurements passed all three profiles: TCG
-took 35.0 seconds for the workloads and 61.5 seconds end-to-end; HVF took 6.1
-seconds and 13.5 seconds respectively. HVF's active-work speedup motivates the
-native real-time workflow. These are not matched full-chaos comparisons.
+5.2 seconds, including a 3-second chaos phase. A subsequent native run with race
+detection, `checkptr=2`, `cgocheck2`, leak detection, and SQLite integrity checks
+also verified all 1,949 tasks, in roughly 6.6 seconds. Final consumers and
+supervisor reported zero detected leaks. Intentional leaks, hung shutdown,
+unexpected worker exits, and sanitizer evidence are covered by negative
+regression tests.
 
 The native Go SQLite simulation passed seeds 42–44 with race and leak checks,
 verifying 435/451/451 tasks per profile. All nine profiles passed in about 14
@@ -660,13 +466,11 @@ The tests use real subprocesses and reject intentionally corrupted results,
 duplicated/missing committed work, leaked hook effects, poison publications,
 audits charged a failure that wasn't a timeout, and missing or duplicated side
 writes.
-Native profiles run in this module's Go tests; full endurance and VM profiles
-are opt-in. Root-module `go test ./...` covers the library; use the simulation
+Native profiles run in this module's Go tests; full endurance profiles are opt-in. Root-module `go test ./...` covers the library; use the simulation
 targets for this setup, or `make test-chaos` for Docker-free harness regressions.
 
 Artifacts include `config.json`, `events.jsonl`, per-worker stderr logs,
 `database.json`, and `summary.json`. The snapshot retains queue and ledger rows,
 including intermediate integers. SQLite additionally retains the actual database.
 For failures, start with the summary error, last events, remaining jobs/DLQ, and
-the committed ledger. See [the implementation plan](../../docs/plans/20261011-accelerated-chaos-testing.md)
-for the broader design and future coverage goals.
+the committed ledger.

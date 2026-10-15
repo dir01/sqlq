@@ -22,7 +22,6 @@ const keptJobType = "kept"
 const sideAuditJobType = "side_audit"
 
 // Config is persisted so a workload and its fault choices can be reproduced.
-// Durations are guest-clock durations when running inside the VM.
 type Config struct {
 	Driver           string
 	DSN              string
