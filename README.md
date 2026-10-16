@@ -12,6 +12,11 @@ and OpenTelemetry tracing and metrics.
 See [Current behavior and limitations](#current-behavior-and-limitations) for
 claim ownership, transactional completion, and at-least-once execution semantics.
 
+Run seeded real-database simulation tests with `make test-simulation-sqlite` or
+`make test-simulation-psql` (requires Docker). They use ordinary Go tests with
+consumer process kills, timeouts, network faults, and a factorial correctness
+oracle. See [Simulation and chaos testing](tests/chaos/README.md) for controls.
+
 ## Installation
 
 Use Go 1.26 or newer. Install the queue and a database driver:
