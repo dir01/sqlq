@@ -53,6 +53,7 @@ func (d *PostgresDriver) initSchema(ctx context.Context) error {
 
 // cleanupJobs deletes old processed jobs for a specific job type in PostgreSQL.
 // It deletes jobs where processed_at is older than maxAge, in batches.
+// Retention uses PostgreSQL's clock, just like processed_at.
 func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -62,39 +63,11 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge
 	))
 	defer span.End()
 
-	var totalDeleted int64
-	threshold := time.Now().Add(-maxAge)
-
-	for {
-		var batchDeleted int64
-		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
-			// Efficiently delete a batch using ctid in PostgreSQL
-			res, err := tx.ExecContext(ctx, `
-				DELETE FROM jobs
-				WHERE ctid IN (
-					SELECT ctid
-					FROM jobs
-					WHERE job_type = $1 AND processed_at < $2
-					LIMIT $3
-				)
-			`, jobType, threshold, batchSize)
-			if err != nil {
-				return fmt.Errorf("failed to delete batch of old processed jobs for type %s: %w", jobType, err)
-			}
-			count, _ := res.RowsAffected()
-			batchDeleted = count
-			return nil
-		})
-
-		if err != nil {
-			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
-			return totalDeleted, err // Return partial counts and error
-		}
-
-		totalDeleted += batchDeleted
-		if batchDeleted < int64(batchSize) {
-			break // Last batch processed
-		}
+	totalDeleted, err := d.deleteOldInBatches(ctx, "jobs", "processed_at", jobType, maxAge, batchSize)
+	if err != nil {
+		err = fmt.Errorf("failed to delete batch of old processed jobs for type %s: %w", jobType, err)
+		span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
+		return totalDeleted, err // Return partial counts and error
 	}
 	span.SetAttributes(attribute.Int64("sqlq.db.rows_deleted.processed", totalDeleted))
 	return totalDeleted, nil
@@ -102,6 +75,7 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge
 
 // cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 // It deletes DLQ jobs older than maxAge, in batches.
+// Retention uses PostgreSQL's clock, just like failed_at.
 func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
@@ -111,48 +85,53 @@ func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType
 	))
 	defer span.End()
 
-	// --- Cleanup DLQ Jobs (Batched) ---
-	dlqThreshold := time.Now().Add(-maxAge)
-	var totalDlqDeleted int64
+	totalDlqDeleted, err := d.deleteOldInBatches(ctx, "dead_letter_queue", "failed_at", jobType, maxAge, batchSize)
+	if err != nil {
+		err = fmt.Errorf("failed to delete batch of old dlq jobs for type %s: %w", jobType, err)
+		span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
+		return totalDlqDeleted, err // Return partial counts and error
+	}
+	span.SetAttributes(attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted))
+	return totalDlqDeleted, nil
+}
+
+// deleteOldInBatches deletes rows of jobType from table whose timestampColumn is older than maxAge
+// by PostgreSQL's clock, one transaction per batch. It returns how many rows it deleted, even on error.
+// table and timestampColumn are trusted identifiers, never user input.
+func (d *PostgresDriver) deleteOldInBatches(
+	ctx context.Context, table, timestampColumn, jobType string, maxAge time.Duration, batchSize uint16,
+) (int64, error) {
+	// Efficiently delete a batch using ctid in PostgreSQL
+	query := fmt.Sprintf(`
+		DELETE FROM %[1]s
+		WHERE ctid IN (
+			SELECT ctid
+			FROM %[1]s
+			WHERE job_type = $1 AND %[2]s < NOW() - $2 * interval '1 microsecond'
+			LIMIT $3
+		)
+	`, table, timestampColumn)
+
+	var totalDeleted int64
 	for {
 		var batchDeleted int64
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
-			// Efficiently delete a batch using ctid in PostgreSQL
-			resDLQ, err := tx.ExecContext(ctx, `
-				DELETE FROM dead_letter_queue
-				WHERE ctid IN (
-					SELECT ctid
-					FROM dead_letter_queue
-					WHERE job_type = $1 AND failed_at < $2
-					LIMIT $3
-				)
-			`, jobType, dlqThreshold, batchSize)
+			res, err := tx.ExecContext(ctx, query, jobType, maxAge.Microseconds(), batchSize)
 			if err != nil {
-				return fmt.Errorf("failed to delete batch of old dlq jobs for type %s: %w", jobType, err)
+				return err
 			}
-			count, _ := resDLQ.RowsAffected()
-			batchDeleted = count
+			batchDeleted, _ = res.RowsAffected()
 			return nil
 		})
-
 		if err != nil {
-			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
-			return totalDlqDeleted, err // Return partial counts and error
+			return totalDeleted, err
 		}
 
-		totalDlqDeleted += batchDeleted
+		totalDeleted += batchDeleted
 		if batchDeleted < int64(batchSize) {
-			break // Last batch processed
+			return totalDeleted, nil // Last batch processed
 		}
-		// Optional: Add a small delay between batches if needed
-		// time.Sleep(10 * time.Millisecond)
 	}
-
-	span.SetAttributes(
-		attribute.Int64("sqlq.db.rows_deleted.dlq", totalDlqDeleted),
-	)
-
-	return totalDlqDeleted, nil
 }
 
 // InsertJob inserts a new job into the PostgreSQL jobs table.

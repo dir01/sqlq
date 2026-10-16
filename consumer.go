@@ -553,7 +553,18 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 	defer span.End()
 
 	// Preserve the uint16 callback API without wrapping long-lived retries to zero.
-	backoff := cons.backoffFunc(uint16(min(uint64(job.RetryCount)+1, 65535)))
+	retryNum := uint16(min(uint64(job.RetryCount)+1, 65535))
+	var backoff time.Duration
+	if err := callRecovering("backoff function", func() error {
+		backoff = cons.backoffFunc(retryNum)
+		return nil
+	}); err != nil {
+		backoff = exponentialBackoff(retryNum)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "backoff function panicked; using default backoff")
+		cons.logger.ErrorContext(ctx, "sqlq: backoff function panicked; using default backoff",
+			slog.Int64("job_id", job.ID), slog.Duration("retry_in", backoff), slog.Any("error", err))
+	}
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	if err := cons.driver.markJobFailedAndReschedule(ctx, job.ID, job.ClaimToken, errorMsg, backoff); err != nil {
