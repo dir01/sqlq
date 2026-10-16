@@ -39,9 +39,9 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 		sqlq.WithDefaultPollInterval(25*time.Millisecond),
 	)
 	require.NoError(t, err)
-	require.NoError(t, q.Run())
+	require.NoError(t, q.Run(t.Context()))
 	t.Cleanup(func() {
-		q.Shutdown()
+		assert.NoError(t, q.Shutdown(context.Background()))
 		assert.NoError(t, db.Close())
 		assert.NoError(t, other.Close())
 	})
@@ -129,9 +129,9 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 		sqlq.WithDefaultJobTimeout(jobTimeout),
 	)
 	require.NoError(t, err)
-	require.NoError(t, q.Run())
+	require.NoError(t, q.Run(t.Context()))
 	t.Cleanup(func() {
-		q.Shutdown()
+		assert.NoError(t, q.Shutdown(context.Background()))
 		assert.NoError(t, db.Close())
 		assert.NoError(t, other.Close())
 	})

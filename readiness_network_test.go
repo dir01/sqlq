@@ -197,12 +197,12 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 		WithDefaultMaxRetries(-1), WithDefaultBackoffFunc(func(uint16) time.Duration { return 0 }),
 		WithDefaultCleanupProcessedInterval(0), WithDefaultCleanupDLQInterval(0))
 	require.NoError(t, err)
-	defer q.Shutdown()
+	defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 	// The admin/publisher bypasses network impairment. The consumer queue and
 	// pool below are created once and stay alive through every recovery cycle.
 	publisher, err := New(db, DBTypePostgres)
 	require.NoError(t, err)
-	defer publisher.Shutdown()
+	defer func() { require.NoError(t, publisher.Shutdown(t.Context())) }()
 	restartWritten := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -244,7 +244,7 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 	t.Run("database-crash-restart", func(t *testing.T) {
 		data := os.Getenv("SQLQ_TEST_POSTGRES_DATA_DIR")
 		if data == "" {
-			t.Skip("VM supplies SQLQ_TEST_POSTGRES_DATA_DIR for its disposable PostgreSQL server")
+			t.Skip("set SQLQ_TEST_POSTGRES_DATA_DIR to a disposable local PostgreSQL server's data directory")
 		}
 		require.NoError(t, publisher.Publish(t.Context(), "recovery", "restart-inflight"))
 		select {
@@ -279,7 +279,7 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 		require.NoError(t, publisher.Publish(t.Context(), "recovery", "after-restart"))
 		assertEffect("after-restart")
 	})
-	q.Shutdown()
+	require.NoError(t, q.Shutdown(t.Context()))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE processed_at IS NULL`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM (SELECT value FROM readiness_effects GROUP BY value HAVING count(*) <> 1) duplicates`))

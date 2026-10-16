@@ -58,9 +58,9 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 		sqlq.WithDefaultPollInterval(25*time.Millisecond),
 	)
 	require.NoError(t, err)
-	require.NoError(t, q.Run())
+	require.NoError(t, q.Run(t.Context()))
 	t.Cleanup(func() {
-		q.Shutdown()
+		assert.NoError(t, q.Shutdown(context.Background()))
 		assert.NoError(t, db.Close())
 		assert.NoError(t, other.Close())
 	})

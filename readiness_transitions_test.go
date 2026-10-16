@@ -22,7 +22,7 @@ func testTransitionAmbiguity(t *testing.T, f readinessFixture, observer *sql.DB,
 				db, d, arm, fired := readinessBoundaryDB(t, f)
 				q, err := New(db, f.kind)
 				require.NoError(t, err)
-				defer q.Shutdown()
+				defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 				require.NoError(t, q.Publish(t.Context(), "claims", "task"))
 				switch operation {
 				case "claim":
@@ -182,7 +182,7 @@ func testReadinessPublishing(t *testing.T, f readinessFixture, observer *sql.DB,
 			db, _, arm, fired := readinessBoundaryDB(t, f)
 			q, err := New(db, f.kind)
 			require.NoError(t, err)
-			defer q.Shutdown()
+			defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 			tx, err := db.BeginTx(t.Context(), nil)
 			require.NoError(t, err)
 			defer func() { _ = tx.Rollback() }()

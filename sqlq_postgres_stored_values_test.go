@@ -76,8 +76,8 @@ func TestPostgresStoredValues(t *testing.T) {
 			sqlq.WithDefaultBackoffFunc(func(uint16) time.Duration { return 0 }),
 		}, opts...)...)
 		require.NoError(t, err)
-		require.NoError(t, q.Run())
-		t.Cleanup(q.Shutdown) // Runs before the database closes.
+		require.NoError(t, q.Run(t.Context()))
+		t.Cleanup(func() { assert.NoError(t, q.Shutdown(context.Background())) }) // Runs before the database closes.
 		return q
 	}
 
