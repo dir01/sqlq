@@ -46,6 +46,15 @@ func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
 	return jobTimeout + min(time.Minute, jobTimeout/2)
 }
 
+// minClaimTimeout returns the shortest claim timeout a consumer accepts for jobTimeout:
+// a claim just extended must still have claimTimeNeeded left once the extension's round trip
+// and the wait for a connection are over. A quarter of the job timeout, at most one second,
+// is left for those, and 2ms more for claimBudget's rounding. With less, a worker would extend
+// the claim again and again and never start the handler.
+func minClaimTimeout(jobTimeout time.Duration) time.Duration {
+	return claimTimeNeeded(jobTimeout) + min(time.Second, jobTimeout/4) + 2*time.Millisecond
+}
+
 // newClaimToken returns a random string for one claim request (128 random bits, base32).
 // The drivers add ":<job ID>", so each job in a batch gets its own token.
 // It is random so that consumers in different processes never make the same token.

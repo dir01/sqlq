@@ -166,7 +166,7 @@ func TestPostgreSQL(t *testing.T) {
 		tc.TestDLQGetLimit(ctx, t)
 	})
 
-	t.Run("Job with NULL created_at is still delivered", func(t *testing.T) {
+	t.Run("Job without created_at is rejected", func(t *testing.T) {
 		t.Parallel()
 
 		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestNullCreatedAt")
@@ -174,38 +174,45 @@ func TestPostgreSQL(t *testing.T) {
 
 		tc.TestNullCreatedAt(ctx, t)
 	})
+
+	t.Run("Sub-millisecond backoff respects retry limit", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestSubMillisecondBackoffRetryLimit")
+		defer span.End()
+
+		tc.TestSubMillisecondBackoffRetryLimit(ctx, t)
+	})
+
+	t.Run("PublishTx delay is measured from publish time", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestPublishTxDelayFromPublishTime")
+		defer span.End()
+
+		tc.TestPublishTxDelayFromPublishTime(ctx, t)
+	})
+
+	t.Run("Marking processed outlasts a transient row lock", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, span := tracer.Start(t.Context(), "TestPostgreSQL.TestMarkProcessedOutlastsTransientRowLock")
+		defer span.End()
+
+		tc.TestMarkProcessedOutlastsTransientRowLock(ctx, t)
+	})
 }
 
-// TestNullCreatedAt checks that a job whose created_at is NULL, which the PostgreSQL schema allows
-// (unlike SQLite's), is delivered with a zero CreatedAt instead of being claimed and dropped.
+// TestNullCreatedAt checks that a job cannot be stored without created_at. The column was once
+// nullable, and a job without one could never be dead-lettered.
 func (tc *TestCase) TestNullCreatedAt(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	jobType := "null_created_at_test"
-	infos := make(chan sqlq.JobInfo, 1)
-
-	err := tc.Q.Consume(ctx, jobType, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
-		info, _ := sqlq.JobInfoFromContext(ctx)
-		infos <- info
-		return nil
-	})
-	require.NoError(t, err)
-
-	_, err = tc.DB.ExecContext(ctx,
+	_, err := tc.DB.ExecContext(ctx,
 		"INSERT INTO jobs (job_type, payload, created_at) VALUES ($1, $2, NULL)",
-		jobType, []byte(`{"message":"null created_at"}`),
+		"null_created_at_test", []byte(`{"message":"null created_at"}`),
 	)
-	require.NoError(t, err)
-
-	select {
-	case info := <-infos:
-		require.True(t, info.CreatedAt.IsZero())
-	case <-ctx.Done():
-		t.Fatal("job with NULL created_at was not delivered")
-	}
+	require.ErrorContains(t, err, "violates not-null constraint")
 }
 
 func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {

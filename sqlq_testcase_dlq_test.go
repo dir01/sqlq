@@ -52,13 +52,13 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 		require.NoError(t, err, "Failed to get DLQ jobs")
 
 		return len(dlqJobs) > 0
-	// Increase timeout for checking DLQ
+		// Increase timeout for checking DLQ
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, 1, len(dlqJobs))
 
 	j := dlqJobs[0]
-	require.Equal(t, uint16(maxRetries), j.RetryCount)
+	require.Equal(t, uint32(maxRetries), j.RetryCount)
 	require.NotZero(t, j.OriginalID, "OriginalID should not be zero in DLQ job")
 }
 
@@ -356,7 +356,7 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 	require.Equal(t, jobType, call.info.JobType)
 	require.NotZero(t, call.info.ID)
 	require.Equal(t, maxRetries, call.info.MaxRetries)
-	require.Equal(t, uint16(maxRetries), call.info.RetryCount)
+	require.Equal(t, uint32(maxRetries), call.info.RetryCount)
 	// Generous, since the database server's clock sets created_at on some drivers
 	require.WithinDuration(t, publishedAt, call.info.CreatedAt, time.Minute)
 	require.True(t, call.info.IsFinalAttempt())
@@ -386,7 +386,7 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 		require.True(t, handlerCall.ok, "job info should be in handler context")
 		require.Equal(t, call.info.ID, handlerCall.info.ID)
 		require.Equal(t, call.info.CreatedAt, handlerCall.info.CreatedAt)
-		require.Equal(t, uint16(i), handlerCall.info.RetryCount)
+		require.Equal(t, uint32(i), handlerCall.info.RetryCount)
 		require.Equal(t, i == int(maxRetries), handlerCall.info.IsFinalAttempt())
 	}
 
@@ -468,7 +468,7 @@ func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 
 	require.Equal(t, int32(4), hookCalls.Load())
 	require.Equal(t, int32(4), handlerCalls.Load(), "the handler should run again after each failed hook")
-	require.Equal(t, uint16(3), dlqJob.RetryCount, "each failed hook should count as a failed attempt")
+	require.Equal(t, uint32(3), dlqJob.RetryCount, "each failed hook should count as a failed attempt")
 
 	rows, err := tc.DB.QueryContext(ctx, "SELECT attempt FROM dlq_hook_failure_attempts")
 	require.NoError(t, err)

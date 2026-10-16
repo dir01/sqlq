@@ -4,6 +4,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -21,7 +22,7 @@ type driver interface {
 			TraceContext map[string]string
 			Payload      []byte
 			ID           int64
-			RetryCount   uint16
+			RetryCount   uint32
 		}
 	*/
 
@@ -40,6 +41,8 @@ type driver interface {
 
 	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
+	// It returns errMarkInFreshTx when tx made no writes and could not become a writer;
+	// the caller may then roll tx back and mark the job in a new transaction.
 	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
@@ -65,6 +68,11 @@ type driver interface {
 	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
 }
+
+// errMarkInFreshTx is returned by markJobProcessed when the handler's transaction wrote nothing
+// but could not be upgraded to a write transaction. Marking the job in a new transaction then
+// loses nothing.
+var errMarkInFreshTx = errors.New("handler transaction wrote nothing and could not become a writer")
 
 // sqlExecutor is implemented by both *sql.DB and *sql.Tx.
 type sqlExecutor interface {

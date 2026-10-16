@@ -34,7 +34,9 @@ go get github.com/jackc/pgx/v5/stdlib
 4. `Publish` JSON-encodes a payload and inserts a job. Publishing does not wait
    for the handler to finish.
 5. `Shutdown` cancels consumers and waits for their goroutines. Your application
-   closes the database afterward.
+   closes the database afterward. From the moment it is called, `Consume` returns
+   `ErrShutDown`, so a consumer registered concurrently, say during startup when a
+   signal comes, cannot outlive it.
 
 There can be one `Consume` registration per job type on a queue instance.
 Registering the same type twice returns `ErrDuplicateConsumer`. Increase the
@@ -132,6 +134,12 @@ Two retries allow three attempts total. A failure on `info.IsFinalAttempt()`
 moves the job to the DLQ; success completes it. Panics use the same failure
 path. [Full retry demo](demo/retry/README.md).
 
+`JobInfo.RetryCount` and `DeadLetterJob.RetryCount` are `uint32`. Counts saturate
+at 2,147,483,647 (the PostgreSQL integer limit); unlimited retries continue at
+that value. Existing `func(uint16) time.Duration` backoff callbacks are retained,
+with their argument saturating at 65,535. The default exponential backoff caps
+at 24 hours to prevent duration overflow on long-lived failures.
+
 ## 6. Process jobs concurrently
 
 ```go
@@ -159,11 +167,14 @@ can recover unfinished jobs after their claims expire. Recovery does not increme
 the retry count: a prefetched job may never have started. Polling discovers expired
 claims even without a new publish notification.
 
-The claim timeout defaults to twice the job timeout and must be longer than it;
-otherwise `Consume` returns `ErrClaimTimeoutTooShort`. Before a worker starts a
+The claim timeout defaults to twice the job timeout. Before a worker starts a
 handler, it checks a conservative local deadline. If less than the job timeout plus
 a margin (half the job timeout, at most one minute) remains, it extends the claim
-using its token. Fresh claims need no additional database query. Expired local
+using its token, and checks again once it has a connection for the handler. So the
+claim timeout must cover that much and the extension's round trip: at least the job
+timeout, plus the margin, plus a quarter of the job timeout (at most one second),
+plus 2ms. Otherwise `Consume` returns `ErrClaimTimeoutTooShort`. Twice the job
+timeout is always enough for job timeouts of 8ms or more. Fresh claims need no additional database query. Expired local
 copies are discarded; a failed ownership check prevents the handler from starting.
 
 Claims are not renewed while a handler runs, and claim expiry does not cancel it.
@@ -210,6 +221,9 @@ q.RequeueDeadLetterJob(ctx, jobs[0].OriginalID)
 Fix the handler first. Requeue removes the DLQ row and inserts a new pending
 job with a new ID, zero retries, and no inherited trace context. A missing row
 returns `ErrJobNotFound`. [Full requeue demo](demo/requeue-dlq/README.md).
+
+Concurrent PostgreSQL requeues atomically take the DLQ row: only one caller
+creates a replacement, and the others receive `ErrJobNotFound`.
 
 ## 10. Record terminal failure atomically
 
@@ -325,7 +339,7 @@ another attempt, and clears the claim. A DLQ move inserts the failure and
 deletes the original job in a transaction. SQLite stores timestamps as Unix
 milliseconds; PostgreSQL uses SQL timestamps.
 
-Schema definitions: `./driver_sqlite.go:51` and `./driver_postgres.go:33`.
+Schema definitions: `./driver_sqlite.go:91` and `./driver_postgres.go:34`.
 
 ## Current behavior and limitations
 
