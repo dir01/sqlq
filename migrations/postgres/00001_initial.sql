@@ -14,8 +14,6 @@ CREATE TABLE jobs (
     claim_expires_at TIMESTAMP WITH TIME ZONE NULL
 );
 CREATE INDEX idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL;
-CREATE INDEX idx_jobs_job_type ON jobs(job_type);
-CREATE INDEX idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at); -- Finding available jobs
 CREATE INDEX idx_jobs_job_type_processed_at ON jobs(job_type, processed_at); -- Cleaning up processed jobs
 
 -- Dead-lettered jobs keep their original IDs.

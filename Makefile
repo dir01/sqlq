@@ -6,8 +6,9 @@ test:
 	go test -timeout 3m -race -v ./...
 .PHONY: test
 
+# The linter has a module file of its own, so that its dependencies stay out of the library's.
 lint:
-	go tool golangci-lint run
+	go tool -modfile=tools/go.mod golangci-lint run
 .PHONY: lint
 
 test-short:
@@ -30,4 +31,3 @@ start-jaeger:
 		--set receivers.otlp.protocols.http.endpoint=0.0.0.0:4318 \
 		--set receivers.otlp.protocols.grpc.endpoint=0.0.0.0:4317
 .PHONY: start-jaeger
-

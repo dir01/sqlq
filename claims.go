@@ -21,6 +21,18 @@ func claimKey(j job) string {
 	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
 }
 
+// heldClaim is a claim in consumer.claims. started is set when a worker starts the job.
+// A worker does not start a job once shutdown has begun, so shutdown can release the claims
+// of jobs that are not started while handlers still run.
+type heldClaim struct {
+	job     job
+	started bool
+}
+
+// claimReleaseTimeout is the most time that one release of claims can use: the release of one claim
+// after a failed attempt, or each of the two releases at shutdown.
+const claimReleaseTimeout = 5 * time.Second
+
 // claimBudget returns how long a worker can count on a claim, from the time it asked for it.
 // It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
 // It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
