@@ -242,7 +242,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
-		require.Equal(t, uint16(1), jobs[0].RetryCount)
+		require.Equal(t, uint32(1), jobs[0].RetryCount)
 		require.NotEqual(t, j.ClaimToken, jobs[0].ClaimToken)
 	})
 
@@ -456,6 +456,22 @@ func TestConsumeClaimTimeout(t *testing.T) {
 		{
 			"claim timeout equal to job timeout is rejected", ErrClaimTimeoutTooShort, nil,
 			[]ConsumerOption{WithConsumerClaimTimeout(defaultJobTimeout)}, 0,
+		},
+		{
+			"claim timeout shorter than a worker needs before it starts a handler is rejected", ErrClaimTimeoutTooShort, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1100 * time.Millisecond)}, 0,
+		},
+		{
+			"claim timeout with no time for its extension is rejected", ErrClaimTimeoutTooShort, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(claimTimeNeeded(time.Second) + 2*time.Millisecond)}, 0,
+		},
+		{
+			"shortest claim timeout is accepted", nil, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1752 * time.Millisecond)}, 1752 * time.Millisecond,
+		},
+		{
+			"default covers a very short job timeout", nil, nil,
+			[]ConsumerOption{WithConsumerJobTimeout(4 * time.Millisecond)}, 9 * time.Millisecond,
 		},
 		{
 			"queue claim timeout shorter than consumer job timeout is rejected", ErrClaimTimeoutTooShort,

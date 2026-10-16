@@ -17,19 +17,14 @@ func (b *tokenBucket) SpendToken(currUnixMilli int64) bool {
 		tokensCurr = b.Capacity
 	}
 
-	// maybe add tokens
-	passedMilli := currUnixMilli - b.lastCheckUnixMilli
-	toAdd := b.RPM * uint16(passedMilli) / 60000
-	if toAdd > 0 {
-		tokensCurr += toAdd
-		// only update if tokens were added
-		// otherwise failed spending will interfere with refill
-		b.lastCheckUnixMilli = currUnixMilli
-	}
-
-	// but not past Capacity
-	if tokensCurr > b.Capacity {
-		tokensCurr = b.Capacity
+	// maybe add tokens, in 64 bits: RPM times the elapsed milliseconds overflows 16
+	passedMilli := max(currUnixMilli-b.lastCheckUnixMilli, 0)
+	if toAdd := int64(b.RPM) * passedMilli / 60000; toAdd > 0 {
+		// but not past Capacity
+		tokensCurr = uint16(min(int64(tokensCurr)+toAdd, int64(b.Capacity)))
+		// Only the time the added tokens took is used up, so a fraction of the next carries over.
+		// Without that, failed spends would interfere with refill.
+		b.lastCheckUnixMilli += toAdd * 60000 / int64(b.RPM)
 	}
 
 	// deny spending if at zero
