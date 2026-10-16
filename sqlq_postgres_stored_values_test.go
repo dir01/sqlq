@@ -113,31 +113,6 @@ func TestPostgresStoredValues(t *testing.T) {
 		})
 	}
 
-	// Dead-letter times stored without a time zone, by earlier versions, keep their meaning: the
-	// session's wall-clock time, for failed_at as its default wrote it.
-	t.Run("DLQ times without a time zone are migrated", func(t *testing.T) {
-		t.Parallel()
-		db := openSchema(t, "America/Los_Angeles")
-		_, err := db.ExecContext(t.Context(), `CREATE TABLE dead_letter_queue (
-			original_job_id INTEGER PRIMARY KEY, job_type TEXT NOT NULL, payload BYTEA,
-			created_at TIMESTAMP, failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			retry_count INTEGER, failure_reason TEXT)`)
-		require.NoError(t, err)
-		_, err = db.ExecContext(t.Context(), `INSERT INTO dead_letter_queue (original_job_id, job_type, created_at, retry_count, failure_reason)
-			VALUES (1, 'old', LOCALTIMESTAMP - interval '1 hour', 0, 'old failure')`)
-		require.NoError(t, err)
-		for range 2 { // Migrating again changes nothing.
-			_, err = sqlq.New(db, sqlq.DBTypePostgres)
-			require.NoError(t, err)
-		}
-		q := newQueue(t, db)
-		jobs, err := q.GetDeadLetterJobs(t.Context(), "old", 10)
-		require.NoError(t, err)
-		require.Len(t, jobs, 1)
-		assert.WithinDuration(t, time.Now(), jobs[0].FailedAt, time.Minute, "failure time")
-		assert.WithinDuration(t, time.Now().Add(-time.Hour), jobs[0].CreatedAt, time.Minute, "creation time")
-	})
-
 	// The same, with the application in other time zones: the queue reads its clock there.
 	for _, timeZone := range []string{"Asia/Tokyo", "America/Los_Angeles"} {
 		if os.Getenv("SQLQ_STORED_VALUES_CHILD") != "" {

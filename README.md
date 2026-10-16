@@ -29,7 +29,7 @@ go get github.com/jackc/pgx/v5/stdlib
 ## How the queue runs
 
 1. Your application opens a `*sql.DB` and passes it to `sqlq.New`.
-2. `Run` creates the queue tables and indexes. It does not start workers.
+2. `Run` creates or migrates the queue tables and indexes. It does not start workers.
 3. `Consume` registers a handler and immediately starts workers for its job type.
 4. `Publish` JSON-encodes a payload and inserts a job. Publishing does not wait
    for the handler to finish.
@@ -323,10 +323,13 @@ unless `WithMeterProvider` sets another. Instruments: `./metrics.go:13`.
 
 ## Storage
 
-`Run` creates two tables and their indexes using SQL embedded in the drivers.
-It also idempotently adds claim columns to existing `jobs` tables. Stop old-version
-consumers before upgrading: they do not enforce claim tokens. Legacy unprocessed
-jobs without claim metadata are recoverable; processed jobs remain excluded.
+`Run` applies the queue's [goose](https://github.com/pressly/goose) migrations,
+embedded in the library: `migrations/postgres/` and `migrations/sqlite/`. Applied
+versions are recorded in `sqlq_schema_migrations`, separate from any goose table of
+your own. On PostgreSQL an advisory lock keeps processes starting together from
+migrating twice. `00001_initial.sql` is the whole schema; each later change is a new
+numbered file, never an edit of an applied one. Databases created before migrations
+existed are not upgraded: drain the queue and drop its tables first.
 
 | Table | Contents |
 | --- | --- |
@@ -339,7 +342,7 @@ another attempt, and clears the claim. A DLQ move inserts the failure and
 deletes the original job in a transaction. SQLite stores timestamps as Unix
 milliseconds; PostgreSQL uses SQL timestamps.
 
-Schema definitions: `./driver_sqlite.go:91` and `./driver_postgres.go:34`.
+Schema definitions: `./migrations/sqlite/` and `./migrations/postgres/`.
 
 ## Current behavior and limitations
 
