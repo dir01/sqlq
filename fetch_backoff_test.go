@@ -38,7 +38,7 @@ func TestFetchRetryBackoff(t *testing.T) {
 func TestFetchRetryBackoffDoesNotExceedPollRate(t *testing.T) {
 	t.Parallel()
 	for _, poll := range []time.Duration{time.Minute, 5 * time.Minute} {
-		requireFetchRetryDelay(t, fetchRetryMaxFirstDelay, fetchRetryBackoff(0, poll))
+		requireFetchRetryDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, poll))
 		for _, attempt := range []uint16{1, 2, 16, 65535} {
 			requireFetchRetryDelay(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}

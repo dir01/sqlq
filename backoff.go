@@ -21,21 +21,14 @@ func exponentialBackoff(retryNum uint16) time.Duration {
 	return delay + jitter
 }
 
-const (
-	// The maximum delay before the first retry of a failed fetch.
-	// Most fetch errors occur because of a short lock, and one fast retry is usually successful.
-	fetchRetryMaxFirstDelay = 100 * time.Millisecond
-	// The maximum delay between retries of a failed fetch, if the poll interval is shorter.
-	fetchRetryMaxDelay = 30 * time.Second
-)
-
 // fetchRetryBackoff returns the delay of the fetch loop after retryNum + 1 failed fetches in sequence.
 //
-// The first delay is the poll interval, but not more than fetchRetryMaxFirstDelay.
+// The first delay is the poll interval, but not more than 100ms. Most fetch errors occur
+// because of a short lock, and one fast retry is usually successful.
 // If the failures continue, the database is possibly not available. Then the delay is the
-// poll interval, doubled one time for each further failure, to a maximum of fetchRetryMaxDelay
-// or the poll interval, whichever is longer. Thus, after the first retry, a failure never
-// makes the consumer fetch more frequently than its poll interval.
+// poll interval, doubled one time for each further failure, to a maximum of 30s or the poll
+// interval, whichever is longer. Thus, after the first retry, a failure never makes the
+// consumer fetch more frequently than its poll interval.
 //
 // The function adds a random jitter of up to 20% to the delay. When the database stops,
 // all consumers fail at almost the same time. Without the jitter, they would also retry
@@ -43,9 +36,9 @@ const (
 func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duration {
 	delay := max(pollInterval, time.Millisecond) // a zero delay does not increase when it doubles
 	if retryNum == 0 {
-		delay = min(delay, fetchRetryMaxFirstDelay)
+		delay = min(delay, 100*time.Millisecond)
 	} else {
-		maxDelay := max(fetchRetryMaxDelay, delay)
+		maxDelay := max(30*time.Second, delay)
 		for range retryNum {
 			if delay > maxDelay/2 { // doubling would make the delay more than maxDelay
 				delay = maxDelay
