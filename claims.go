@@ -7,77 +7,77 @@ import (
 	"time"
 )
 
-// A claim lets one consumer work on one job for a limited time.
-// The jobs table stores the claim token and the expiry time.
-// Every later write for the job must give the same token, or it fails with ErrClaimLost.
-// After a claim expires, another consumer can claim the job with a new token.
-// This lets another worker finish jobs that a stopped worker left behind.
-
-// claimKey returns the key for a claim in consumer.claims. The consumer uses that map
-// to limit how many jobs it holds, and to release them at shutdown.
-// The key includes the token, because the consumer can claim the same job again
-// after its old claim expires.
-func claimKey(j job) string {
-	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
-}
-
-// claimBudget returns how long a worker can count on a claim, from the time it asked for it.
-// It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
-// It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
-// so the claim start it stores can be up to 1ms before the real time.
-func claimBudget(timeout time.Duration) time.Duration {
-	return timeout.Truncate(time.Millisecond) - time.Millisecond
-}
-
-// localClaimDeadline returns the last time a worker can start a job without asking the database.
-// getJobsForConsumer and extendClaim in each driver call it before they send their UPDATE,
-// so it is never later than the expiry the database stores. processJob compares it with
-// the current time before it runs the handler (see claimTimeToStart).
-func localClaimDeadline(timeout time.Duration) time.Time {
-	return time.Now().Add(claimBudget(timeout))
-}
-
-// Each new claim and each extension lasts the job timeout plus a gap. The gap has two halves:
+// A claim gives one consumer the right to process one job for a limited time.
+// The jobs table stores the claim token and the expiry time of each claim.
+// Each write for the job must give the token. If the token is different, the write fails with ErrClaimLost.
+// When a claim expires, a different consumer can claim the job with a new token.
+// Thus, the jobs of a worker that stopped are processed again.
+//
+// The job timeout sets the length of each claim:
 //
 //	| start | job timeout | finish |
-//	        ^ the handler starts; claimTimeToStart must be left
+//	        ^ the handler starts
 //
-// Start: the worker gets a connection and, if necessary, extends the claim.
-// Finish: the handler returns and the worker writes the result.
+//   - Start: the worker gets a connection and, if necessary, extends the claim.
+//   - Finish: the handler returns, and the worker writes the result.
+//
+// The start and the finish are each half of the claim gap.
 
-// minJobTimeout is the shortest job timeout. The job timeout options raise a shorter value to it.
-// Thus, the gap is at least 25ms, and half of it is sufficient for the start: claimBudget removes
-// up to 2ms, and the extension needs a round trip to the database.
+// minJobTimeout is the shortest job timeout. The job timeout options increase a shorter value to it.
+// Then each half of the claim gap is at least 12.5ms. That is sufficient for the rounding
+// in claimBudget and for one round trip to the database.
 const minJobTimeout = 50 * time.Millisecond
 
-// claimGap returns the claim time in addition to the job timeout: half the job timeout,
-// but at most one minute.
+// claimGap returns the claim time after the job timeout: half the job timeout, but not more than one minute.
 func claimGap(jobTimeout time.Duration) time.Duration {
 	return min(time.Minute, jobTimeout/2)
 }
 
-// claimLength returns the length of each new claim and each extension.
+// claimLength returns the length of each new claim and of each extension.
 func claimLength(jobTimeout time.Duration) time.Duration {
 	return jobTimeout + claimGap(jobTimeout)
 }
 
-// claimTimeToStart returns the claim time that must be left when a handler starts.
-// If less time is left, processJob extends the claim first.
+// claimTimeToStart returns the claim time that must be left when the handler starts.
+// If less time is left, processJob extends the claim before the handler starts.
 func claimTimeToStart(jobTimeout time.Duration) time.Duration {
 	return jobTimeout + claimGap(jobTimeout)/2
 }
 
-// newClaimToken returns a random string for one claim request (128 random bits, base32).
-// The drivers add ":<job ID>", so each job in a batch gets its own token.
-// It is random so that consumers in different processes never make the same token.
+// claimBudget returns the time that a worker can use from a claim of the given length.
+// It is the length minus up to 2ms. Thus, the local deadline is never later than the expiry in the database:
+//   - The database gets the length in whole milliseconds.
+//   - SQLite stores the start of the claim in whole milliseconds, so the start can be up to 1ms too early.
+func claimBudget(timeout time.Duration) time.Duration {
+	return timeout.Truncate(time.Millisecond) - time.Millisecond
+}
+
+// localClaimDeadline returns the time at which the worker must think that a claim expires.
+// The drivers call it before they send the claim UPDATE, so the deadline is not later than
+// the expiry that the database stores. The worker compares the deadline with its own clock,
+// so it does not need a query for each check.
+func localClaimDeadline(timeout time.Duration) time.Time {
+	return time.Now().Add(claimBudget(timeout))
+}
+
+// claimKey returns the key of a claim in consumer.claims. The consumer uses that map to count
+// the jobs that it holds, and to release them at shutdown. The key includes the token, because
+// the consumer can claim the same job again after its old claim expires.
+func claimKey(j job) string {
+	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
+}
+
+// newClaimToken returns a random token for one claim query: 128 random bits in base32.
+// The drivers add ":<job ID>", so each job in the batch gets a different token.
+// The token is random, so consumers in different processes do not make the same token.
 func newClaimToken() string {
 	return rand.Text()
 }
 
-// checkClaimResult checks a write that filters on the claim token and must change one row.
-// If it did not change one row, it returns ErrClaimLost. That happens when another consumer
-// took the job, the claim was released, or the job is already done.
-// If the write itself failed, it returns that error.
+// checkClaimResult examines the result of a write that has a filter on the claim token.
+// The write must change one row. If it changed no row, the function returns ErrClaimLost:
+// a different consumer has the job, the claim was released, or the job is complete.
+// If the write failed, the function returns its error.
 func checkClaimResult(result sql.Result, err error) error {
 	if err != nil {
 		return err
