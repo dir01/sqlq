@@ -38,21 +38,28 @@ func localClaimDeadline(timeout time.Duration) time.Time {
 	return time.Now().Add(claimBudget(timeout))
 }
 
-// claimTimeNeeded returns how much claim time must be left before a worker starts a handler:
-// the job timeout, plus time for the handler to return and its result to be written.
-// That extra time is half the job timeout, but at most one minute.
-// processJob extends the claim first when less time is left.
+// A claim that is sufficiently long for one job has these parts:
+//
+//	| start time | job timeout | finish time |
+//	             ^ the handler starts; claimTimeNeeded must be left
+//
+// Start time: the worker gets a connection and, if necessary, extends the claim.
+// Finish time: the handler returns and the worker writes the result.
+
+// claimTimeNeeded returns the claim time that must be left when a handler starts.
+// If less time is left, processJob extends the claim first.
 func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
-	return jobTimeout + min(time.Minute, jobTimeout/2)
+	finishTime := min(time.Minute, jobTimeout/2)
+	return jobTimeout + finishTime
 }
 
-// minClaimTimeout returns the shortest claim timeout that a consumer accepts for jobTimeout.
-// After an extension, the claim must have claimTimeNeeded remaining, after the round trip
-// and the wait for a connection. These get a quarter of the job timeout, maximum one second.
-// The rounding in claimBudget gets 2ms more. If the timeout is shorter, a worker extends
-// the claim again and again, and the handler never starts.
+// minClaimTimeout returns the shortest claim timeout that a consumer accepts.
+// With a shorter timeout, each extension leaves less than claimTimeNeeded,
+// so the worker extends the claim again and again, and the handler never starts.
 func minClaimTimeout(jobTimeout time.Duration) time.Duration {
-	return claimTimeNeeded(jobTimeout) + min(time.Second, jobTimeout/4) + 2*time.Millisecond
+	startTime := min(time.Second, jobTimeout/4)
+	rounding := 2 * time.Millisecond // claimBudget removes up to 2ms
+	return startTime + claimTimeNeeded(jobTimeout) + rounding
 }
 
 // newClaimToken returns a random string for one claim request (128 random bits, base32).
