@@ -55,7 +55,7 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }),
-		sqlq.WithDefaultPollFunc(pollEvery(25*time.Millisecond)),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(25*time.Millisecond)),
 	)
 	require.NoError(t, err)
 	require.NoError(t, q.Run())

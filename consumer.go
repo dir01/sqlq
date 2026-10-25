@@ -24,10 +24,11 @@ type consumer struct {
 	db                       *sql.DB
 	driver                   driver
 	handler                  func(ctx context.Context, tx *sql.Tx, payloadBytes []byte) error
-	onDeadLetter             DeadLetterHook                      // Called in the transaction that moves a job to the dead letter queue
-	ctx                      context.Context                     // context that was passed to .Consume, but with cancelation
-	cancel                   context.CancelFunc                  // cancel() cancels ctx, TODO: consider alternatives, see https://go.dev/blog/context-and-structs
-	backoffFunc              func(retryNum uint16) time.Duration // Calculate a delay retried job is scheduled with. Defaults to exponential back off with jitter
+	onDeadLetter             DeadLetterHook                        // Called in the transaction that moves a job to the dead letter queue
+	ctx                      context.Context                       // context that was passed to .Consume, but with cancelation
+	cancel                   context.CancelFunc                    // cancel() cancels ctx, TODO: consider alternatives, see https://go.dev/blog/context-and-structs
+	backoffFunc              func(retryNum uint16) time.Duration   // Calculate a delay retried job is scheduled with. Defaults to exponential back off with jitter
+	pollDelayFunc            func(emptyPolls uint16) time.Duration // Calculate the delay to the next poll. Defaults to defaultPollDelay
 	tracer                   trace.Tracer
 	metrics                  *sqlqMetrics // Copied from sqlq
 	jobsChan                 chan job     // Written to by a db poller coroutine, consumed by worker goroutines
@@ -36,18 +37,17 @@ type consumer struct {
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
 	claimTimeout             time.Duration
-	pollFunc                 func(emptyPolls uint16) time.Duration // Calculate the delay to the next poll. Defaults to defaultPollDelay
-	jobTimeout               time.Duration                         // After this amount a time job context will be canceled
-	cleanupProcessedInterval time.Duration                         // How often this consumer cleans up processed jobs
-	cleanupProcessedAge      time.Duration                         // Min age a processed job should be to be considered for cleanup
-	cleanupDLQInterval       time.Duration                         // How often this consumer cleans up DLQ jobs
-	cleanupDLQAge            time.Duration                         // Min age a DLQ job should be to be considered for cleanup
-	maxRetries               int32                                 // Total attempts is maxRetries+1. -1 means unlimited
-	prefetchCount            uint16                                // LIMIT when fetching jobs from database into jobsChan
-	concurrency              uint16                                // How many goroutines will read from jobsChan
-	cleanupBatch             uint16                                // Number of jobs to delete per cleanup batch
-	asyncPushEnabled         bool                                  // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
-	asyncPushMaxRPM          uint16                                // How many times per minute will async push be delivered at most
+	jobTimeout               time.Duration // After this amount a time job context will be canceled
+	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
+	cleanupProcessedAge      time.Duration // Min age a processed job should be to be considered for cleanup
+	cleanupDLQInterval       time.Duration // How often this consumer cleans up DLQ jobs
+	cleanupDLQAge            time.Duration // Min age a DLQ job should be to be considered for cleanup
+	maxRetries               int32         // Total attempts is maxRetries+1. -1 means unlimited
+	prefetchCount            uint16        // LIMIT when fetching jobs from database into jobsChan
+	concurrency              uint16        // How many goroutines will read from jobsChan
+	cleanupBatch             uint16        // Number of jobs to delete per cleanup batch
+	asyncPushEnabled         bool          // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
+	asyncPushMaxRPM          uint16        // How many times per minute will async push be delivered at most
 
 }
 
@@ -108,7 +108,7 @@ func (cons *consumer) fetchJobsLoop() {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			// Calculate the delay one time. It has a random jitter, so a second call gives a different value.
 			// A failed fetch does not change emptyPolls.
-			backoffTimeout := fetchRetryBackoff(attempt, cons.pollFunc(emptyPolls))
+			backoffTimeout := fetchRetryBackoff(attempt, cons.pollDelayFunc(emptyPolls))
 
 			// only start span in case of error since we don't want
 			// long-running traces of long-running background processes
@@ -153,7 +153,7 @@ func (cons *consumer) fetchJobsLoop() {
 		case <-subChan: // This will always block if async push is not used
 			// Got async push, so we'll fetch prematurely.
 			continue
-		case <-time.After(cons.pollFunc(emptyPolls)):
+		case <-time.After(cons.pollDelayFunc(emptyPolls)):
 			continue
 		}
 	}

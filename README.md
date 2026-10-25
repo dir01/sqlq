@@ -295,7 +295,7 @@ the library defaults are:
 
 | Setting | Default | Queue option | Consumer option |
 | --- | --- | --- | --- |
-| Poll delay | 100 ms, 10% longer after each poll that finds no jobs, to a maximum of 30 s, with jitter | `WithDefaultPollFunc` | `WithConsumerPollFunc` |
+| Poll delay | 100 ms, 10% longer after each poll that finds no jobs, to a maximum of 30 s, with jitter | `WithDefaultPollDelayFunc` | `WithConsumerPollDelayFunc` |
 | Concurrency | min(NumCPU, GOMAXPROCS) | `WithDefaultConcurrency` | `WithConsumerConcurrency` |
 | Prefetch | Consumer's concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |

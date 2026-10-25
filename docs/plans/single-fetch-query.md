@@ -84,9 +84,9 @@ SQLite does not need `SKIP LOCKED`, because the driver serializes the writes wit
 
 ### Costs
 
-- **API change.** One dispatcher has one poll function. `WithConsumerPollFunc` must be
-  removed. Only the queue-level poll function (`WithDefaultPollFunc`) stays. The dispatcher
-  must also count the polls that find no jobs for all job types together.
+- **API change.** One dispatcher has one poll delay function. `WithConsumerPollDelayFunc`
+  must be removed. Only the queue-level poll delay function (`WithDefaultPollDelayFunc`)
+  stays. The dispatcher must also count the polls that find no jobs for all job types together.
 - **Less error isolation.** Most fetch errors are database errors (lost connection, timeout,
   `SQLITE_BUSY`). Such errors stop all consumers also now. But an error that occurs for only one
   job type, for example a row that the driver cannot read, stops all job types.
@@ -107,11 +107,11 @@ These alternatives also decrease the idle polling, and the consumers stay indepe
 1. **Async push for Postgres with `LISTEN/NOTIFY`.** Now `PostgresDriver.subscribeForConsumer`
    returns `nil`. With a push, an idle consumer gets new jobs immediately, also when its
    poll delay is long.
-2. **Backoff when there are no jobs.** Done: the default poll function (`defaultPollDelay`)
-   makes the delay longer after each poll that finds no jobs.
+2. **Backoff when there are no jobs.** Done: the default poll delay function
+   (`defaultPollDelay`) makes the delay longer after each poll that finds no jobs.
 
 ## Recommendation
 
-Do this work in a separate PR, after the current stack. The default poll function already
-decreases the load of idle consumers. Thus, first measure if the remaining load of busy
+Do this work in a separate PR, after the current stack. The default poll delay function
+already decreases the load of idle consumers. Thus, first measure if the remaining load of busy
 consumers is a problem.

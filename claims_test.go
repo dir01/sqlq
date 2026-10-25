@@ -582,7 +582,7 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 		metrics:      noopMetrics(),
 		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
 		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
-		pollFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
+		pollDelayFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
 }

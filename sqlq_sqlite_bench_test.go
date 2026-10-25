@@ -84,7 +84,7 @@ func BenchmarkHighConcurrency(b *testing.B) {
 
 	err = q.Consume(
 		b.Context(), jobType, handler,
-		sqlq.WithConsumerPollFunc(pollEvery(100*time.Millisecond)),
+		sqlq.WithConsumerPollDelayFunc(pollEvery(100*time.Millisecond)),
 		sqlq.WithAsyncPush(),
 	)
 

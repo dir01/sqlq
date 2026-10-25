@@ -271,7 +271,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	q, err := sqlq.New(
 		db,
 		sqlq.DBTypePostgres,
-		sqlq.WithDefaultPollFunc(pollEvery(50*time.Millisecond)),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(50*time.Millisecond)),
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithTracer(tracer),
 		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics))),

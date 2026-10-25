@@ -36,7 +36,7 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }),
-		sqlq.WithDefaultPollFunc(pollEvery(25*time.Millisecond)),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(25*time.Millisecond)),
 	)
 	require.NoError(t, err)
 	require.NoError(t, q.Run())
@@ -125,7 +125,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }),
 		// The first poll takes the job. The next poll can claim it again after the claim expires.
 		// It occurs long after the release of the lock.
-		sqlq.WithDefaultPollFunc(pollEvery(time.Second)),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(time.Second)),
 		sqlq.WithDefaultJobTimeout(jobTimeout),
 	)
 	require.NoError(t, err)

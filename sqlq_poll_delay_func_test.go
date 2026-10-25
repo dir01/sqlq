@@ -13,35 +13,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestUnusualPollFuncs makes sure that a consumer still polls when the poll function is nil
+// TestUnusualPollDelayFuncs makes sure that a consumer still polls when the poll delay function is nil
 // (the option ignores it) or returns zero (the consumer polls again immediately).
 // The consumer runs in a subprocess, because a panic in its goroutine stops the test binary.
-func TestUnusualPollFuncs(t *testing.T) {
+func TestUnusualPollDelayFuncs(t *testing.T) {
 	t.Parallel()
-	for _, pollFunc := range []string{"nil", "zero"} {
-		t.Run(pollFunc, func(t *testing.T) {
+	for _, pollDelayFunc := range []string{"nil", "zero"} {
+		t.Run(pollDelayFunc, func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.Command(os.Args[0], "-test.run=^TestPollFuncHelper$")
-			cmd.Env = append(os.Environ(), "SQLQ_POLL_FUNC="+pollFunc, "SQLQ_POLL_DB="+filepath.Join(t.TempDir(), "poll.db"))
+			cmd := exec.Command(os.Args[0], "-test.run=^TestPollDelayFuncHelper$")
+			cmd.Env = append(os.Environ(), "SQLQ_POLL_FUNC="+pollDelayFunc, "SQLQ_POLL_DB="+filepath.Join(t.TempDir(), "poll.db"))
 			out, err := cmd.CombinedOutput()
 			require.NoError(t, err, "consumer process failed:\n%s", out)
 		})
 	}
 }
 
-// TestPollFuncHelper is the subprocess of TestUnusualPollFuncs.
-func TestPollFuncHelper(t *testing.T) { //nolint:paralleltest // A subprocess with one test.
-	var pollFunc func(uint16) time.Duration
+// TestPollDelayFuncHelper is the subprocess of TestUnusualPollDelayFuncs.
+func TestPollDelayFuncHelper(t *testing.T) { //nolint:paralleltest // A subprocess with one test.
+	var pollDelayFunc func(uint16) time.Duration
 	switch os.Getenv("SQLQ_POLL_FUNC") {
 	case "":
-		t.Skip("subprocess of TestUnusualPollFuncs")
+		t.Skip("subprocess of TestUnusualPollDelayFuncs")
 	case "zero":
-		pollFunc = pollEvery(0)
+		pollDelayFunc = pollEvery(0)
 	}
 	db, err := sql.Open("sqlite3", "file:"+os.Getenv("SQLQ_POLL_DB")+"?_journal_mode=WAL")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
-	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollFunc(pollFunc))
+	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollDelayFunc(pollDelayFunc))
 	require.NoError(t, err)
 	require.NoError(t, q.Run())
 	defer q.Shutdown()

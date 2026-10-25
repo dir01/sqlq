@@ -108,18 +108,18 @@ type sqlq struct {
 	meter              metric.Meter
 	driver             driver
 	defaultBackoffFunc func(retryNum uint16) time.Duration
-	tracer             trace.Tracer
-	consumersMap       map[string]*consumer // jobType -> consumer
-	dbType             DBType
-	consumersMapMutex  sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
+	// Function for calculating the delay to the next poll for new jobs. Default is defaultPollDelay.
+	// Individual consumers may override this using WithConsumerPollDelayFunc.
+	defaultPollDelayFunc func(emptyPolls uint16) time.Duration
+	tracer               trace.Tracer
+	consumersMap         map[string]*consumer // jobType -> consumer
+	dbType               DBType
+	consumersMapMutex    sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
 
 	// Function for calculating how much of a delay to use when rescheduling a failed job.
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
 
-	// Function for calculating the delay to the next poll for new jobs. Default is defaultPollDelay.
-	// Individual consumers may override this using WithConsumerPollFunc.
-	defaultPollFunc func(emptyPolls uint16) time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
 
@@ -203,7 +203,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		consumersMap:                    make(map[string]*consumer),
 		consumersMapMutex:               sync.RWMutex{},
 		shutDown:                        false,
-		defaultPollFunc:                 defaultPollDelay,
+		defaultPollDelayFunc:            defaultPollDelay,
 		defaultConcurrency:              defaultConcurrency,
 		defaultPrefetchCount:            0,
 		defaultMaxRetries:               defaultMaxRetries,
@@ -335,7 +335,7 @@ func (q *sqlq) Consume(
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
 		maxRetries:               q.defaultMaxRetries,
-		pollFunc:                 q.defaultPollFunc,
+		pollDelayFunc:            q.defaultPollDelayFunc,
 		jobTimeout:               q.defaultJobTimeout,
 		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]job),

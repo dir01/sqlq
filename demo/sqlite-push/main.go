@@ -29,7 +29,7 @@ func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
 	err := q.Consume(ctx, "notification", handler,
 		sqlq.WithAsyncPush(),
 		sqlq.WithAsyncPushRateLimit(60),
-		sqlq.WithConsumerPollFunc(func(uint16) time.Duration { return time.Second }),
+		sqlq.WithConsumerPollDelayFunc(func(uint16) time.Duration { return time.Second }),
 	)
 	if err != nil {
 		return err

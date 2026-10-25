@@ -31,7 +31,7 @@ func exponentialBackoff(retryNum uint16) time.Duration {
 // If the failures continue, the database is possibly not available. Then the delay is the
 // poll delay, doubled one time for each further failure, to a maximum of 30s or the poll
 // delay, whichever is longer. Thus, after the first retry, a failure never makes the
-// consumer fetch more frequently than its poll function allows.
+// consumer fetch more frequently than its poll delay function allows.
 //
 // The function adds a random jitter of up to 20% to the delay. When the database stops,
 // all consumers fail at almost the same time. Without the jitter, they would also retry

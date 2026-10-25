@@ -62,7 +62,7 @@ func (d *emptyPollsDriver) getJobsForConsumer(ctx context.Context, _ string, _ u
 	return nil, nil
 }
 
-// The loop gives the poll function the number of polls since the last poll that found jobs.
+// The loop gives the poll delay function the number of polls since the last poll that found jobs.
 // A failed fetch does not change that number.
 func TestFetchLoopCountsEmptyPolls(t *testing.T) {
 	t.Parallel()
@@ -76,7 +76,7 @@ func TestFetchLoopCountsEmptyPolls(t *testing.T) {
 	emptyPolls := make(chan uint16, 100)
 	cons := &consumer{ //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("poll-test"), metrics: metrics,
-		pollFunc: func(n uint16) time.Duration {
+		pollDelayFunc: func(n uint16) time.Duration {
 			emptyPolls <- n
 			return time.Millisecond
 		},
@@ -99,7 +99,7 @@ func TestFetchLoopCountsEmptyPolls(t *testing.T) {
 		got = append(got, n)
 	}
 	// Calls: 1 empty, 2 empty, 3 jobs, 4 empty, 5 failure (the retry delay uses the count), 6 empty.
-	// After the test stops the loop, the loop can call the poll function again, so examine only 6 values.
+	// After the test stops the loop, the loop can call the poll delay function again, so examine only 6 values.
 	require.GreaterOrEqual(t, len(got), 6)
 	require.Equal(t, []uint16{1, 2, 0, 1, 1, 2}, got[:6])
 }

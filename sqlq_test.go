@@ -17,7 +17,7 @@ type TestPayload struct {
 	Message string `json:"message"`
 }
 
-// pollEvery returns a poll function with a fixed delay.
+// pollEvery returns a poll delay function with a fixed delay.
 func pollEvery(delay time.Duration) func(uint16) time.Duration {
 	return func(uint16) time.Duration { return delay }
 }

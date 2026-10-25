@@ -59,13 +59,13 @@ func WithConsumerPrefetchCount(prefetchCount uint16) ConsumerOption {
 	}
 }
 
-// WithConsumerPollFunc sets the function that calculates the delay to the next poll for a given consumer.
-// See WithDefaultPollFunc for the argument and the default. The option ignores nil.
-// You may also configure default value for all consumers, see WithDefaultPollFunc.
-func WithConsumerPollFunc(pollFunc func(emptyPolls uint16) time.Duration) ConsumerOption {
+// WithConsumerPollDelayFunc sets the function that calculates the delay to the next poll for a given consumer.
+// See WithDefaultPollDelayFunc for the argument and the default. The option ignores nil.
+// You may also configure default value for all consumers, see WithDefaultPollDelayFunc.
+func WithConsumerPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		if pollFunc != nil {
-			o.pollFunc = pollFunc
+		if pollDelayFunc != nil {
+			o.pollDelayFunc = pollDelayFunc
 		}
 	}
 }

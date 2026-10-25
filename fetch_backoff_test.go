@@ -90,7 +90,7 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	d := &transientFetchDriver{recovered: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                         //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
-		pollFunc: func(uint16) time.Duration { return 5 * time.Millisecond }, prefetchCount: 1, concurrency: 1,
+		pollDelayFunc: func(uint16) time.Duration { return 5 * time.Millisecond }, prefetchCount: 1, concurrency: 1,
 		claims: make(map[string]job),
 	}
 	done := make(chan struct{})
@@ -134,7 +134,7 @@ func TestFetchLoopPushStopsBackoff(t *testing.T) {
 	d := &pushDuringBackoffDriver{push: make(chan struct{}), fetched: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                                                     //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
-		pollFunc: func(uint16) time.Duration { return time.Minute }, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
+		pollDelayFunc: func(uint16) time.Duration { return time.Minute }, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
 		claims: make(map[string]job),
 	}
 	done := make(chan struct{})
