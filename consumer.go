@@ -123,7 +123,7 @@ func (cons *consumer) fetchJobsLoop() {
 			)
 			span.End()
 
-			if attempt < 16 { // 16 doublings are sufficient to get to the maximum delay
+			if attempt < math.MaxUint16 {
 				attempt++
 			}
 			select {
