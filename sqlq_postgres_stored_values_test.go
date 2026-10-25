@@ -72,7 +72,7 @@ func TestPostgresStoredValues(t *testing.T) {
 	newQueue := func(t *testing.T, db *sql.DB, opts ...sqlq.NewOption) sqlq.JobsQueue {
 		t.Helper()
 		q, err := sqlq.New(db, sqlq.DBTypePostgres, append([]sqlq.NewOption{
-			sqlq.WithDefaultPollInterval(10 * time.Millisecond),
+			sqlq.WithDefaultPollFunc(pollEvery(10 * time.Millisecond)),
 			sqlq.WithDefaultBackoffFunc(func(uint16) time.Duration { return 0 }),
 		}, opts...)...)
 		require.NoError(t, err)

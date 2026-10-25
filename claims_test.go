@@ -305,7 +305,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
-		cons.workerWg.Go(func() { _ = cons.fetchJobs(cons.ctx) })
+		cons.workerWg.Go(func() { _, _ = cons.fetchJobs(cons.ctx) })
 		require.Eventually(t, func() bool {
 			cons.claimsMutex.Lock()
 			defer cons.claimsMutex.Unlock()
@@ -323,10 +323,14 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job, 3)
-		require.NoError(t, cons.fetchJobs(ctx))
+		fetch := func() {
+			_, err := cons.fetchJobs(ctx)
+			require.NoError(t, err)
+		}
+		fetch()
 		<-cons.jobsChan // Take one job, like a busy worker. Its claim stays open.
-		require.NoError(t, cons.fetchJobs(ctx))
-		require.NoError(t, cons.fetchJobs(ctx)) // The consumer is full, so this fetch must claim nothing.
+		fetch()
+		fetch() // The consumer is full, so this fetch must claim nothing.
 		require.Len(t, cons.claims, 4)
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 6, time.Minute)
 		require.NoError(t, err)
@@ -578,7 +582,7 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 		metrics:      noopMetrics(),
 		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
 		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
-		pollInterval: time.Millisecond, jobsChan: make(chan job, 1),
+		pollFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
 }

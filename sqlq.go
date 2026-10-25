@@ -117,9 +117,9 @@ type sqlq struct {
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
 
-	// How often to poll database for new jobs. Default is 100ms.
-	// Individual consumers may override this using WithConsumerPollInteval.
-	defaultPollInterval time.Duration
+	// Function for calculating the delay to the next poll for new jobs. Default is defaultPollDelay.
+	// Individual consumers may override this using WithConsumerPollFunc.
+	defaultPollFunc func(emptyPolls uint16) time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
 
@@ -203,7 +203,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		consumersMap:                    make(map[string]*consumer),
 		consumersMapMutex:               sync.RWMutex{},
 		shutDown:                        false,
-		defaultPollInterval:             100 * time.Millisecond,
+		defaultPollFunc:                 defaultPollDelay,
 		defaultConcurrency:              defaultConcurrency,
 		defaultPrefetchCount:            0,
 		defaultMaxRetries:               defaultMaxRetries,
@@ -335,7 +335,7 @@ func (q *sqlq) Consume(
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
 		maxRetries:               q.defaultMaxRetries,
-		pollInterval:             q.defaultPollInterval,
+		pollFunc:                 q.defaultPollFunc,
 		jobTimeout:               q.defaultJobTimeout,
 		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]job),

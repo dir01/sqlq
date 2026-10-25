@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -35,18 +36,18 @@ type consumer struct {
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
 	claimTimeout             time.Duration
-	pollInterval             time.Duration // How often should db poller run. You might want to set this value higher if you have push configured
-	jobTimeout               time.Duration // After this amount a time job context will be canceled
-	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
-	cleanupProcessedAge      time.Duration // Min age a processed job should be to be considered for cleanup
-	cleanupDLQInterval       time.Duration // How often this consumer cleans up DLQ jobs
-	cleanupDLQAge            time.Duration // Min age a DLQ job should be to be considered for cleanup
-	maxRetries               int32         // Total attempts is maxRetries+1. -1 means unlimited
-	prefetchCount            uint16        // LIMIT when fetching jobs from database into jobsChan
-	concurrency              uint16        // How many goroutines will read from jobsChan
-	cleanupBatch             uint16        // Number of jobs to delete per cleanup batch
-	asyncPushEnabled         bool          // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
-	asyncPushMaxRPM          uint16        // How many times per minute will async push be delivered at most
+	pollFunc                 func(emptyPolls uint16) time.Duration // Calculate the delay to the next poll. Defaults to defaultPollDelay
+	jobTimeout               time.Duration                         // After this amount a time job context will be canceled
+	cleanupProcessedInterval time.Duration                         // How often this consumer cleans up processed jobs
+	cleanupProcessedAge      time.Duration                         // Min age a processed job should be to be considered for cleanup
+	cleanupDLQInterval       time.Duration                         // How often this consumer cleans up DLQ jobs
+	cleanupDLQAge            time.Duration                         // Min age a DLQ job should be to be considered for cleanup
+	maxRetries               int32                                 // Total attempts is maxRetries+1. -1 means unlimited
+	prefetchCount            uint16                                // LIMIT when fetching jobs from database into jobsChan
+	concurrency              uint16                                // How many goroutines will read from jobsChan
+	cleanupBatch             uint16                                // Number of jobs to delete per cleanup batch
+	asyncPushEnabled         bool                                  // By default, only polling is used. If enabled, supporting drivers will also deliver async pushes for lower latency
+	asyncPushMaxRPM          uint16                                // How many times per minute will async push be delivered at most
 
 }
 
@@ -85,9 +86,6 @@ func (cons *consumer) shutdown() {
 
 // fetchJobsLoop periodically fetches jobs from the database and sends them to the jobs channel.
 func (cons *consumer) fetchJobsLoop() {
-	ticker := time.NewTicker(cons.pollInterval)
-	defer ticker.Stop()
-
 	// subChan is a channel that a driver might write to if async push is configured and supported
 	// in cases where async push isn't used, this will remain a dummy channel.
 	// The loop reads it in the wait between polls and in the wait after a failed fetch.
@@ -104,10 +102,13 @@ func (cons *consumer) fetchJobsLoop() {
 	}
 
 	var attempt uint16
+	var emptyPolls uint16 // the number of polls since the last poll that found jobs
 	for {
-		if err := cons.fetchJobs(cons.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		foundJobs, err := cons.fetchJobs(cons.ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			// Calculate the delay one time. It has a random jitter, so a second call gives a different value.
-			backoffTimeout := fetchRetryBackoff(attempt, cons.pollInterval)
+			// A failed fetch does not change emptyPolls.
+			backoffTimeout := fetchRetryBackoff(attempt, cons.pollFunc(emptyPolls))
 
 			// only start span in case of error since we don't want
 			// long-running traces of long-running background processes
@@ -140,36 +141,40 @@ func (cons *consumer) fetchJobsLoop() {
 		}
 
 		attempt = 0 // Reset attempt count on success
+		if foundJobs {
+			emptyPolls = 0
+		} else if emptyPolls < math.MaxUint16 {
+			emptyPolls++
+		}
 
 		select {
 		case <-cons.ctx.Done():
 			return
 		case <-subChan: // This will always block if async push is not used
 			// Got async push, so we'll fetch prematurely.
-			// This means we need to reset the ticker so that fetches are pollInterval apart.
-			ticker.Reset(cons.pollInterval)
 			continue
-		case <-ticker.C:
-			// Timer expired, continue to next poll
+		case <-time.After(cons.pollFunc(emptyPolls)):
 			continue
 		}
 	}
 }
 
 // fetchJobs fetches jobs for this consumer and sends them to the jobs channel.
-func (cons *consumer) fetchJobs(ctx context.Context) error {
+// It returns true if it found jobs. A consumer that has no free capacity holds jobs,
+// so for it, fetchJobs also returns true. Then the next poll does not come later.
+func (cons *consumer) fetchJobs(ctx context.Context) (bool, error) {
 	cons.claimsMutex.Lock()
 	// Claim no more jobs than the workers and the buffer can hold. Extra jobs would
 	// wait outside the channel while their claim time runs out.
 	capacity := min(int(cons.prefetchCount), int(cons.prefetchCount)+int(cons.concurrency)-len(cons.claims))
 	cons.claimsMutex.Unlock()
 	if capacity <= 0 {
-		return nil
+		return true, nil
 	}
 	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, uint16(capacity), cons.claimTimeout)
 	if err != nil {
 		// Don't wrap error here, let the poller handle logging/backoff
-		return err
+		return false, err
 	}
 	cons.claimsMutex.Lock()
 	for _, j := range jobs {
@@ -185,13 +190,13 @@ func (cons *consumer) fetchJobs(ctx context.Context) error {
 	for _, job := range jobs {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return true, ctx.Err()
 		case cons.jobsChan <- job:
 			// Successfully sent job to worker channel
 		}
 	}
 
-	return nil
+	return len(jobs) > 0, nil
 }
 
 // workerLoop processes jobs from the jobsChan.

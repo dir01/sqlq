@@ -4,12 +4,14 @@ Status: proposal. Nobody has started this work.
 
 ## Problem
 
-Each consumer has its own fetch loop. Each loop sends one claim query for each poll interval.
-The default poll interval is 100ms. Thus, a process with N job types sends 10 × N queries
-each second, also when there are no jobs. For example, 50 job types send 500 queries each second.
+Each consumer has its own fetch loop. Each loop sends one claim query for each poll.
+The default poll delay is 100ms while a consumer finds jobs. Thus, a process with N busy job
+types sends 10 × N queries each second. For example, 50 job types send 500 queries each second.
+An idle consumer polls less frequently: each poll that finds no jobs makes the delay 10% longer,
+to a maximum of 30s (see `defaultPollDelay`).
 
 We do not know how many job types the users of the library have. If the number is large, the
-idle polling causes a large load on the database.
+polling causes a large load on the database.
 
 For SQLite, the load is larger, because SQLite has only one writer. Each claim query is a write
 transaction, and all write transactions of the process wait for the same lock (`d.lock`).
@@ -82,9 +84,9 @@ SQLite does not need `SKIP LOCKED`, because the driver serializes the writes wit
 
 ### Costs
 
-- **Breaking API change.** One dispatcher has one poll interval. `WithConsumerPollInteval`
-  must be removed, or it must be ignored. Only the queue-level poll interval
-  (`WithDefaultPollInterval`) stays.
+- **API change.** One dispatcher has one poll function. `WithConsumerPollFunc` must be
+  removed. Only the queue-level poll function (`WithDefaultPollFunc`) stays. The dispatcher
+  must also count the polls that find no jobs for all job types together.
 - **Less error isolation.** Most fetch errors are database errors (lost connection, timeout,
   `SQLITE_BUSY`). Such errors stop all consumers also now. But an error that occurs for only one
   job type, for example a row that the driver cannot read, stops all job types.
@@ -103,12 +105,13 @@ SQLite does not need `SKIP LOCKED`, because the driver serializes the writes wit
 These alternatives also decrease the idle polling, and the consumers stay independent:
 
 1. **Async push for Postgres with `LISTEN/NOTIFY`.** Now `PostgresDriver.subscribeForConsumer`
-   returns `nil`. With a push, the users can set a long poll interval, and new jobs still start
-   immediately.
-2. **Backoff when there are no jobs.** When a fetch finds no jobs, increase the delay to the
-   next poll. When a fetch finds jobs, or a push arrives, set the delay back to the poll interval.
+   returns `nil`. With a push, an idle consumer gets new jobs immediately, also when its
+   poll delay is long.
+2. **Backoff when there are no jobs.** Done: the default poll function (`defaultPollDelay`)
+   makes the delay longer after each poll that finds no jobs.
 
 ## Recommendation
 
-Do this work in a separate PR, after the current stack. Before you start, decide if the
-breaking API change is acceptable. If it is not acceptable, start with the alternatives.
+Do this work in a separate PR, after the current stack. The default poll function already
+decreases the load of idle consumers. Thus, first measure if the remaining load of busy
+consumers is a problem.

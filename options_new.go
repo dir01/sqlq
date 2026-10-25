@@ -29,13 +29,16 @@ func WithMeterProvider(provider metric.MeterProvider) NewOption {
 // Default values for per-consumer options
 //////////////////////////////////////////
 
-// WithDefaultPollInterval allows to configure default poll interval.
-// The option ignores a zero or negative interval, as WithConsumerPollInteval does.
-// This value may be overridden per individual consumer, see WithConsumerPollInteval.
-func WithDefaultPollInterval(tick time.Duration) NewOption {
+// WithDefaultPollFunc sets the function that calculates the delay to the next poll for new jobs.
+// emptyPolls is the number of polls since the last poll that found jobs. It stops at 65535.
+// The default starts at 100ms and becomes 10% longer after each poll that finds no jobs,
+// to a maximum of 30s. For a fixed interval, use func(uint16) time.Duration { return 100 * time.Millisecond }.
+// A zero or negative delay polls again immediately. The option ignores nil.
+// This value may be overridden per individual consumer, see WithConsumerPollFunc.
+func WithDefaultPollFunc(pollFunc func(emptyPolls uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
-		if tick > 0 {
-			q.defaultPollInterval = tick
+		if pollFunc != nil {
+			q.defaultPollFunc = pollFunc
 		}
 	}
 }

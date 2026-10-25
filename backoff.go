@@ -23,18 +23,18 @@ func exponentialBackoff(retryNum uint16) time.Duration {
 
 // fetchRetryBackoff returns the delay of the fetch loop after retryNum + 1 failed fetches in sequence.
 //
-// The first delay is the poll interval, but not more than 100ms. Most fetch errors occur
+// The first delay is the poll delay, but not more than 100ms. Most fetch errors occur
 // because of a short lock, and one fast retry is usually successful.
 // If the failures continue, the database is possibly not available. Then the delay is the
-// poll interval, doubled one time for each further failure, to a maximum of 30s or the poll
-// interval, whichever is longer. Thus, after the first retry, a failure never makes the
-// consumer fetch more frequently than its poll interval.
+// poll delay, doubled one time for each further failure, to a maximum of 30s or the poll
+// delay, whichever is longer. Thus, after the first retry, a failure never makes the
+// consumer fetch more frequently than its poll function allows.
 //
 // The function adds a random jitter of up to 20% to the delay. When the database stops,
 // all consumers fail at almost the same time. Without the jitter, they would also retry
 // at the same time, and the database would get all their queries at once when it starts again.
-func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duration {
-	delay := max(pollInterval, time.Millisecond) // a zero delay does not increase when it doubles
+func fetchRetryBackoff(retryNum uint16, pollDelay time.Duration) time.Duration {
+	delay := max(pollDelay, time.Millisecond) // a zero delay does not increase when it doubles
 	if retryNum == 0 {
 		delay = min(delay, 100*time.Millisecond)
 	} else {

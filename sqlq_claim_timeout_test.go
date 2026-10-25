@@ -30,7 +30,7 @@ func TestAcceptedClaimTimeoutRunsHandler(t *testing.T) {
 			dsn := "file:" + filepath.Join(t.TempDir(), "claim.db") + "?_journal_mode=WAL&_busy_timeout=1000"
 			db, err := sql.Open("sqlite3", dsn)
 			require.NoError(t, err)
-			q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollInterval(10*time.Millisecond))
+			q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollFunc(pollEvery(10*time.Millisecond)))
 			require.NoError(t, err)
 			require.NoError(t, q.Run())
 			t.Cleanup(func() {

@@ -255,8 +255,7 @@ q.Consume(ctx, "notification", handler,
 
 Push hints work only within one SQLite driver instance. Polling still handles
 delays, retries, requeues, transactional publications, missed hints, and
-external writes. PostgreSQL returns `ErrPushNotSupported`. The current poll
-option spelling is `WithConsumerPollInteval`.
+external writes. PostgreSQL returns `ErrPushNotSupported`.
 [Full SQLite push demo](demo/sqlite-push/README.md).
 
 ## 12. Choose retention periods
@@ -296,7 +295,7 @@ the library defaults are:
 
 | Setting | Default | Queue option | Consumer option |
 | --- | --- | --- | --- |
-| Poll interval | 100 ms | `WithDefaultPollInterval` | `WithConsumerPollInteval` |
+| Poll delay | 100 ms, 10% longer after each poll that finds no jobs, to a maximum of 30 s, with jitter | `WithDefaultPollFunc` | `WithConsumerPollFunc` |
 | Concurrency | min(NumCPU, GOMAXPROCS) | `WithDefaultConcurrency` | `WithConsumerConcurrency` |
 | Prefetch | Consumer's concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |

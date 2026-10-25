@@ -12,8 +12,8 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// requireFetchRetryDelay makes sure that got is want plus a jitter of up to 20%.
-func requireFetchRetryDelay(t *testing.T, want, got time.Duration, msgAndArgs ...any) {
+// requireJitteredDelay makes sure that got is want plus a jitter of up to 20%.
+func requireJitteredDelay(t *testing.T, want, got time.Duration, msgAndArgs ...any) {
 	t.Helper()
 	require.GreaterOrEqual(t, got, want, msgAndArgs...)
 	require.LessOrEqual(t, got, want+want/5, msgAndArgs...)
@@ -21,14 +21,14 @@ func requireFetchRetryDelay(t *testing.T, want, got time.Duration, msgAndArgs ..
 
 func TestFetchRetryBackoff(t *testing.T) {
 	t.Parallel()
-	requireFetchRetryDelay(t, 5*time.Millisecond, fetchRetryBackoff(0, 5*time.Millisecond))
-	requireFetchRetryDelay(t, 10*time.Millisecond, fetchRetryBackoff(1, 5*time.Millisecond))
-	requireFetchRetryDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, time.Second))
+	requireJitteredDelay(t, 5*time.Millisecond, fetchRetryBackoff(0, 5*time.Millisecond))
+	requireJitteredDelay(t, 10*time.Millisecond, fetchRetryBackoff(1, 5*time.Millisecond))
+	requireJitteredDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, time.Second))
 	// After the first retry, the delay starts from the poll interval.
-	requireFetchRetryDelay(t, 2*time.Second, fetchRetryBackoff(1, time.Second))
+	requireJitteredDelay(t, 2*time.Second, fetchRetryBackoff(1, time.Second))
 	for _, poll := range []time.Duration{time.Millisecond, 5 * time.Millisecond, time.Second} {
 		for _, attempt := range []uint16{16, 32, 65535} {
-			requireFetchRetryDelay(t, 30*time.Second, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
+			requireJitteredDelay(t, 30*time.Second, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}
 	}
 }
@@ -38,9 +38,9 @@ func TestFetchRetryBackoff(t *testing.T) {
 func TestFetchRetryBackoffDoesNotExceedPollRate(t *testing.T) {
 	t.Parallel()
 	for _, poll := range []time.Duration{time.Minute, 5 * time.Minute} {
-		requireFetchRetryDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, poll))
+		requireJitteredDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, poll))
 		for _, attempt := range []uint16{1, 2, 16, 65535} {
-			requireFetchRetryDelay(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
+			requireJitteredDelay(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}
 	}
 }
@@ -90,7 +90,7 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	d := &transientFetchDriver{recovered: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                         //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
-		pollInterval: 5 * time.Millisecond, prefetchCount: 1, concurrency: 1,
+		pollFunc: func(uint16) time.Duration { return 5 * time.Millisecond }, prefetchCount: 1, concurrency: 1,
 		claims: make(map[string]job),
 	}
 	done := make(chan struct{})
@@ -134,7 +134,7 @@ func TestFetchLoopPushStopsBackoff(t *testing.T) {
 	d := &pushDuringBackoffDriver{push: make(chan struct{}), fetched: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                                                     //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
-		pollInterval: time.Minute, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
+		pollFunc: func(uint16) time.Duration { return time.Minute }, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
 		claims: make(map[string]job),
 	}
 	done := make(chan struct{})

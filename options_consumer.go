@@ -59,12 +59,13 @@ func WithConsumerPrefetchCount(prefetchCount uint16) ConsumerOption {
 	}
 }
 
-// WithConsumerPollInteval sets how frequently to check for new jobs for a given consumer
-// You may also configure default value for all consumers, see WithDefaultPollInterval.
-func WithConsumerPollInteval(interval time.Duration) ConsumerOption {
+// WithConsumerPollFunc sets the function that calculates the delay to the next poll for a given consumer.
+// See WithDefaultPollFunc for the argument and the default. The option ignores nil.
+// You may also configure default value for all consumers, see WithDefaultPollFunc.
+func WithConsumerPollFunc(pollFunc func(emptyPolls uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		if interval > 0 {
-			o.pollInterval = interval
+		if pollFunc != nil {
+			o.pollFunc = pollFunc
 		}
 	}
 }

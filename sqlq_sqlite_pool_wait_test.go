@@ -58,7 +58,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 		db, err := sql.Open("sqlite3", dsn)
 		require.NoError(t, err)
 		db.SetMaxOpenConns(1)
-		opts := []sqlq.NewOption{sqlq.WithDefaultPollInterval(10 * time.Millisecond), sqlq.WithDefaultJobTimeout(jobTimeout)}
+		opts := []sqlq.NewOption{sqlq.WithDefaultPollFunc(pollEvery(10 * time.Millisecond)), sqlq.WithDefaultJobTimeout(jobTimeout)}
 		if tracer != nil {
 			opts = append(opts, sqlq.WithTracer(tracer))
 		}
