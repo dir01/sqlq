@@ -35,6 +35,7 @@ type consumer struct {
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
 	claimTimeout             time.Duration
+	maxBackoff               time.Duration // Caps the delay backoffFunc returns
 	pollInterval             time.Duration // How often should db poller run. You might want to set this value higher if you have push configured
 	jobTimeout               time.Duration // After this amount a time job context will be canceled
 	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
@@ -509,7 +510,7 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 	defer span.End()
 
 	// Preserve the uint16 callback API without wrapping long-lived retries to zero.
-	backoff := cons.backoffFunc(uint16(min(uint64(job.RetryCount)+1, 65535)))
+	backoff := min(cons.backoffFunc(uint16(min(uint64(job.RetryCount)+1, 65535))), cons.maxBackoff)
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
 	if err := cons.driver.markJobFailedAndReschedule(ctx, job.ID, job.ClaimToken, errorMsg, backoff); err != nil {

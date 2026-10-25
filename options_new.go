@@ -49,9 +49,9 @@ func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	}
 }
 
-// WithMaxBackoff sets the longest delay the default exponential backoff waits before retrying a job.
-// Default is 24 hours. A zero or negative value is ignored.
-// It doesn't limit functions set with WithDefaultBackoffFunc or WithConsumerBackoffFunc.
+// WithMaxBackoff sets the longest delay before retrying a failed job.
+// It caps the default exponential backoff and functions set with WithDefaultBackoffFunc
+// or WithConsumerBackoffFunc alike. Default is 24 hours. A zero or negative value is ignored.
 func WithMaxBackoff(maxBackoff time.Duration) NewOption {
 	return func(q *sqlq) {
 		if maxBackoff > 0 {

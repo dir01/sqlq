@@ -123,7 +123,7 @@ type sqlq struct {
 	defaultPollInterval time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
-	// The longest delay the default exponential backoff waits before a retry. See WithMaxBackoff.
+	// The longest delay any consumer waits before retrying a job. See WithMaxBackoff.
 	maxBackoff time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
@@ -212,7 +212,7 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
 		defaultClaimTimeout:             0,
-		defaultBackoffFunc:              nil,
+		defaultBackoffFunc:              exponentialBackoff,
 		maxBackoff:                      defaultMaxBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
@@ -227,9 +227,6 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 
 	for _, o := range opts {
 		o(q)
-	}
-	if q.defaultBackoffFunc == nil {
-		q.defaultBackoffFunc = exponentialBackoff(q.maxBackoff)
 	}
 
 	q.meter = q.meterProvider.Meter(meterName)
@@ -347,6 +344,7 @@ func (q *sqlq) Consume(
 		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]job),
 		backoffFunc:              q.defaultBackoffFunc,
+		maxBackoff:               q.maxBackoff,
 		cleanupBatch:             q.defaultCleanupBatch,
 		cleanupProcessedInterval: q.defaultCleanupProcessedInterval,
 		cleanupProcessedAge:      q.defaultCleanupProcessedAge,

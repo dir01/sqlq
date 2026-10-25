@@ -1,9 +1,13 @@
 package sqlq
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestExponentialBackoff(t *testing.T) {
@@ -49,7 +53,7 @@ func TestExponentialBackoff(t *testing.T) {
 
 			// Run multiple times to account for randomness
 			for range 100 {
-				duration := exponentialBackoff(defaultMaxBackoff)(tc.retryNum)
+				duration := exponentialBackoff(tc.retryNum)
 				if duration < tc.minExp || duration >= tc.maxExp {
 					t.Errorf("exponentialBackoff(%d) = %v; want between [%v, %v)",
 						tc.retryNum, duration, tc.minExp, tc.maxExp)
@@ -59,21 +63,47 @@ func TestExponentialBackoff(t *testing.T) {
 	}
 }
 
-func TestExponentialBackoffMaximum(t *testing.T) {
+func TestExponentialBackoffDoesNotOverflow(t *testing.T) {
 	t.Parallel()
 
-	backoff := exponentialBackoff(time.Minute)
-	if got := backoff(5); got >= time.Minute {
-		t.Errorf("backoff(5) = %v; want below the maximum", got)
-	}
-	// Every retry number from where the delay reaches the maximum, past where
-	// 2^retryNum seconds would overflow time.Duration, gets exactly the maximum.
-	for retryNum := uint16(6); retryNum < 100; retryNum++ {
-		if got := backoff(retryNum); got != time.Minute {
-			t.Errorf("backoff(%d) = %v; want %v", retryNum, got, time.Minute)
+	previous := time.Duration(0)
+	for retryNum := range uint16(math.MaxUint16) {
+		got := exponentialBackoff(retryNum)
+		if got < previous {
+			t.Fatalf("exponentialBackoff(%d) = %v; want at least %v", retryNum, got, previous)
 		}
+		previous = got
 	}
-	if got := backoff(65535); got != time.Minute {
-		t.Errorf("backoff(65535) = %v; want %v", got, time.Minute)
+}
+
+type rescheduleRecordingDriver struct {
+	driver
+	backoff time.Duration
+}
+
+func (d *rescheduleRecordingDriver) markJobFailedAndReschedule(_ context.Context, _ int64, _ string, _ string, backoff time.Duration) error {
+	d.backoff = backoff
+	return nil
+}
+
+func TestRetryJobCapsBackoff(t *testing.T) {
+	t.Parallel()
+
+	for name, backoffFunc := range map[string]func(uint16) time.Duration{
+		"default":  exponentialBackoff,
+		"custom":   func(uint16) time.Duration { return 1000 * time.Hour },
+		"overflow": func(uint16) time.Duration { return math.MaxInt64 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			d := &rescheduleRecordingDriver{} //nolint:exhaustruct
+			cons := &consumer{                //nolint:exhaustruct // Only dependencies used by retryJob are needed.
+				driver: d, tracer: noop.NewTracerProvider().Tracer("backoff-test"), metrics: noopMetrics(),
+				backoffFunc: backoffFunc, maxBackoff: time.Minute,
+			}
+			require.NoError(t, cons.retryJob(t.Context(), &job{RetryCount: 100}, "failed")) //nolint:exhaustruct
+			require.Equal(t, time.Minute, d.backoff)
+		})
 	}
 }
