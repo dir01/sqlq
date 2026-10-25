@@ -12,8 +12,8 @@ type JobInfo struct {
 	JobType    string
 	ID         int64
 	MaxRetries int32 // -1 means unlimited
-	// RetryCount saturates at 2^31-1, the database counter limit. Unlimited
-	// retries continue at that value; finite limits still reach a final attempt.
+	// RetryCount stops at 2^31-1, the limit of the database counter. Unlimited retries
+	// continue at that value. Finite limits still get a final attempt.
 	RetryCount uint32
 }
 

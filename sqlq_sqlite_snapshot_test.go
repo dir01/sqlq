@@ -13,12 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSQLiteHandlerReadThenConcurrentWrite checks that a handler which only reads in its transaction
-// and succeeds is not charged a retry when another connection commits before the job is marked
-// processed. A deferred transaction's first read pins a WAL snapshot; once another connection
-// commits, upgrading that transaction to a writer fails with SQLITE_BUSY_SNAPSHOT, which
-// busy_timeout does not wait out. The queue's pool has a single connection, which the handler's
-// transaction holds, so recovering from the conflict must not need another one.
+// TestSQLiteHandlerReadThenConcurrentWrite makes sure that the queue does not count a retry for a
+// successful handler that only reads, if a different connection commits before the mark.
+// The first read of a deferred transaction sets a WAL snapshot. After a different connection
+// commits, the transaction cannot become a writer. It fails with SQLITE_BUSY_SNAPSHOT, and
+// busy_timeout does not wait. The pool of the queue has one connection, and the handler
+// transaction holds it. Thus, the recovery must not need a second connection.
 func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	t.Parallel()
 
@@ -29,7 +29,7 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	db, err := sql.Open("sqlite3", dsn)
 	require.NoError(t, err)
 	db.SetMaxOpenConns(1)
-	// Another process sharing the database file.
+	// A different process that uses the same database file.
 	other, err := sql.Open("sqlite3", dsn)
 	require.NoError(t, err)
 
@@ -55,15 +55,15 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	err = q.Consume(ctx, jobType, func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 		calls.Add(1)
 
-		// The handler reads, which starts the transaction's snapshot.
+		// The handler reads. This sets the snapshot of the transaction.
 		var n int
 		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&n); readErr != nil {
 			handlerErrs.Add(1)
 			return readErr
 		}
 
-		// Another connection commits a write, as another consumer claiming or a publisher
-		// inserting a job would.
+		// A different connection commits a write, as a different consumer with a claim, or a
+		// publisher with a new job, does.
 		if _, writeErr := other.ExecContext(ctx, "INSERT INTO other_writes VALUES (1)"); writeErr != nil {
 			handlerErrs.Add(1)
 			return writeErr
@@ -75,7 +75,7 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 
 	require.NoError(t, q.Publish(ctx, jobType, TestPayload{Message: "succeeds"}))
 
-	// Wait until the job settles: processed, or dead-lettered after every retry.
+	// Wait until the job is processed, or until it goes to the DLQ after all retries.
 	var processed bool
 	require.Eventually(t, func() bool {
 		var processedAt sql.NullInt64
@@ -99,10 +99,10 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	require.Equal(t, int32(1), calls.Load(), "a successful handler was retried")
 }
 
-// TestSQLiteHandlerReadThenLongLock checks the same with a claim shorter than the wait for the
-// write lock: another connection holds it past the claim's expiry. The mark keeps trying, since
-// recording the success needs the lock no more than charging a retry would, and its claim token
-// keeps it from marking a job another worker has claimed since.
+// TestSQLiteHandlerReadThenLongLock examines the same, with a claim that is shorter than the wait
+// for the write lock. A different connection holds the lock after the claim expires. The mark tries
+// again and again, because a retry needs the same lock. The claim token prevents a mark on a job
+// that a different worker has now.
 func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	t.Parallel()
 
@@ -110,7 +110,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	defer cancel()
 
 	const (
-		jobTimeout = 50 * time.Millisecond // The claim lasts 100ms.
+		jobTimeout = 50 * time.Millisecond // The claim is 100ms.
 		lockHeld   = 300 * time.Millisecond
 	)
 	dsn := "file:" + filepath.Join(t.TempDir(), "lock.db") + "?_journal_mode=WAL&_busy_timeout=100"
@@ -123,8 +123,8 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }),
-		// The first poll takes the job. The next, which could claim it again once its claim expired,
-		// comes well after the lock is released.
+		// The first poll takes the job. The next poll can claim it again after the claim expires.
+		// It occurs long after the release of the lock.
 		sqlq.WithDefaultPollInterval(time.Second),
 		sqlq.WithDefaultJobTimeout(jobTimeout),
 	)
@@ -150,7 +150,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&n); readErr != nil {
 			return readErr
 		}
-		// Another process takes the write lock and keeps it past the claim's expiry.
+		// A different process takes the write lock, and keeps it until after the claim expires.
 		conn, connErr := other.Conn(context.Background())
 		if connErr != nil {
 			return connErr
@@ -170,7 +170,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	}, sqlq.WithConsumerMaxRetries(3))
 	require.NoError(t, err)
 
-	// Wait until the job settles: processed, or charged a retry.
+	// Wait until the job is processed, or until the queue counts a retry.
 	var processedAt sql.NullInt64
 	var retryCount int
 	var lastError sql.NullString

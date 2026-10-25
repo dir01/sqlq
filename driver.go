@@ -41,8 +41,8 @@ type driver interface {
 
 	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
-	// It returns errStaleReadTx when tx made no writes and could not become a writer;
-	// the caller may then roll tx back and mark the job in a new transaction.
+	// If tx did not write and cannot become a writer, it returns errStaleReadTx.
+	// The caller can then roll back tx and mark the job in a new transaction.
 	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
@@ -69,9 +69,9 @@ type driver interface {
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
 }
 
-// errStaleReadTx is returned by markJobProcessed when the handler's transaction only read,
-// and another connection has committed since, so the transaction can't write anymore.
-// Since the handler wrote nothing, marking the job in a new transaction loses nothing.
+// markJobProcessed returns errStaleReadTx if the handler transaction only read, and a different
+// connection committed after that. Then the transaction cannot write.
+// The handler did not write. Thus, a mark in a new transaction does not lose data.
 var errStaleReadTx = errors.New("handler transaction only read, and its snapshot is stale, so it can't write")
 
 // sqlExecutor is implemented by both *sql.DB and *sql.Tx.

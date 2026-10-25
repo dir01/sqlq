@@ -35,7 +35,7 @@ type consumer struct {
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
 	claimTimeout             time.Duration
-	maxBackoff               time.Duration // Caps the delay backoffFunc returns
+	maxBackoff               time.Duration // The maximum delay that backoffFunc can set
 	pollInterval             time.Duration // How often should db poller run. You might want to set this value higher if you have push configured
 	jobTimeout               time.Duration // After this amount a time job context will be canceled
 	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
@@ -208,8 +208,8 @@ func (cons *consumer) workerLoop() {
 
 // processJob handles a single job fetched by the poller.
 func (cons *consumer) processJob(j *job) {
-	// settled means there is no claim left to release: the job's next state was committed,
-	// or the claim was already lost to another attempt.
+	// If settled is true, there is no claim to release. The next state of the job is committed,
+	// or a different attempt has the claim.
 	settled := false
 	defer func() {
 		// During shutdown, keep the claim in the map. shutdown releases all claims after the workers stop.
@@ -217,12 +217,12 @@ func (cons *consumer) processJob(j *job) {
 			return
 		}
 		if !settled {
-			// Derived from cons.ctx so that Shutdown does not wait for this release.
+			// The context comes from cons.ctx. Thus, Shutdown does not wait for this release.
 			ctx, cancel := context.WithTimeout(cons.ctx, 5*time.Second)
 			defer cancel()
 			if err := cons.driver.releaseClaim(ctx, *j); err != nil && !errors.Is(err, ErrClaimLost) {
 				if cons.ctx.Err() != nil {
-					return // Shutdown began during the release; shutdown releases the claim.
+					return // Shutdown started during the release. Shutdown releases the claim.
 				}
 				log.Printf("sqlq: failed to release claim for job %d: %v", j.ID, err)
 			}
@@ -284,12 +284,12 @@ func (cons *consumer) processJob(j *job) {
 
 			return
 		}
-		// Beginning can wait for a pool connection, during which the claim can expire and another
-		// consumer can complete the job. Check the claim again before the handler runs.
+		// BeginTx can wait for a pool connection. During that time, the claim can expire, and a
+		// different consumer can complete the job. Thus, examine the claim again before the handler starts.
 		if time.Until(j.ClaimExpiresAt) >= claimTimeNeeded(cons.jobTimeout) {
 			break
 		}
-		_ = tx.Rollback() // Extending the claim may need this connection.
+		_ = tx.Rollback() // The extension of the claim can need this connection.
 		if err = cons.ensureClaimTime(j); err != nil {
 			settled = errors.Is(err, ErrClaimLost)
 			return
@@ -356,13 +356,13 @@ func (cons *consumer) processJob(j *job) {
 	settled = true
 }
 
-// errClaimExpired is returned by ensureClaimTime when the claim ran out before it could be extended.
-// Another consumer may have claimed the job since, or not.
+// ensureClaimTime returns errClaimExpired if the claim expired before the extension.
+// A different consumer possibly has the claim now.
 var errClaimExpired = errors.New("claim expired before the handler could start")
 
-// ensureClaimTime makes sure the claim on j lasts long enough to run the handler and record its result,
-// extending it if needed. It returns ErrClaimLost if another consumer has claimed the job since,
-// and another error if the claim can't be made long enough for any other reason.
+// ensureClaimTime makes sure that the claim on j is sufficiently long for the handler and its result.
+// If necessary, it extends the claim. It returns ErrClaimLost if a different consumer has the claim now.
+// It returns a different error if it cannot extend the claim for a different reason.
 func (cons *consumer) ensureClaimTime(j *job) error {
 	remaining := time.Until(j.ClaimExpiresAt)
 	if remaining <= 0 {
@@ -406,7 +406,7 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 		if !errors.Is(err, errStaleReadTx) {
 			return "fail_mark_processed", fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
 		}
-		// The handler wrote nothing, so there is nothing to commit with the mark.
+		// The handler did not write. Thus, the transaction has no changes to commit with the mark.
 		_ = tx.Rollback()
 		if err = cons.markJobDoneInFreshTx(ctx, j); err != nil {
 			return "fail_mark_processed", fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
@@ -423,11 +423,11 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 	return "", nil
 }
 
-// markJobDoneInFreshTx marks a job processed in a transaction of its own. The mark is that transaction's
-// first statement, so it waits for the write lock instead of failing on a stale snapshot. If even that
-// wait times out, it keeps trying until the consumer stops, even once the claim has expired. Charging
-// the job a retry would need the same lock, and giving up would run a successful handler again. The
-// mark filters on the claim token, so it fails with ErrClaimLost if another worker took the job since.
+// markJobDoneInFreshTx marks a job processed in a new transaction. The mark is the first statement
+// of the transaction. Thus, it waits for the write lock, and does not fail on a stale snapshot.
+// If the wait times out, it tries again until the consumer stops, also after the claim expires.
+// A retry of the job needs the same lock. If it stops, a successful handler runs again.
+// The mark has a filter on the claim token. Thus, it fails with ErrClaimLost if a different worker has the job now.
 func (cons *consumer) markJobDoneInFreshTx(ctx context.Context, j *job) error {
 	delay := time.Millisecond
 	for {
@@ -509,7 +509,7 @@ func (cons *consumer) retryJob(ctx context.Context, job *job, errorMsg string) e
 
 	defer span.End()
 
-	// Preserve the uint16 callback API without wrapping long-lived retries to zero.
+	// The callback gets a uint16. A retry count above 65535 becomes 65535, not zero.
 	backoff := min(cons.backoffFunc(uint16(min(uint64(job.RetryCount)+1, 65535))), cons.maxBackoff)
 	span.SetAttributes(attribute.Float64("sqlq.backoff_seconds", backoff.Seconds()))
 
@@ -590,18 +590,17 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	return err
 }
 
-// ctxErrOrPassedDeadline is ctx.Err(), except that it also reports context.DeadlineExceeded
-// once ctx's deadline has passed, even if ctx hasn't been canceled yet.
+// ctxErrOrPassedDeadline returns ctx.Err(). It also returns context.DeadlineExceeded
+// if the deadline of ctx is in the past, but ctx is not canceled yet.
 //
-// Go cancels a context on a timer, and the timer can fire late. Say the process is paused
-// while a handler runs: the container hits its CPU quota and is throttled, the VM loses CPU
-// to steal time, or the process is suspended. When it resumes, the handler's goroutine can
-// run before the timer does. The job timeout may have passed during the pause, but a
-// handler checking ctx.Err() sees nil, finishes its work and returns nil.
+// Go cancels a context with a timer, and the timer can be late. For example, CPU throttling,
+// CPU steal or a suspend can stop the process while a handler runs. When the process continues,
+// the handler can run before the timer. Then the job timeout is in the past, but ctx.Err() is nil.
+// The handler completes and returns nil.
 //
-// By then, the claim on the job may have expired too, and another worker may be running
-// the job. The handler's transaction doesn't use ctx, so it would still commit. Calling the
-// handler failed instead makes sqlq roll back its writes, as it does for any timed-out handler.
+// At that time, the claim can be expired, and a different worker can run the job.
+// The handler transaction does not use ctx, thus it can commit. This function makes the
+// handler fail. Then sqlq does a rollback of the handler writes, as for all handlers that time out.
 func ctxErrOrPassedDeadline(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -675,7 +674,7 @@ func (cons *consumer) performCleanup(
 	cleanup func(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error),
 	deletedCounter metric.Int64Counter,
 ) {
-	// Cleanup must release blocked SQL/pool waits when the consumer shuts down.
+	// When the consumer stops, the cleanup must stop its waits for SQL and for the pool.
 	ctx, span := tracer.Start(cons.ctx, "sqlq.consumer.cleanup."+kind, trace.WithAttributes(
 		attribute.String("sqlq.job_type", cons.jobType),
 		attribute.String("sqlq.cleanup.age."+kind, maxAge.String()),

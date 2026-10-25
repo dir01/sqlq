@@ -41,7 +41,7 @@ func TestExponentialBackoff(t *testing.T) {
 				}
 				durations[duration] = true
 			}
-			// Jobs that failed together must not all retry together, from the first retry on.
+			// Jobs that failed at the same time must not retry at the same time, also at the first retry.
 			if len(durations) < 2 {
 				t.Errorf("exponentialBackoff(%d) returned only %v; want jitter", tc.retryNum, durations)
 			}
@@ -84,7 +84,7 @@ func TestRetryJobCapsBackoff(t *testing.T) {
 			t.Parallel()
 
 			d := &rescheduleRecordingDriver{} //nolint:exhaustruct
-			cons := &consumer{                //nolint:exhaustruct // Only dependencies used by retryJob are needed.
+			cons := &consumer{                //nolint:exhaustruct // The test needs only the dependencies of retryJob.
 				driver: d, tracer: noop.NewTracerProvider().Tracer("backoff-test"), metrics: noopMetrics(),
 				backoffFunc: backoffFunc, maxBackoff: time.Minute,
 			}

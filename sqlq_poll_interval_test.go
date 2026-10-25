@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNonPositiveDefaultPollIntervalIgnored checks that a zero or negative default poll interval keeps
-// the default, as the per-consumer option does, instead of crashing the process from the poller.
-// The consumer runs in a subprocess, because a panic in its goroutine would end this test binary.
+// TestNonPositiveDefaultPollIntervalIgnored makes sure that a zero or negative default poll interval
+// does not change the default, as with the consumer option. Before, the poller stopped the process.
+// The consumer runs in a subprocess, because a panic in its goroutine stops the test binary.
 func TestNonPositiveDefaultPollIntervalIgnored(t *testing.T) {
 	t.Parallel()
 	for _, interval := range []string{"0s", "-1s"} {
@@ -30,7 +30,7 @@ func TestNonPositiveDefaultPollIntervalIgnored(t *testing.T) {
 }
 
 // TestPollIntervalHelper is the subprocess of TestNonPositiveDefaultPollIntervalIgnored.
-func TestPollIntervalHelper(t *testing.T) { //nolint:paralleltest // A subprocess with a single test.
+func TestPollIntervalHelper(t *testing.T) { //nolint:paralleltest // A subprocess with one test.
 	interval := os.Getenv("SQLQ_POLL_INTERVAL")
 	if interval == "" {
 		t.Skip("subprocess of TestNonPositiveDefaultPollIntervalIgnored")

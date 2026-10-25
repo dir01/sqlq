@@ -52,7 +52,7 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 		require.NoError(t, err, "Failed to get DLQ jobs")
 
 		return len(dlqJobs) > 0
-		// Increase timeout for checking DLQ
+		// Increase the timeout for the DLQ check
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, 1, len(dlqJobs))

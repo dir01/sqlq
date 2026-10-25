@@ -71,8 +71,8 @@ func testAmbiguousClaim(t *testing.T, f readinessFixture, observer, db *sql.DB, 
 		jobs, err = d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Empty(t, jobs, "an acknowledged-lost claim must remain exclusively held until expiry")
-		// Natural expiry is covered by the SIGSTOP test. Fast-forward only the
-		// database fixture here to cheaply test the lost-claim-response branch.
+		// The SIGSTOP test examines a real expiry. Here, only the database time moves forward.
+		// Thus, the test of the lost-claim branch is fast.
 		expire := `UPDATE jobs SET claim_expires_at=0`
 		if f.kind == DBTypePostgres {
 			expire = `UPDATE jobs SET claim_expires_at=clock_timestamp()-interval '1 second'`
@@ -100,8 +100,8 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 			return err
 		}
 		if attempts == 1 {
-			// The failed attempt rolls back. Its retry/DLQ settlement is the
-			// next COMMIT, so this fault targets settlement, not the handler.
+			// The failed attempt rolls back. The next COMMIT records the retry or the DLQ move.
+			// Thus, this fault applies to that record, not to the handler.
 			arm(fault)
 		}
 		return errors.New("deliberate handler failure")
@@ -122,7 +122,7 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 	require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects WHERE value='failed-attempt'`))
 	if terminal {
 		if fault == 1 {
-			// The DLQ transaction rolled back; the consumer reschedules the job.
+			// The DLQ transaction rolled back. The consumer schedules the job again.
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE job_type='terminal-child'`))
@@ -142,8 +142,8 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 			wantRetries = 1
 		}
 		require.Equal(t, wantRetries, next.RetryCount, "only committed retry settlements advance the count")
-		// Repeating settlement with the old token must not count a second failure
-		// or interfere with a freshly acquired claim.
+		// A second record with the old token must not count a second failure,
+		// and must not change a new claim.
 		require.ErrorIs(t, d.markJobFailedAndReschedule(t.Context(), j.ID, j.ClaimToken, "stale", 0), ErrClaimLost)
 		cons.processJob(&next)
 		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects WHERE value='completed'`))
@@ -190,8 +190,8 @@ func testReadinessPublishing(t *testing.T, f readinessFixture, observer *sql.DB,
 			require.NoError(t, err)
 			require.NoError(t, q.PublishTx(t.Context(), tx, "claims", "first"))
 			require.NoError(t, q.PublishTx(t.Context(), tx, "claims", "second"))
-			// PublishTx success is not a commit. An independent connection must
-			// see neither the application's writes nor either queue publication.
+			// A successful PublishTx is not a commit. A different connection must not see
+			// the application writes, and must not see the two published jobs.
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs`))
 			committed := false

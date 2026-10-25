@@ -3,7 +3,7 @@ package sqlq
 type tokenBucket struct {
 	tokensCurr         *uint16
 	lastCheckUnixMilli int64
-	// The part of a token earned but not yet added, in sixty-thousandths of a token.
+	// The part of a token that is earned but not added, in units of 1/60000 token.
 	partialToken int64
 
 	RPM      uint16
@@ -19,16 +19,16 @@ func (b *tokenBucket) SpendToken(currUnixMilli int64) bool {
 		tokensCurr = b.Capacity
 	}
 
-	// maybe add tokens. Count in 64 bits: RPM times the elapsed milliseconds overflows 16.
-	// The fraction of a token left over carries to the next call, so that calls coming
-	// faster than tokens are earned still add up to the full rate, and no faster.
+	// maybe add tokens. Use 64 bits: RPM times the elapsed milliseconds overflows 16 bits.
+	// The remaining part of a token goes to the next call.
+	// Thus, frequent calls get the full rate, but not more.
 	if passedMilli := currUnixMilli - b.lastCheckUnixMilli; passedMilli > 0 {
 		earned := b.partialToken + int64(b.RPM)*passedMilli
 		toAdd := earned / 60000
 		b.partialToken = earned % 60000
 		b.lastCheckUnixMilli = currUnixMilli
 
-		// but not past Capacity
+		// but not more than Capacity
 		tokensCurr = uint16(min(int64(tokensCurr)+toAdd, int64(b.Capacity)))
 	}
 

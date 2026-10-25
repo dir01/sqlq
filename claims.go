@@ -46,11 +46,11 @@ func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
 	return jobTimeout + min(time.Minute, jobTimeout/2)
 }
 
-// minClaimTimeout returns the shortest claim timeout a consumer accepts for jobTimeout:
-// a claim just extended must still have claimTimeNeeded left once the extension's round trip
-// and the wait for a connection are over. A quarter of the job timeout, at most one second,
-// is left for those, and 2ms more for claimBudget's rounding. With less, a worker would extend
-// the claim again and again and never start the handler.
+// minClaimTimeout returns the shortest claim timeout that a consumer accepts for jobTimeout.
+// After an extension, the claim must have claimTimeNeeded remaining, after the round trip
+// and the wait for a connection. These get a quarter of the job timeout, maximum one second.
+// The rounding in claimBudget gets 2ms more. If the timeout is shorter, a worker extends
+// the claim again and again, and the handler never starts.
 func minClaimTimeout(jobTimeout time.Duration) time.Duration {
 	return claimTimeNeeded(jobTimeout) + min(time.Second, jobTimeout/4) + 2*time.Millisecond
 }

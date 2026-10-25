@@ -13,12 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// boundaryConnector delegates all SQL to the real database driver. It only
-// controls Begin/Commit boundaries, with no production failpoints or mock SQL.
+// boundaryConnector sends all SQL to the real database driver. It only controls
+// Begin and Commit. It does not use failpoints in the production code or mock SQL.
 type boundaryConnector struct {
 	sqldriver.Connector
 	beforeBegin func()
-	commitFault atomic.Int32 // 1: disconnect before commit; 2: lose successful acknowledgment
+	commitFault atomic.Int32 // 1: disconnect before commit. 2: lose the acknowledgment of a successful commit
 	fired       atomic.Int32
 }
 
@@ -89,7 +89,7 @@ func (tx *boundaryTx) Commit() error {
 		return tx.Tx.Commit()
 	}
 	if fault == 1 {
-		// A lost connection before COMMIT leaves the transaction rolled back.
+		// If the connection is lost before COMMIT, the transaction rolls back.
 		if err := tx.Rollback(); err != nil {
 			return err
 		}
@@ -97,7 +97,7 @@ func (tx *boundaryTx) Commit() error {
 		return err
 	}
 	tx.control.fired.Store(fault)
-	// Do not return ErrBadConn, which permits database/sql transparent retries.
+	// Do not return ErrBadConn. With ErrBadConn, database/sql can retry without a report.
 	return errors.New("injected ambiguous commit outcome")
 }
 
@@ -170,12 +170,12 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 
 func readinessBoundaryDB(t *testing.T, f readinessFixture) (*sql.DB, driver, func(int32), func() int32) {
 	t.Helper()
-	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // Faults are initially disarmed.
+	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // At the start, all faults are off.
 	var connector sqldriver.Connector = control
 	arm, fired := control.commitFault.Store, control.fired.Load
 	if f.kind == DBTypePostgres {
-		// The real PostgreSQL wire test confirms the outcome on the server;
-		// SQLite uses the real transaction with a synthesized driver error.
+		// The PostgreSQL network test examines the result on the server.
+		// SQLite uses the real transaction with a simulated driver error.
 		proxy := newReadinessProxy(t, f)
 		f.dsn = proxy.dsn
 		connector = f.connector(t)

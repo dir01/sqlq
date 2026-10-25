@@ -16,8 +16,8 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// poolHoldingTracer takes the pool's connection when the first job starts, after the worker
-// checked its claim and before it begins the handler's transaction, and keeps it for hold.
+// poolHoldingTracer takes the pool connection when the first job starts. This is after the worker
+// examines its claim, and before it starts the handler transaction. It keeps the connection for hold.
 type poolHoldingTracer struct {
 	trace.Tracer
 	db      *sql.DB
@@ -37,12 +37,12 @@ func (tr *poolHoldingTracer) Start(ctx context.Context, name string, opts ...tra
 			time.AfterFunc(tr.hold, func() { _ = conn.Close() })
 		})
 	}
-	return tr.Tracer.Start(ctx, name, opts...) //nolint:spancheck // A wrapper: the caller ends the span.
+	return tr.Tracer.Start(ctx, name, opts...) //nolint:spancheck // This is a wrapper. The caller ends the span.
 }
 
-// TestHandlerNotRunAfterClaimExpiredInPoolWait checks that a worker which waited for a pool
-// connection longer than its claim lasts does not run the handler. By then another consumer can have
-// claimed and completed the job, and the handler's external effects would happen again.
+// TestHandlerNotRunAfterClaimExpiredInPoolWait makes sure that a worker does not run the handler if
+// its wait for a pool connection is longer than its claim. At that time, a different consumer can
+// have the job, or can have completed it. Then the external effects of the handler occur again.
 func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 	t.Parallel()
 
@@ -51,7 +51,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 
 	const (
 		jobType    = "pool_wait"
-		jobTimeout = 200 * time.Millisecond // The claim lasts twice as long.
+		jobTimeout = 200 * time.Millisecond // The claim is two times longer.
 	)
 	dsn := "file:" + filepath.Join(t.TempDir(), "pool.db") + "?_journal_mode=WAL&_busy_timeout=1000"
 	newQueue := func(tracer trace.Tracer) (sqlq.JobsQueue, *sql.DB) {
@@ -71,7 +71,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 		return q, db
 	}
 
-	// The waiting worker's pool is held well past its claim's expiry.
+	// The pool of the worker stays locked until long after its claim expires.
 	tracer := &poolHoldingTracer{Tracer: noop.NewTracerProvider().Tracer("pool-wait"), db: nil, holding: make(chan struct{}), once: sync.Once{}, hold: 3 * jobTimeout}
 	waiting, waitingDB := newQueue(tracer)
 	tracer.db = waitingDB
@@ -89,7 +89,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the job was never claimed")
 	}
-	// Another consumer takes the job once the waiting worker's claim expires.
+	// A different consumer takes the job after the claim of the worker expires.
 	require.NoError(t, other.Consume(ctx, jobType, func(context.Context, *sql.Tx, []byte) error {
 		otherCalls.Add(1)
 		return nil
@@ -97,7 +97,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 
 	require.Eventually(t, func() bool { return otherCalls.Load() == 1 }, 5*time.Second, 10*time.Millisecond,
 		"the other consumer never processed the job")
-	// Give the waiting worker time to get its connection back and act on the job.
+	// Give the worker time to get its connection again and to process the job.
 	time.Sleep(3 * jobTimeout)
 	require.Zero(t, staleCalls.Load(), "the handler ran after the claim expired while the worker waited for a connection")
 }

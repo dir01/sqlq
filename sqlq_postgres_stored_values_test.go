@@ -21,8 +21,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// TestPostgresStoredValues checks values that the PostgreSQL driver stores as they come:
-// timestamps, whatever the session's time zone, and handler error text, whatever its bytes.
+// TestPostgresStoredValues examines values that the PostgreSQL driver must store without change:
+// timestamps in all session time zones, and handler error text with all bytes.
 func TestPostgresStoredValues(t *testing.T) {
 	t.Parallel()
 	if testing.Short() {
@@ -50,7 +50,7 @@ func TestPostgresStoredValues(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, admin.Close()) })
 
-	// openSchema returns a database in a schema of its own, whose sessions use timeZone.
+	// openSchema returns a database in a new schema. Its sessions use timeZone.
 	openSchema := func(t *testing.T, timeZone string) *sql.DB {
 		t.Helper()
 		schema := fmt.Sprintf("stored_%d", time.Now().UnixNano())
@@ -68,7 +68,7 @@ func TestPostgresStoredValues(t *testing.T) {
 		})
 		return db
 	}
-	// newQueue returns a running queue on db.
+	// newQueue returns a queue on db that runs.
 	newQueue := func(t *testing.T, db *sql.DB, opts ...sqlq.NewOption) sqlq.JobsQueue {
 		t.Helper()
 		q, err := sqlq.New(db, sqlq.DBTypePostgres, append([]sqlq.NewOption{
@@ -77,12 +77,12 @@ func TestPostgresStoredValues(t *testing.T) {
 		}, opts...)...)
 		require.NoError(t, err)
 		require.NoError(t, q.Run())
-		t.Cleanup(q.Shutdown) // Runs before the database closes.
+		t.Cleanup(q.Shutdown) // This runs before the database closes.
 		return q
 	}
 
-	// A dead-lettered job is as old as the time since it failed, in whatever time zone the
-	// database session and the application are: cleanup with a long retention keeps it.
+	// The age of a job in the DLQ is the time since it failed, in all time zones of the
+	// database session and the application. Thus, a cleanup with a long retention keeps it.
 	for _, timeZone := range []string{"America/Los_Angeles", "UTC", "Asia/Tokyo"} {
 		t.Run("DLQ cleanup keeps a fresh job in "+timeZone, func(t *testing.T) {
 			t.Parallel()
@@ -103,7 +103,7 @@ func TestPostgresStoredValues(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("job was never dead-lettered")
 			}
-			// Many cleanup runs, all well within the retention.
+			// Many cleanup runs, all in the retention time.
 			time.Sleep(500 * time.Millisecond)
 			jobs, err := q.GetDeadLetterJobs(t.Context(), "fails", 10)
 			require.NoError(t, err)
@@ -113,8 +113,8 @@ func TestPostgresStoredValues(t *testing.T) {
 		})
 	}
 
-	// Dead-letter times stored without a time zone, by earlier versions, keep their meaning: the
-	// session's wall-clock time, for failed_at as its default wrote it.
+	// Old versions stored the DLQ times without a time zone. These times must keep their meaning:
+	// the local time of the session, as the default of failed_at wrote it.
 	t.Run("DLQ times without a time zone are migrated", func(t *testing.T) {
 		t.Parallel()
 		db := openSchema(t, "America/Los_Angeles")
@@ -126,7 +126,7 @@ func TestPostgresStoredValues(t *testing.T) {
 		_, err = db.ExecContext(t.Context(), `INSERT INTO dead_letter_queue (original_job_id, job_type, created_at, retry_count, failure_reason)
 			VALUES (1, 'old', LOCALTIMESTAMP - interval '1 hour', 0, 'old failure')`)
 		require.NoError(t, err)
-		for range 2 { // Migrating again changes nothing.
+		for range 2 { // A second migration does not change values.
 			_, err = sqlq.New(db, sqlq.DBTypePostgres)
 			require.NoError(t, err)
 		}
@@ -138,7 +138,7 @@ func TestPostgresStoredValues(t *testing.T) {
 		assert.WithinDuration(t, time.Now().Add(-time.Hour), jobs[0].CreatedAt, time.Minute, "creation time")
 	})
 
-	// The same, with the application in other time zones: the queue reads its clock there.
+	// The same, with the application in other time zones. The queue reads its clock there.
 	for _, timeZone := range []string{"Asia/Tokyo", "America/Los_Angeles"} {
 		if os.Getenv("SQLQ_STORED_VALUES_CHILD") != "" {
 			break
@@ -152,8 +152,8 @@ func TestPostgresStoredValues(t *testing.T) {
 		})
 	}
 
-	// PostgreSQL text rejects NUL bytes and invalid UTF-8. A handler's error must still be
-	// recorded, or its retries are never counted and the job runs again and again.
+	// PostgreSQL text does not accept NUL bytes or invalid UTF-8. The queue must still record the
+	// handler error. If not, the queue does not count the retries, and the job runs again and again.
 	for name, message := range map[string]string{"NUL": "bad input: \x00", "invalid UTF-8": "bad input: \xff"} {
 		t.Run("error text with "+name+" counts as a retry", func(t *testing.T) {
 			t.Parallel()
@@ -172,7 +172,7 @@ func TestPostgresStoredValues(t *testing.T) {
 			}, 5*time.Second, 20*time.Millisecond) {
 				t.Fatalf("job never reached the DLQ, after %d calls", calls.Load())
 			}
-			// Polls that could run it again, had it stayed in the queue.
+			// Polls that run the job again if it is still in the queue.
 			time.Sleep(200 * time.Millisecond)
 			assert.Equal(t, int32(2), calls.Load(), "one attempt and one retry")
 			assert.Equal(t, uint32(1), jobs[0].RetryCount)

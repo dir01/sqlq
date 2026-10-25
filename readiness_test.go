@@ -18,15 +18,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests are also compiled into the VM image. PostgreSQL uses the guest's
-// existing server, never a nested Docker container. Each suite owns its schema.
-func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // Scenarios share a database and deliberately mutate its state.
+// The VM image also contains these tests. PostgreSQL uses the server in the guest,
+// not a Docker container in the guest. Each suite has its own schema.
+func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // The scenarios use the same database, and change its state.
 	t.Parallel()
 	f := readinessFixture{kind: DBTypeSQLite, dsn: "file:" + filepath.Join(t.TempDir(), "readiness.db") + "?_journal_mode=WAL&_busy_timeout=1000&_synchronous=FULL", schema: ""}
 	testReadiness(t, f)
 }
 
-func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // May restart the dedicated VM database server.
+func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // The test can restart the database server of the VM.
 	dsn := os.Getenv("SQLQ_TEST_POSTGRES_DSN")
 	if testing.Short() || dsn == "" {
 		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database (the VM supplies it)")
@@ -55,7 +55,7 @@ func (f readinessFixture) connector(t *testing.T) sqldriver.Connector {
 	require.NoError(t, err)
 	c.RuntimeParams["search_path"] = f.schema
 	c.RuntimeParams["application_name"] = f.schema
-	// No lock timeout: cancellation tests must prove queue cancellation works.
+	// Do not set a lock timeout. The cancel tests must show that the queue cancel operates.
 	c.RuntimeParams["lock_timeout"] = "0"
 	return stdlib.GetConnector(*c)
 }
@@ -160,7 +160,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				held, err := cleanupDB.Conn(t.Context())
 				require.NoError(t, err)
 				defer func() { require.NoError(t, held.Close()) }()
-				// Holding SQLite's driver mutex must not obstruct cancellation either.
+				// If a different call holds the mutex of the SQLite driver, the cancel must also operate.
 				if sqlite, ok := cleanupDriver.(*SQLiteDriver); ok {
 					require.NoError(t, sqlite.lock(t.Context()))
 					defer sqlite.unlock()
@@ -236,8 +236,8 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	require.NoError(t, d.moveToDeadLetterQueue(ctx, jobs[0].ID, jobs[0].ClaimToken, "test", nil))
-	// Hold replacement INSERTs after any DLQ read/delete. In the old code both
-	// callers read the row and block here; in the fixed code one blocks on DELETE.
+	// Stop the replacement INSERTs after each DLQ read or delete. In the old code, the two
+	// callers read the row and stop here. In the new code, one caller stops at DELETE.
 	require.NoError(t, execSQL(ctx, db, `CREATE FUNCTION gate_requeue() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN PERFORM pg_advisory_xact_lock(hashtext(TG_TABLE_SCHEMA), 17); RETURN NEW; END $$`))
 	require.NoError(t, execSQL(ctx, db, `CREATE TRIGGER gate_requeue BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION gate_requeue()`))
@@ -287,7 +287,7 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	require.Equal(t, 1, missing)
 	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	// Taking the row must remain transactional if replacement insertion fails.
+	// If the replacement INSERT fails, the DELETE of the row must also roll back.
 	replacements, err := d.getJobsForConsumer(ctx, "requeue", 1, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, replacements, 1)

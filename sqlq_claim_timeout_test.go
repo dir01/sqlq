@@ -14,10 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAcceptedClaimTimeoutRunsHandler checks claim timeouts just above the job timeout:
-// Consume either rejects one, or the handler runs. A worker extends a claim with less than the
-// job timeout plus a margin left before it starts a handler. If the claim timeout cannot cover
-// that, extending again never helps, and an accepted consumer would never run anything.
+// TestAcceptedClaimTimeoutRunsHandler examines claim timeouts a little above the job timeout.
+// Consume does not accept the timeout, or the handler runs. Before a worker starts a handler, it
+// extends the claim if the remaining time is less than the job timeout plus a margin. If the claim
+// timeout is shorter than that, each extension is also too short, and the consumer never runs a job.
 func TestAcceptedClaimTimeoutRunsHandler(t *testing.T) {
 	t.Parallel()
 	const jobTimeout = 100 * time.Millisecond

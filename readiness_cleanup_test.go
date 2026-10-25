@@ -22,7 +22,7 @@ func testCleanupEligibility(t *testing.T, f readinessFixture, db *sql.DB, d driv
 		retryLabel     = "retry"
 		otherTypeLabel = "other-type"
 	)
-	// Controlled historical timestamps avoid sleeping for retention windows.
+	// The test sets old timestamps. Thus, it does not wait for the retention time.
 	old := fmt.Sprint(time.Now().Add(-2 * time.Hour).UnixMilli())
 	recent := fmt.Sprint(time.Now().UnixMilli())
 	future := fmt.Sprint(time.Now().Add(2 * time.Hour).UnixMilli())

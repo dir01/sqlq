@@ -52,7 +52,7 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	metrics, err := newMetrics(metricnoop.NewMeterProvider().Meter("fetch-test"))
 	require.NoError(t, err)
 	d := &transientFetchDriver{recovered: make(chan struct{})} //nolint:exhaustruct
-	cons := &consumer{                                         //nolint:exhaustruct // Only the polling loop is exercised.
+	cons := &consumer{                                         //nolint:exhaustruct // The test uses only the polling loop.
 		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
 		pollInterval: 5 * time.Millisecond, prefetchCount: 1, concurrency: 1,
 		claims: make(map[string]job),

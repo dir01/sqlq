@@ -11,15 +11,15 @@ import (
 type ConsumerOption func(*consumer)
 
 // WithConsumerClaimTimeout sets how long a consumer holds a fetched job before other
-// consumers can take it. Default is twice the job timeout (30 minutes with defaults), or
-// the shortest accepted timeout if that is longer.
-// The time starts at fetch, so time in the buffer counts. Before a worker starts a handler,
-// it extends the claim if less than the job timeout plus a margin is left. Claims are not
-// renewed while the handler runs. Consume returns ErrClaimTimeoutTooShort if the claim
-// timeout is shorter than the job timeout plus that margin (half the job timeout, at most one
-// minute) plus a quarter of the job timeout (at most one second) for the extension itself,
-// plus 2ms. Twice the job timeout is enough for any job timeout of 8ms or more.
-// Values under 2ms are ignored.
+// consumers can take it. The default is two times the job timeout (30 minutes by default),
+// or the shortest accepted timeout if that is longer.
+// The time starts at the fetch. Thus, the time in the buffer counts. Before a worker starts
+// a handler, it extends the claim if the remaining time is less than the job timeout plus a margin.
+// The claim does not extend while the handler runs. Consume returns ErrClaimTimeoutTooShort
+// if the claim timeout is shorter than the sum of: the job timeout, the margin (half of the
+// job timeout, maximum one minute), a quarter of the job timeout for the extension (maximum
+// one second), and 2ms. Two times the job timeout is sufficient for all job timeouts of 8ms or more.
+// The option ignores values less than 2ms.
 func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
 	return func(c *consumer) {
 		if claimBudget(timeout) > 0 {
@@ -70,7 +70,7 @@ func WithConsumerPollInteval(interval time.Duration) ConsumerOption {
 }
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
-// The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
+// The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
 func WithConsumerBackoffFunc(fn func(uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
@@ -147,9 +147,8 @@ func WithAsyncPush() ConsumerOption {
 	}
 }
 
-// WithAsyncPushRateLimit says how many times per minute should async notifications
-// from a publisher be delivered, at most. Zero or less means no limit, and more than
-// 65535 is taken as 65535.
+// WithAsyncPushRateLimit sets the maximum number of async notifications from a publisher
+// in one minute. Zero or less means no limit. A value above 65535 becomes 65535.
 func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
 		o.asyncPushMaxRPM = uint16(min(max(rpm, 0), math.MaxUint16))

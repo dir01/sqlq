@@ -49,7 +49,7 @@ type JobsQueue interface {
 	RequeueDeadLetterJob(ctx context.Context, originalJobID int64) error
 
 	// Shutdown gracefully stops all consumers and background processes.
-	// Consume fails with ErrShutDown once it has been called.
+	// After a call to Shutdown, Consume fails with ErrShutDown.
 	Shutdown()
 
 	// Run performs initial setup like schema initialization.
@@ -69,8 +69,8 @@ const (
 var (
 	// ErrDuplicateConsumer is returned when Consume is called multiple times for the same job type.
 	ErrDuplicateConsumer = errors.New(".Consume was called twice for same job type")
-	// ErrShutDown is returned when Consume is called once Shutdown has been, even while Shutdown is
-	// still waiting for consumers: a consumer started then would outlive it.
+	// ErrShutDown is the error from Consume after a call to Shutdown, also while Shutdown waits
+	// for consumers. A consumer that starts at that time can continue after Shutdown completes.
 	ErrShutDown = errors.New("queue is shut down")
 	// ErrUnsupportedDBType is returned when an unsupported database type is provided to New.
 	ErrUnsupportedDBType = errors.New("unsupported database type")
@@ -80,9 +80,9 @@ var (
 	ErrJobNotFound = errors.New("job not found")
 	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
-	// ErrClaimTimeoutTooShort means the claim timeout cannot cover the job timeout and the margin
-	// a worker needs before it starts a handler (see WithConsumerClaimTimeout), so handlers would
-	// either outlive their claims or never start.
+	// ErrClaimTimeoutTooShort means that the claim timeout is shorter than the job timeout plus the
+	// margin that a worker needs before it starts a handler (see WithConsumerClaimTimeout).
+	// Then handlers continue after their claims expire, or they never start.
 	ErrClaimTimeoutTooShort = errors.New("claim timeout is too short for the job timeout")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
@@ -123,7 +123,7 @@ type sqlq struct {
 	defaultPollInterval time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
-	// The longest delay any consumer waits before retrying a job. See WithMaxBackoff.
+	// The maximum delay before a retry, for all consumers. See WithMaxBackoff.
 	maxBackoff time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
@@ -163,7 +163,7 @@ type sqlq struct {
 	// Individual consumers may override this using WithConsumerCleanupBatch.
 	defaultCleanupBatch uint16
 
-	// Set by Shutdown, under consumersMapMutex. Consume fails once it is.
+	// Shutdown sets this, with consumersMapMutex locked. When it is true, Consume fails.
 	shutDown bool
 }
 
@@ -447,7 +447,7 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 	return err
 }
 
-// Shutdown stops the job processing. Consume fails with ErrShutDown from then on.
+// Shutdown stops the job processing. After this call, Consume fails with ErrShutDown.
 func (q *sqlq) Shutdown() {
 	wg := sync.WaitGroup{}
 

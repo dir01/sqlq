@@ -30,7 +30,7 @@ func WithMeterProvider(provider metric.MeterProvider) NewOption {
 //////////////////////////////////////////
 
 // WithDefaultPollInterval allows to configure default poll interval.
-// A zero or negative interval is ignored, as it is by WithConsumerPollInteval.
+// The option ignores a zero or negative interval, as WithConsumerPollInteval does.
 // This value may be overridden per individual consumer, see WithConsumerPollInteval.
 func WithDefaultPollInterval(tick time.Duration) NewOption {
 	return func(q *sqlq) {
@@ -41,7 +41,7 @@ func WithDefaultPollInterval(tick time.Duration) NewOption {
 }
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
-// The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
+// The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
 func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
@@ -49,9 +49,9 @@ func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	}
 }
 
-// WithMaxBackoff sets the longest delay before retrying a failed job.
-// It caps the default exponential backoff and functions set with WithDefaultBackoffFunc
-// or WithConsumerBackoffFunc alike. Default is 24 hours. A zero or negative value is ignored.
+// WithMaxBackoff sets the maximum delay before a retry of a failed job.
+// It applies to the default exponential backoff, and to the functions from WithDefaultBackoffFunc
+// and WithConsumerBackoffFunc. The default is 24 hours. The option ignores a zero or negative value.
 func WithMaxBackoff(maxBackoff time.Duration) NewOption {
 	return func(q *sqlq) {
 		if maxBackoff > 0 {

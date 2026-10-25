@@ -24,13 +24,13 @@ type readinessProcessConfig struct {
 	Schema string `json:"schema"`
 }
 
-// Pause inside BeginTx, after the consumer's local ownership check, as a wait for a
-// pool connection would. This is a real scheduling gap and, unlike pausing a SQLite
-// writer, permits reclamation on both databases. The claim expires during the pause,
-// so the resumed worker must not run the handler: its external effects would happen
-// although another consumer owns the job. Its database writes would still be fenced
-// by the claim token (see claims_test.go).
-func TestReadinessWorkerProcess(t *testing.T) { //nolint:paralleltest // The parent controls this process's exact execution boundaries.
+// Stop the process in BeginTx, after the consumer examines its claim, as a wait for a pool
+// connection does. This is a real gap in the schedule. Different from a stop of a SQLite writer,
+// it lets a different consumer claim the job on the two databases. The claim expires during the stop.
+// Thus, the worker must not run the handler when it continues. If it does, the handler has external
+// effects, but a different consumer has the job. The claim token still blocks its database
+// writes (see claims_test.go).
+func TestReadinessWorkerProcess(t *testing.T) { //nolint:paralleltest // The parent process controls when this process stops and continues.
 	config := os.Getenv("SQLQ_READINESS_WORKER")
 	if config == "" {
 		t.Skip("subprocess helper")
@@ -38,7 +38,7 @@ func TestReadinessWorkerProcess(t *testing.T) { //nolint:paralleltest // The par
 	var c readinessProcessConfig
 	require.NoError(t, json.Unmarshal([]byte(config), &c))
 	f := readinessFixture{kind: c.Kind, dsn: c.DSN, schema: c.Schema}
-	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // Faults are initially disarmed.
+	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // At the start, all faults are off.
 	db := sql.OpenDB(control)
 	defer func() { require.NoError(t, db.Close()) }()
 	d, err := getDriver(db, f.kind)
@@ -119,14 +119,14 @@ func testStaleResumption(t *testing.T, f readinessFixture, db *sql.DB, d driver)
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	require.NotEqual(t, oldToken, jobs[0].ClaimToken)
-	// B owns the job but has not completed it. Otherwise processed_at alone
-	// would reject A, letting a missing claim-token fence escape detection.
+	// B has the job, but has not completed it. If B completes it, processed_at alone
+	// stops A, and the test cannot find a missing claim-token check.
 	require.NoError(t, cmd.Process.Signal(syscall.SIGCONT))
 	_, err = in.Write([]byte{1})
 	require.NoError(t, err)
 	done := make(chan error, 1)
 	go func() {
-		// Drain stdout before Wait closes its pipe, preserving the final marker.
+		// Read all of stdout before Wait closes the pipe. Thus, the test keeps the last marker.
 		finished := false
 		for scanner.Scan() {
 			finished = finished || scanner.Text() == "stale-attempt-finished"
