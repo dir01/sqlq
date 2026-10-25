@@ -37,18 +37,25 @@ const (
 // poll interval, doubled one time for each further failure, to a maximum of fetchRetryMaxDelay
 // or the poll interval, whichever is longer. Thus, after the first retry, a failure never
 // makes the consumer fetch more frequently than its poll interval.
+//
+// The function adds a random jitter of up to 20% to the delay. When the database stops,
+// all consumers fail at almost the same time. Without the jitter, they would also retry
+// at the same time, and the database would get all their queries at once when it starts again.
 func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duration {
 	delay := max(pollInterval, time.Millisecond) // a zero delay does not increase when it doubles
 	if retryNum == 0 {
-		return min(delay, fetchRetryMaxFirstDelay)
+		delay = min(delay, fetchRetryMaxFirstDelay)
+	} else {
+		maxDelay := max(fetchRetryMaxDelay, delay)
+		for range retryNum {
+			if delay > maxDelay/2 { // doubling would make the delay more than maxDelay
+				delay = maxDelay
+				break
+			}
+			delay *= 2
+		}
 	}
 
-	maxDelay := max(fetchRetryMaxDelay, delay)
-	for range retryNum {
-		if delay > maxDelay/2 { // doubling would make the delay more than maxDelay
-			return maxDelay
-		}
-		delay *= 2
-	}
-	return delay
+	jitter := rand.N(delay / 5)
+	return delay + min(jitter, math.MaxInt64-delay) // the sum must not overflow time.Duration
 }

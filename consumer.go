@@ -90,7 +90,8 @@ func (cons *consumer) fetchJobsLoop() {
 	defer ticker.Stop()
 
 	// subChan is a channel that a driver might write to if async push is configured and supported
-	// in cases where async push isn't used, this will remain a dummy channel
+	// in cases where async push isn't used, this will remain a dummy channel.
+	// The loop reads it in the wait between polls and in the wait after a failed fetch.
 	subChan := make(<-chan struct{})
 	if cons.asyncPushEnabled {
 		var bucket *tokenBucket
@@ -106,6 +107,9 @@ func (cons *consumer) fetchJobsLoop() {
 	var attempt uint16
 	for {
 		if err := cons.fetchJobs(cons.ctx); err != nil && !errors.Is(err, context.Canceled) {
+			// Calculate the delay one time. It has a random jitter, so a second call gives a different value.
+			backoffTimeout := fetchRetryBackoff(attempt, cons.pollInterval)
+
 			// only start span in case of error since we don't want
 			// long-running traces of long-running background processes
 			_, span := cons.tracer.Start(cons.ctx, "sqlq.consumer.fetch_jobs")
@@ -115,16 +119,21 @@ func (cons *consumer) fetchJobsLoop() {
 			span.SetAttributes(
 				attribute.String("job_type", cons.jobType),
 				attribute.Int("attempt", int(attempt)),
-				attribute.Int64("retry_delay_ms", fetchRetryBackoff(attempt, cons.pollInterval).Milliseconds()),
+				attribute.Int64("retry_delay_ms", backoffTimeout.Milliseconds()),
 			)
 			span.End()
 
-			backoffTimeout := fetchRetryBackoff(attempt, cons.pollInterval)
 			if attempt < 16 { // 16 doublings are sufficient to get to the maximum delay
 				attempt++
 			}
 			select {
 			case <-time.After(backoffTimeout):
+				continue
+			case <-subChan:
+				// An async push stops the wait. With SQLite, a publisher in this process
+				// wrote a job, so the database is possibly available again. The push does
+				// not set attempt to 0. Only a successful fetch does that. The driver
+				// discards a push that nobody reads, so the wait must not ignore it.
 				continue
 			case <-cons.ctx.Done():
 				return

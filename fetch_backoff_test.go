@@ -12,16 +12,23 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
+// requireFetchRetryDelay makes sure that got is want plus a jitter of up to 20%.
+func requireFetchRetryDelay(t *testing.T, want, got time.Duration, msgAndArgs ...any) {
+	t.Helper()
+	require.GreaterOrEqual(t, got, want, msgAndArgs...)
+	require.LessOrEqual(t, got, want+want/5, msgAndArgs...)
+}
+
 func TestFetchRetryBackoff(t *testing.T) {
 	t.Parallel()
-	require.Equal(t, 5*time.Millisecond, fetchRetryBackoff(0, 5*time.Millisecond))
-	require.Equal(t, 10*time.Millisecond, fetchRetryBackoff(1, 5*time.Millisecond))
-	require.Equal(t, 100*time.Millisecond, fetchRetryBackoff(0, time.Second))
+	requireFetchRetryDelay(t, 5*time.Millisecond, fetchRetryBackoff(0, 5*time.Millisecond))
+	requireFetchRetryDelay(t, 10*time.Millisecond, fetchRetryBackoff(1, 5*time.Millisecond))
+	requireFetchRetryDelay(t, 100*time.Millisecond, fetchRetryBackoff(0, time.Second))
 	// After the first retry, the delay starts from the poll interval.
-	require.Equal(t, 2*time.Second, fetchRetryBackoff(1, time.Second))
+	requireFetchRetryDelay(t, 2*time.Second, fetchRetryBackoff(1, time.Second))
 	for _, poll := range []time.Duration{time.Millisecond, 5 * time.Millisecond, time.Second} {
 		for _, attempt := range []uint16{16, 32, 65535} {
-			require.Equal(t, 30*time.Second, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
+			requireFetchRetryDelay(t, 30*time.Second, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}
 	}
 }
@@ -31,20 +38,30 @@ func TestFetchRetryBackoff(t *testing.T) {
 func TestFetchRetryBackoffDoesNotExceedPollRate(t *testing.T) {
 	t.Parallel()
 	for _, poll := range []time.Duration{time.Minute, 5 * time.Minute} {
-		require.Equal(t, fetchRetryMaxFirstDelay, fetchRetryBackoff(0, poll))
+		requireFetchRetryDelay(t, fetchRetryMaxFirstDelay, fetchRetryBackoff(0, poll))
 		for _, attempt := range []uint16{1, 2, 16, 65535} {
-			require.Equal(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
+			requireFetchRetryDelay(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}
 	}
 }
 
-// Doubling a very long poll interval must not overflow time.Duration.
+// Doubling a very long poll interval and adding the jitter must not overflow time.Duration.
 func TestFetchRetryBackoffLongPollIntervalDoesNotOverflow(t *testing.T) {
 	t.Parallel()
 	poll := time.Duration(math.MaxInt64)
 	for _, attempt := range []uint16{1, 16, 65535} {
 		require.Equal(t, poll, fetchRetryBackoff(attempt, poll))
 	}
+}
+
+// Consumers that fail at the same time must not retry at the same time.
+func TestFetchRetryBackoffHasJitter(t *testing.T) {
+	t.Parallel()
+	delays := make(map[time.Duration]struct{})
+	for range 100 {
+		delays[fetchRetryBackoff(5, time.Second)] = struct{}{}
+	}
+	require.Greater(t, len(delays), 1)
 }
 
 type transientFetchDriver struct {
@@ -83,5 +100,57 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	case <-d.recovered:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("transient fetch failure incurred an excessive delay")
+	}
+}
+
+type pushDuringBackoffDriver struct {
+	driver
+	push    chan struct{}
+	fetched chan struct{}
+	calls   int
+}
+
+func (d *pushDuringBackoffDriver) subscribeForConsumer(context.Context, string, *tokenBucket) (<-chan struct{}, error) {
+	return d.push, nil
+}
+
+func (d *pushDuringBackoffDriver) getJobsForConsumer(context.Context, string, uint16, time.Duration) ([]job, error) {
+	d.calls++
+	if d.calls <= 2 {
+		return nil, errors.New("claim failure")
+	}
+	close(d.fetched)
+	return nil, nil
+}
+
+// After two failed fetches, the consumer waits two poll intervals. An async push must stop the
+// wait, because the driver discards a push that nobody reads.
+func TestFetchLoopPushStopsBackoff(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	metrics, err := newMetrics(metricnoop.NewMeterProvider().Meter("fetch-test"))
+	require.NoError(t, err)
+	d := &pushDuringBackoffDriver{push: make(chan struct{}), fetched: make(chan struct{})} //nolint:exhaustruct
+	cons := &consumer{                                                                     //nolint:exhaustruct // The test uses only the polling loop.
+		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
+		pollInterval: time.Minute, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
+		claims: make(map[string]job),
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); cons.fetchJobsLoop() }()
+	defer func() { cancel(); <-done }()
+
+	// The consumer reads a push in each wait, so send pushes until a fetch is successful.
+	// Without the push, the third fetch would occur only after two poll intervals.
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case d.push <- struct{}{}:
+		case <-d.fetched:
+			return
+		case <-timeout:
+			t.Fatal("the push did not stop the backoff")
+		}
 	}
 }
