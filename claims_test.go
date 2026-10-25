@@ -430,13 +430,29 @@ func TestClaimLength(t *testing.T) {
 	}{
 		{15 * time.Minute, 16 * time.Minute, 15*time.Minute + 30*time.Second}, // the gap stops at one minute
 		{10 * time.Second, 15 * time.Second, 12500 * time.Millisecond},        // the gap is half the job timeout
-		{4 * time.Millisecond, 14 * time.Millisecond, 9 * time.Millisecond},   // the gap is at least 10ms
+		{minJobTimeout, 75 * time.Millisecond, 62500 * time.Microsecond},      // the shortest job timeout
 	} {
 		require.Equal(t, scenario.length, claimLength(scenario.jobTimeout), scenario.jobTimeout)
 		require.Equal(t, scenario.timeToStart, claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
 		// After an extension, the claim must still have claimTimeToStart left after the rounding
 		// in claimBudget. Otherwise, the worker extends the claim again and again.
 		require.Greater(t, claimBudget(claimLength(scenario.jobTimeout)), claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
+	}
+}
+
+// The job timeout options raise a timeout shorter than 50ms, and ignore a timeout of zero or less.
+func TestJobTimeoutLowerLimit(t *testing.T) {
+	t.Parallel()
+	for timeout, want := range map[time.Duration]time.Duration{
+		-time.Second: defaultJobTimeout, 0: defaultJobTimeout, time.Millisecond: minJobTimeout,
+		minJobTimeout: minJobTimeout, time.Second: time.Second,
+	} {
+		cons := &consumer{jobTimeout: defaultJobTimeout} //nolint:exhaustruct
+		WithConsumerJobTimeout(timeout)(cons)
+		q := &sqlq{defaultJobTimeout: defaultJobTimeout} //nolint:exhaustruct
+		WithDefaultJobTimeout(timeout)(q)
+		require.Equal(t, want, cons.jobTimeout, timeout)
+		require.Equal(t, want, q.defaultJobTimeout, timeout)
 	}
 }
 

@@ -138,11 +138,12 @@ func WithDefaultMaxRetries(maxRetries int32) NewOption {
 // WithDefaultJobTimeout sets a maximum execution duration for a single job handler invocation.
 // If the handler exceeds this duration, its context will be canceled.
 // A timeout is treated as a job failure.
+// The option ignores a zero or negative timeout, and raises a timeout shorter than 50ms to 50ms.
 // This value may be overridden per individual consumer, see WithConsumerJobTimeout.
 func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	return func(o *sqlq) {
 		if timeout > 0 {
-			o.defaultJobTimeout = timeout
+			o.defaultJobTimeout = max(timeout, minJobTimeout)
 		}
 	}
 }

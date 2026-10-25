@@ -14,12 +14,13 @@ import (
 )
 
 // TestShortJobTimeoutRunsHandler examines very short job timeouts. The job timeout sets the claim.
+// The options raise a job timeout shorter than 50ms to 50ms.
 // Before a worker starts a handler, it extends the claim if the remaining time is too short. If an
 // extension also left too little time, the worker would extend the claim again and again, and the
 // handler would never run.
 func TestShortJobTimeoutRunsHandler(t *testing.T) {
 	t.Parallel()
-	for _, jobTimeout := range []time.Duration{time.Millisecond, 4 * time.Millisecond, 20 * time.Millisecond, 100 * time.Millisecond} {
+	for _, jobTimeout := range []time.Duration{time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond} {
 		t.Run(jobTimeout.String(), func(t *testing.T) {
 			t.Parallel()
 			dsn := "file:" + filepath.Join(t.TempDir(), "claim.db") + "?_journal_mode=WAL&_busy_timeout=1000"

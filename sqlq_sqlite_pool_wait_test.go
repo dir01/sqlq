@@ -51,7 +51,7 @@ func TestHandlerNotRunAfterClaimExpiredInPoolWait(t *testing.T) {
 
 	const (
 		jobType    = "pool_wait"
-		jobTimeout = 200 * time.Millisecond // The claim is two times longer.
+		jobTimeout = 200 * time.Millisecond // The claim is 300ms.
 	)
 	dsn := "file:" + filepath.Join(t.TempDir(), "pool.db") + "?_journal_mode=WAL&_busy_timeout=1000"
 	newQueue := func(tracer trace.Tracer) (sqlq.JobsQueue, *sql.DB) {

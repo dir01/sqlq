@@ -45,11 +45,15 @@ func localClaimDeadline(timeout time.Duration) time.Time {
 // Start: the worker gets a connection and, if necessary, extends the claim.
 // Finish: the handler returns and the worker writes the result.
 
+// minJobTimeout is the shortest job timeout. The job timeout options raise a shorter value to it.
+// Thus, the gap is at least 25ms, and half of it is sufficient for the start: claimBudget removes
+// up to 2ms, and the extension needs a round trip to the database.
+const minJobTimeout = 50 * time.Millisecond
+
 // claimGap returns the claim time in addition to the job timeout: half the job timeout,
-// but at most one minute. It is at least 10ms, because claimBudget removes up to 2ms,
-// and that must leave time for the start in very short claims.
+// but at most one minute.
 func claimGap(jobTimeout time.Duration) time.Duration {
-	return max(min(time.Minute, jobTimeout/2), 10*time.Millisecond)
+	return min(time.Minute, jobTimeout/2)
 }
 
 // claimLength returns the length of each new claim and each extension.

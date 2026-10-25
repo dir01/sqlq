@@ -110,7 +110,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	defer cancel()
 
 	const (
-		jobTimeout = 50 * time.Millisecond // The claim is 100ms.
+		jobTimeout = 50 * time.Millisecond // The claim is 75ms.
 		lockHeld   = 300 * time.Millisecond
 	)
 	dsn := "file:" + filepath.Join(t.TempDir(), "lock.db") + "?_journal_mode=WAL&_busy_timeout=100"

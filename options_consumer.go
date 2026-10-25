@@ -78,11 +78,12 @@ func WithConsumerMaxRetries(maxRetries int32) ConsumerOption {
 // The job timeout also sets the claim: other consumers can take a fetched job after the job
 // timeout plus half of it (at most one minute more). Before a handler starts, the worker
 // extends the claim if necessary.
+// The option ignores a zero or negative timeout, and raises a timeout shorter than 50ms to 50ms.
 // You may also configure default value for all consumers, see WithDefaultJobTimeout.
 func WithConsumerJobTimeout(timeout time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		if timeout > 0 { // Only set positive timeouts
-			o.jobTimeout = timeout
+		if timeout > 0 {
+			o.jobTimeout = max(timeout, minJobTimeout)
 		}
 	}
 }

@@ -167,11 +167,12 @@ the retry count: a prefetched job may never have started. Polling discovers expi
 claims even without a new publish notification.
 
 The job timeout sets the claim. Each claim and each extension lasts the job timeout
-plus a gap: half the job timeout, at most one minute, and at least 10ms. Before a
-worker starts a handler, it examines the claim. If less than the job timeout plus
-half the gap is left, the worker extends the claim with its token. It examines the
-claim again when it has a connection for the handler. The other half of the gap is
-for the handler to return and for the result writes. A fresh claim needs no extension.
+plus a gap: half the job timeout, at most one minute. The job timeout is at least
+50ms; the options raise a shorter value. Before a worker starts a handler, it
+examines the claim. If less than the job timeout plus half the gap is left, the
+worker extends the claim with its token. It examines the claim again when it has a
+connection for the handler. The other half of the gap is for the handler to return
+and for the result writes. A fresh claim needs no extension.
 Expired local copies are discarded; a failed ownership check prevents the handler
 from starting.
 
