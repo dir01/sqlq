@@ -10,24 +10,6 @@ import (
 // ConsumerOption defines functional options for Subscribe
 type ConsumerOption func(*consumer)
 
-// WithConsumerClaimTimeout sets how long a consumer holds a fetched job before other
-// consumers can take it. The default is two times the job timeout (30 minutes by default),
-// or the shortest accepted timeout if that is longer.
-// The time starts at the fetch. Thus, the time in the buffer counts. Before a worker starts
-// a handler, it extends the claim if the remaining time is less than the job timeout plus a margin.
-// The claim does not extend while the handler runs. Consume returns ErrClaimTimeoutTooShort
-// if the claim timeout is shorter than the sum of: the job timeout, the margin (half of the
-// job timeout, maximum one minute), a quarter of the job timeout for the extension (maximum
-// one second), and 2ms. Two times the job timeout is sufficient for all job timeouts of 8ms or more.
-// The option ignores values less than 2ms.
-func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
-	return func(c *consumer) {
-		if claimBudget(timeout) > 0 {
-			c.claimTimeout = timeout
-		}
-	}
-}
-
 // WithConsumerConcurrency sets the number of concurrent workers for a given consumer
 // You may also configure default value for all consumers, see WithDefaultConcurrency.
 func WithConsumerConcurrency(concurrency uint16) ConsumerOption {
@@ -93,6 +75,9 @@ func WithConsumerMaxRetries(maxRetries int32) ConsumerOption {
 // WithConsumerJobTimeout sets a maximum execution duration for a single job handler invocation.
 // If the handler exceeds this duration, its context will be canceled.
 // A timeout is treated as a job failure.
+// The job timeout also sets the claim: other consumers can take a fetched job after the job
+// timeout plus half of it (at most one minute more). Before a handler starts, the worker
+// extends the claim if necessary.
 // You may also configure default value for all consumers, see WithDefaultJobTimeout.
 func WithConsumerJobTimeout(timeout time.Duration) ConsumerOption {
 	return func(o *consumer) {

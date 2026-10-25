@@ -64,7 +64,6 @@ func TestReadinessWorkerProcess(t *testing.T) { //nolint:paralleltest // The par
 	})
 	defer cons.cancel()
 	cons.jobTimeout = 5 * time.Second
-	cons.claimTimeout = 15 * time.Second
 	cons.processJob(&jobs[0])
 	require.True(t, once.Load())
 	require.False(t, called.Load(), "the handler ran after the claim expired while its transaction began")

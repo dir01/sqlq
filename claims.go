@@ -25,7 +25,6 @@ func claimKey(j job) string {
 // It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
 // It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
 // so the claim start it stores can be up to 1ms before the real time.
-// WithConsumerClaimTimeout and WithDefaultClaimTimeout ignore a timeout when this returns zero or less.
 func claimBudget(timeout time.Duration) time.Duration {
 	return timeout.Truncate(time.Millisecond) - time.Millisecond
 }
@@ -33,33 +32,35 @@ func claimBudget(timeout time.Duration) time.Duration {
 // localClaimDeadline returns the last time a worker can start a job without asking the database.
 // getJobsForConsumer and extendClaim in each driver call it before they send their UPDATE,
 // so it is never later than the expiry the database stores. processJob compares it with
-// the current time before it runs the handler (see claimTimeNeeded).
+// the current time before it runs the handler (see claimTimeToStart).
 func localClaimDeadline(timeout time.Duration) time.Time {
 	return time.Now().Add(claimBudget(timeout))
 }
 
-// A claim that is sufficiently long for one job has these parts:
+// Each new claim and each extension lasts the job timeout plus a gap. The gap has two halves:
 //
-//	| start time | job timeout | finish time |
-//	             ^ the handler starts; claimTimeNeeded must be left
+//	| start | job timeout | finish |
+//	        ^ the handler starts; claimTimeToStart must be left
 //
-// Start time: the worker gets a connection and, if necessary, extends the claim.
-// Finish time: the handler returns and the worker writes the result.
+// Start: the worker gets a connection and, if necessary, extends the claim.
+// Finish: the handler returns and the worker writes the result.
 
-// claimTimeNeeded returns the claim time that must be left when a handler starts.
-// If less time is left, processJob extends the claim first.
-func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
-	finishTime := min(time.Minute, jobTimeout/2)
-	return jobTimeout + finishTime
+// claimGap returns the claim time in addition to the job timeout: half the job timeout,
+// but at most one minute. It is at least 10ms, because claimBudget removes up to 2ms,
+// and that must leave time for the start in very short claims.
+func claimGap(jobTimeout time.Duration) time.Duration {
+	return max(min(time.Minute, jobTimeout/2), 10*time.Millisecond)
 }
 
-// minClaimTimeout returns the shortest claim timeout that a consumer accepts.
-// With a shorter timeout, each extension leaves less than claimTimeNeeded,
-// so the worker extends the claim again and again, and the handler never starts.
-func minClaimTimeout(jobTimeout time.Duration) time.Duration {
-	startTime := min(time.Second, jobTimeout/4)
-	rounding := 2 * time.Millisecond // claimBudget removes up to 2ms
-	return startTime + claimTimeNeeded(jobTimeout) + rounding
+// claimLength returns the length of each new claim and each extension.
+func claimLength(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + claimGap(jobTimeout)
+}
+
+// claimTimeToStart returns the claim time that must be left when a handler starts.
+// If less time is left, processJob extends the claim first.
+func claimTimeToStart(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + claimGap(jobTimeout)/2
 }
 
 // newClaimToken returns a random string for one claim request (128 random bits, base32).

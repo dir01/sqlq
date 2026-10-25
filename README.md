@@ -158,8 +158,7 @@ workers run without an additional batch waiting outside the channel.
 
 ```go
 q.Consume(ctx, "numbered_job", handler,
-    sqlq.WithConsumerJobTimeout(10*time.Minute),
-    sqlq.WithConsumerClaimTimeout(30*time.Minute))
+    sqlq.WithConsumerJobTimeout(10*time.Minute)) // Claims last 11 minutes.
 ```
 
 Claims start at fetch time, including time in the local buffer. Another consumer
@@ -167,15 +166,14 @@ can recover unfinished jobs after their claims expire. Recovery does not increme
 the retry count: a prefetched job may never have started. Polling discovers expired
 claims even without a new publish notification.
 
-The claim timeout defaults to twice the job timeout. Before a worker starts a
-handler, it checks a conservative local deadline. If less than the job timeout plus
-a margin (half the job timeout, at most one minute) remains, it extends the claim
-using its token, and checks again once it has a connection for the handler. So the
-claim timeout must cover that much and the extension's round trip: at least the job
-timeout, plus the margin, plus a quarter of the job timeout (at most one second),
-plus 2ms. Otherwise `Consume` returns `ErrClaimTimeoutTooShort`. Twice the job
-timeout is always enough for job timeouts of 8ms or more. Fresh claims need no additional database query. Expired local
-copies are discarded; a failed ownership check prevents the handler from starting.
+The job timeout sets the claim. Each claim and each extension lasts the job timeout
+plus a gap: half the job timeout, at most one minute, and at least 10ms. Before a
+worker starts a handler, it examines the claim. If less than the job timeout plus
+half the gap is left, the worker extends the claim with its token. It examines the
+claim again when it has a connection for the handler. The other half of the gap is
+for the handler to return and for the result writes. A fresh claim needs no extension.
+Expired local copies are discarded; a failed ownership check prevents the handler
+from starting.
 
 Claims are not renewed while a handler runs, and claim expiry does not cancel it.
 The job timeout does, and cancellation is cooperative: a handler that ignores its
@@ -300,7 +298,7 @@ the library defaults are:
 | Prefetch | Consumer's concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
 | Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
-| Claim timeout | 2 × job timeout (30 minutes) | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |
+| Claim | Job timeout + half of it, at most 1 minute more (16 minutes) | — (follows the job timeout) | — |
 | Retry delay | Exponential backoff with jitter, to a maximum of 24 hours | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
 | Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
 | Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |

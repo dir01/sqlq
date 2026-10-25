@@ -193,7 +193,7 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 	defer func() { require.NoError(t, workerDB.Close()) }()
 	q, err := New(workerDB, DBTypePostgres,
 		WithDefaultConcurrency(2), WithDefaultPrefetchCount(2), WithDefaultPollDelayFunc(func(uint16) time.Duration { return 20 * time.Millisecond }),
-		WithDefaultJobTimeout(2*time.Second), WithDefaultClaimTimeout(5*time.Second),
+		WithDefaultJobTimeout(2*time.Second),
 		WithDefaultMaxRetries(-1), WithDefaultBackoffFunc(func(uint16) time.Duration { return 0 }),
 		WithDefaultCleanupProcessedInterval(0), WithDefaultCleanupDLQInterval(0))
 	require.NoError(t, err)

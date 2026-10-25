@@ -36,7 +36,6 @@ type consumer struct {
 	jobType                  string
 	workerWg                 sync.WaitGroup // Used to make sure that all scheduled goroutines stopped
 	claimsMutex              sync.Mutex
-	claimTimeout             time.Duration
 	jobTimeout               time.Duration // After this amount a time job context will be canceled
 	cleanupProcessedInterval time.Duration // How often this consumer cleans up processed jobs
 	cleanupProcessedAge      time.Duration // Min age a processed job should be to be considered for cleanup
@@ -171,7 +170,7 @@ func (cons *consumer) fetchJobs(ctx context.Context) (bool, error) {
 	if capacity <= 0 {
 		return true, nil
 	}
-	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, uint16(capacity), cons.claimTimeout)
+	jobs, err := cons.driver.getJobsForConsumer(ctx, cons.jobType, uint16(capacity), claimLength(cons.jobTimeout))
 	if err != nil {
 		// Don't wrap error here, let the poller handle logging/backoff
 		return false, err
@@ -299,7 +298,7 @@ func (cons *consumer) processJob(j *job) {
 		}
 		// BeginTx can wait for a pool connection. During that time, the claim can expire, and a
 		// different consumer can complete the job. Thus, examine the claim again before the handler starts.
-		if time.Until(j.ClaimExpiresAt) >= claimTimeNeeded(cons.jobTimeout) {
+		if time.Until(j.ClaimExpiresAt) >= claimTimeToStart(cons.jobTimeout) {
 			break
 		}
 		_ = tx.Rollback() // The extension of the claim can need this connection.
@@ -381,10 +380,10 @@ func (cons *consumer) ensureClaimTime(j *job) error {
 	if remaining <= 0 {
 		return errClaimExpired
 	}
-	if remaining >= claimTimeNeeded(cons.jobTimeout) {
+	if remaining >= claimTimeToStart(cons.jobTimeout) {
 		return nil
 	}
-	deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
+	deadline, err := cons.driver.extendClaim(cons.ctx, *j, claimLength(cons.jobTimeout))
 	if err != nil {
 		if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
 			log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)

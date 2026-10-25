@@ -80,10 +80,6 @@ var (
 	ErrJobNotFound = errors.New("job not found")
 	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
-	// ErrClaimTimeoutTooShort means that the claim timeout is shorter than the job timeout plus the
-	// margin that a worker needs before it starts a handler (see WithConsumerClaimTimeout).
-	// Then handlers continue after their claims expire, or they never start.
-	ErrClaimTimeoutTooShort = errors.New("claim timeout is too short for the job timeout")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
 )
@@ -119,9 +115,6 @@ type sqlq struct {
 	// Function for calculating how much of a delay to use when rescheduling a failed job.
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
-
-	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
-	defaultClaimTimeout time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
 	// Individual consumers may override this using WithConsumerJobTimeout.
@@ -208,7 +201,6 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultPrefetchCount:            0,
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
-		defaultClaimTimeout:             0,
 		defaultBackoffFunc:              exponentialBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
@@ -337,7 +329,6 @@ func (q *sqlq) Consume(
 		maxRetries:               q.defaultMaxRetries,
 		pollDelayFunc:            q.defaultPollDelayFunc,
 		jobTimeout:               q.defaultJobTimeout,
-		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]job),
 		backoffFunc:              q.defaultBackoffFunc,
 		cleanupBatch:             q.defaultCleanupBatch,
@@ -366,15 +357,6 @@ func (q *sqlq) Consume(
 	// it would only leave workers idle between polls.
 	if cons.prefetchCount < cons.concurrency {
 		cons.prefetchCount = cons.concurrency
-	}
-	if cons.claimTimeout == 0 {
-		// Leaves about as much claim time for the buffer as for the handler.
-		cons.claimTimeout = max(2*cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
-	}
-	if cons.claimTimeout < minClaimTimeout(cons.jobTimeout) {
-		cancel()
-		return fmt.Errorf("%w: claim timeout %s, job timeout %s, at least %s needed",
-			ErrClaimTimeoutTooShort, cons.claimTimeout, cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
 	}
 	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
 		cancel()

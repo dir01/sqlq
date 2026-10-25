@@ -198,7 +198,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 			extensions int
 			called     bool
 		}{
-			// testClaimConsumer has a 10s job timeout, so a handler needs 15s of claim time.
+			// testClaimConsumer has a 10s job timeout, so a handler needs 12.5s of claim time.
 			{"fresh", time.Minute, 0, true},
 			{"enough for job timeout and margin", 20 * time.Second, 0, true},
 			{"enough for job timeout but not margin", 12 * time.Second, 1, true},
@@ -423,75 +423,20 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	})
 }
 
-func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
-	t.Parallel()
-	for timeout, accepted := range map[time.Duration]bool{
-		time.Millisecond: false, 1999 * time.Microsecond: false, 2 * time.Millisecond: true,
-	} {
-		cons := &consumer{} //nolint:exhaustruct
-		WithConsumerClaimTimeout(timeout)(cons)
-		q := &sqlq{} //nolint:exhaustruct
-		WithDefaultClaimTimeout(timeout)(q)
-		want := time.Duration(0)
-		if accepted {
-			want = timeout
-		}
-		require.Equal(t, want, cons.claimTimeout, timeout)
-		require.Equal(t, want, q.defaultClaimTimeout, timeout)
-	}
-}
-
-func TestConsumeClaimTimeout(t *testing.T) {
+func TestClaimLength(t *testing.T) {
 	t.Parallel()
 	for _, scenario := range []struct {
-		name      string
-		err       error
-		queueOpts []NewOption
-		consOpts  []ConsumerOption
-		want      time.Duration
+		jobTimeout, length, timeToStart time.Duration
 	}{
-		{"defaults to twice the job timeout", nil, nil, nil, 2 * defaultJobTimeout},
-		{"follows a consumer job timeout", nil, nil, []ConsumerOption{WithConsumerJobTimeout(time.Hour)}, 2 * time.Hour},
-		{"follows a queue job timeout", nil, []NewOption{WithDefaultJobTimeout(time.Hour)}, nil, 2 * time.Hour},
-		{
-			"consumer claim timeout wins", nil, []NewOption{WithDefaultClaimTimeout(time.Hour)},
-			[]ConsumerOption{WithConsumerClaimTimeout(20 * time.Minute)}, 20 * time.Minute,
-		},
-		{
-			"claim timeout equal to job timeout is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerClaimTimeout(defaultJobTimeout)}, 0,
-		},
-		{
-			"claim timeout shorter than a worker needs before it starts a handler is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1100 * time.Millisecond)}, 0,
-		},
-		{
-			"claim timeout with no time for its extension is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(claimTimeNeeded(time.Second) + 2*time.Millisecond)}, 0,
-		},
-		{
-			"shortest claim timeout is accepted", nil, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1752 * time.Millisecond)}, 1752 * time.Millisecond,
-		},
-		{
-			"default covers a very short job timeout", nil, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(4 * time.Millisecond)}, 9 * time.Millisecond,
-		},
-		{
-			"queue claim timeout shorter than consumer job timeout is rejected", ErrClaimTimeoutTooShort,
-			[]NewOption{WithDefaultClaimTimeout(time.Hour)}, []ConsumerOption{WithConsumerJobTimeout(2 * time.Hour)}, 0,
-		},
+		{15 * time.Minute, 16 * time.Minute, 15*time.Minute + 30*time.Second}, // the gap stops at one minute
+		{10 * time.Second, 15 * time.Second, 12500 * time.Millisecond},        // the gap is half the job timeout
+		{4 * time.Millisecond, 14 * time.Millisecond, 9 * time.Millisecond},   // the gap is at least 10ms
 	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			t.Parallel()
-			cons, err := consumeOnTestQueue(t, scenario.queueOpts, scenario.consOpts)
-			if scenario.err != nil {
-				require.ErrorIs(t, err, scenario.err)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, scenario.want, cons.claimTimeout)
-		})
+		require.Equal(t, scenario.length, claimLength(scenario.jobTimeout), scenario.jobTimeout)
+		require.Equal(t, scenario.timeToStart, claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
+		// After an extension, the claim must still have claimTimeToStart left after the rounding
+		// in claimBudget. Otherwise, the worker extends the claim again and again.
+		require.Greater(t, claimBudget(claimLength(scenario.jobTimeout)), claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
 	}
 }
 
@@ -579,9 +524,9 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 	return &consumer{ //nolint:exhaustruct
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
-		metrics:      noopMetrics(),
-		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
-		claims: make(map[string]job), concurrency: 1, prefetchCount: 1,
+		metrics:    noopMetrics(),
+		jobTimeout: 10 * time.Second,
+		claims:     make(map[string]job), concurrency: 1, prefetchCount: 1,
 		pollDelayFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
