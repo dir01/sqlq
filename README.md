@@ -125,7 +125,7 @@ make execution later. [Full delay demo](demo/delay/README.md).
 ```go
 q.Consume(ctx, "retry_demo", handler,
     sqlq.WithConsumerMaxRetries(2),
-    sqlq.WithConsumerBackoffFunc(func(uint16) time.Duration { return time.Second }))
+    sqlq.WithConsumerBackoffFunc(func(retryNum uint16) time.Duration { return time.Second }))
 // In handler: info, _ := sqlq.JobInfoFromContext(ctx)
 // info.RetryCount is 0 on the first attempt.
 ```

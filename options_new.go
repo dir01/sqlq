@@ -32,7 +32,7 @@ func WithMeterProvider(provider metric.MeterProvider) NewOption {
 // WithDefaultPollDelayFunc sets the function that calculates the delay to the next poll for new jobs.
 // emptyPolls is the number of polls since the last poll that found jobs. It stops at 65535.
 // The default starts at 100ms and becomes 10% longer after each poll that finds no jobs,
-// to a maximum of 30s. For a fixed interval, use func(uint16) time.Duration { return 100 * time.Millisecond }.
+// to a maximum of 30s. For a fixed interval, use func(emptyPolls uint16) time.Duration { return 100 * time.Millisecond }.
 // A zero or negative delay polls again immediately. The option ignores nil.
 // This value may be overridden per individual consumer, see WithConsumerPollDelayFunc.
 func WithDefaultPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duration) NewOption {
@@ -46,7 +46,7 @@ func WithDefaultPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duratio
 // WithDefaultBackoffFunc allows to configure default backoff function.
 // The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
-func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
+func WithDefaultBackoffFunc(backoffFunc func(retryNum uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
 		q.defaultBackoffFunc = backoffFunc
 	}

@@ -35,7 +35,7 @@ func runExample(ctx context.Context, _ *sql.DB, q sqlq.JobsQueue) error {
 
 	err := q.Consume(ctx, "retry_demo", handler,
 		sqlq.WithConsumerMaxRetries(2),
-		sqlq.WithConsumerBackoffFunc(func(_ uint16) time.Duration {
+		sqlq.WithConsumerBackoffFunc(func(retryNum uint16) time.Duration { //nolint:revive // The name tells what the argument is.
 			return time.Second
 		}),
 	)
