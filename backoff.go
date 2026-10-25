@@ -43,7 +43,7 @@ func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duratio
 	// 16 doublings take even the smallest first delay past the maximum,
 	// and many more would overflow time.Duration.
 	doublings := min(retryNum, 16)
-	delay := firstDelay * time.Duration(1<<doublings)
+	delay := firstDelay * time.Duration(1<<doublings) // 1<<doublings is 2^doublings
 
 	return min(delay, fetchRetryMaxDelay)
 }

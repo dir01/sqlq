@@ -23,6 +23,7 @@ func TestExponentialBackoff(t *testing.T) {
 		{name: "retry 1", retryNum: 1, minExp: 2 * time.Second, maxExp: 2400 * time.Millisecond},
 		{name: "retry 5", retryNum: 5, minExp: 32 * time.Second, maxExp: 38400 * time.Millisecond},
 		{name: "retry 10", retryNum: 10, minExp: 1024 * time.Second, maxExp: 1228800 * time.Millisecond},
+		// 1 << 32 is 2^32
 		{name: "retry 32", retryNum: 32, minExp: (1 << 32) * time.Second, maxExp: (1 << 32) * time.Second / 5 * 6},
 	}
 
