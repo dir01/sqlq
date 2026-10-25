@@ -24,28 +24,31 @@ func exponentialBackoff(retryNum uint16) time.Duration {
 
 const (
 	// The maximum delay before the first retry of a failed fetch.
-	// Most fetch errors occur because of a short lock, and a fast retry is successful.
-	// During the delay, the consumer gets no jobs, also not from async push.
-	// Thus, a long poll interval must not cause a long delay.
+	// Most fetch errors occur because of a short lock, and one fast retry is usually successful.
 	fetchRetryMaxFirstDelay = 100 * time.Millisecond
-	// The maximum delay between retries of a failed fetch.
+	// The maximum delay between retries of a failed fetch, if the poll interval is shorter.
 	fetchRetryMaxDelay = 30 * time.Second
 )
 
 // fetchRetryBackoff returns the delay of the fetch loop after retryNum + 1 failed fetches in sequence.
 //
 // The first delay is the poll interval, but not more than fetchRetryMaxFirstDelay.
-// If the failures continue, the database is possibly not available. Then each failure
-// doubles the delay, to a maximum of fetchRetryMaxDelay.
+// If the failures continue, the database is possibly not available. Then the delay is the
+// poll interval, doubled one time for each further failure, to a maximum of fetchRetryMaxDelay
+// or the poll interval, whichever is longer. Thus, after the first retry, a failure never
+// makes the consumer fetch more frequently than its poll interval.
 func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duration {
-	firstDelay := pollInterval
-	firstDelay = max(firstDelay, time.Millisecond) // a zero delay does not increase when it doubles
-	firstDelay = min(firstDelay, fetchRetryMaxFirstDelay)
+	delay := max(pollInterval, time.Millisecond) // a zero delay does not increase when it doubles
+	if retryNum == 0 {
+		return min(delay, fetchRetryMaxFirstDelay)
+	}
 
-	// After 16 doublings, all first delays are more than the maximum.
-	// More doublings can overflow time.Duration.
-	doublings := min(retryNum, 16)
-	delay := firstDelay * time.Duration(1<<doublings) // 1<<doublings is 2^doublings
-
-	return min(delay, fetchRetryMaxDelay)
+	maxDelay := max(fetchRetryMaxDelay, delay)
+	for range retryNum {
+		if delay > maxDelay/2 { // doubling would make the delay more than maxDelay
+			return maxDelay
+		}
+		delay *= 2
+	}
+	return delay
 }

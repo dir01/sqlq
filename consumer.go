@@ -120,7 +120,7 @@ func (cons *consumer) fetchJobsLoop() {
 			span.End()
 
 			backoffTimeout := fetchRetryBackoff(attempt, cons.pollInterval)
-			if attempt < 16 {
+			if attempt < 16 { // 16 doublings are sufficient to get to the maximum delay
 				attempt++
 			}
 			select {

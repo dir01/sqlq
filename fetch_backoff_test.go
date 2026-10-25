@@ -3,6 +3,7 @@ package sqlq
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -16,15 +17,33 @@ func TestFetchRetryBackoff(t *testing.T) {
 	require.Equal(t, 5*time.Millisecond, fetchRetryBackoff(0, 5*time.Millisecond))
 	require.Equal(t, 10*time.Millisecond, fetchRetryBackoff(1, 5*time.Millisecond))
 	require.Equal(t, 100*time.Millisecond, fetchRetryBackoff(0, time.Second))
+	// After the first retry, the delay starts from the poll interval.
+	require.Equal(t, 2*time.Second, fetchRetryBackoff(1, time.Second))
 	for _, poll := range []time.Duration{time.Millisecond, 5 * time.Millisecond, time.Second} {
-		previous := time.Duration(0)
-		for _, attempt := range []uint16{0, 1, 2, 8, 16, 32, 65535} {
-			delay := fetchRetryBackoff(attempt, poll)
-			require.GreaterOrEqual(t, delay, previous)
-			require.LessOrEqual(t, delay, 30*time.Second)
-			previous = delay
+		for _, attempt := range []uint16{16, 32, 65535} {
+			require.Equal(t, 30*time.Second, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
 		}
-		require.Equal(t, 30*time.Second, previous)
+	}
+}
+
+// A persistent fetch failure must not make the consumer query the database
+// more frequently than its poll interval.
+func TestFetchRetryBackoffDoesNotExceedPollRate(t *testing.T) {
+	t.Parallel()
+	for _, poll := range []time.Duration{time.Minute, 5 * time.Minute} {
+		require.Equal(t, fetchRetryMaxFirstDelay, fetchRetryBackoff(0, poll))
+		for _, attempt := range []uint16{1, 2, 16, 65535} {
+			require.Equal(t, poll, fetchRetryBackoff(attempt, poll), "poll interval %s, attempt %d", poll, attempt)
+		}
+	}
+}
+
+// Doubling a very long poll interval must not overflow time.Duration.
+func TestFetchRetryBackoffLongPollIntervalDoesNotOverflow(t *testing.T) {
+	t.Parallel()
+	poll := time.Duration(math.MaxInt64)
+	for _, attempt := range []uint16{1, 16, 65535} {
+		require.Equal(t, poll, fetchRetryBackoff(attempt, poll))
 	}
 }
 
