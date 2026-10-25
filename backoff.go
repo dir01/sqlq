@@ -7,14 +7,13 @@ import (
 )
 
 // exponentialBackoff is the default backoff function. The delay is 2^retryNum seconds,
-// plus a random jitter of up to 20%. The jitter prevents a retry of all failed jobs at the same time.
-// The consumer limits the delay to maxBackoff. For a different behavior, set a different
-// function with WithDefaultBackoffFunc or WithConsumerBackoffFunc.
+// plus a random jitter of up to 20%, to a maximum of 24 hours. The jitter prevents a retry
+// of all failed jobs at the same time. For a different behavior, also a different maximum,
+// set a different function with WithDefaultBackoffFunc or WithConsumerBackoffFunc.
 func exponentialBackoff(retryNum uint16) time.Duration {
-	// Above 2^32 seconds (approximately 136 years), the delay and the jitter overflow time.Duration.
-	// Then the delay is negative or zero, and the job retries immediately.
-	if retryNum > 32 {
-		return math.MaxInt64
+	// 2^17 seconds is more than 24 hours. 2^16 seconds plus the jitter is less.
+	if retryNum > 16 {
+		return 24 * time.Hour
 	}
 	delay := time.Duration(1<<retryNum) * time.Second // 1<<retryNum is 2^retryNum
 	jitter := rand.N(delay / 5)

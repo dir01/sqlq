@@ -98,7 +98,6 @@ var (
 	defaultCleanupDLQInterval              = 6 * time.Hour
 	defaultCleanupDLQAge                   = 30 * 24 * time.Hour
 	defaultCleanupBatch             uint16 = 500
-	defaultMaxBackoff                      = 24 * time.Hour
 )
 
 // sqlq implements the JobsQueue interface using SQL databases
@@ -123,8 +122,6 @@ type sqlq struct {
 	defaultPollInterval time.Duration
 	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
 	defaultClaimTimeout time.Duration
-	// The maximum delay before a retry, for all consumers. See WithMaxBackoff.
-	maxBackoff time.Duration
 
 	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
 	// Individual consumers may override this using WithConsumerJobTimeout.
@@ -213,7 +210,6 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		defaultJobTimeout:               defaultJobTimeout,
 		defaultClaimTimeout:             0,
 		defaultBackoffFunc:              exponentialBackoff,
-		maxBackoff:                      defaultMaxBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
 		defaultCleanupDLQInterval:       defaultCleanupDLQInterval,
@@ -344,7 +340,6 @@ func (q *sqlq) Consume(
 		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]job),
 		backoffFunc:              q.defaultBackoffFunc,
-		maxBackoff:               q.maxBackoff,
 		cleanupBatch:             q.defaultCleanupBatch,
 		cleanupProcessedInterval: q.defaultCleanupProcessedInterval,
 		cleanupProcessedAge:      q.defaultCleanupProcessedAge,

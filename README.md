@@ -137,9 +137,8 @@ path. [Full retry demo](demo/retry/README.md).
 `JobInfo.RetryCount` and `DeadLetterJob.RetryCount` are `uint32`. Counts saturate
 at 2,147,483,647 (the PostgreSQL integer limit); unlimited retries continue at
 that value. Existing `func(uint16) time.Duration` backoff callbacks are retained,
-with their argument saturating at 65,535. Retry delays, from the default
-exponential backoff or your own function, are capped at 24 hours; change that
-with `WithMaxBackoff`.
+with their argument saturating at 65,535. The default exponential backoff stops
+at 24 hours. Your own function sets its own maximum.
 
 ## 6. Process jobs concurrently
 
@@ -303,8 +302,7 @@ the library defaults are:
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
 | Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
 | Claim timeout | 2 × job timeout (30 minutes) | `WithDefaultClaimTimeout` | `WithConsumerClaimTimeout` |
-| Retry delay | Exponential backoff with jitter | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
-| Maximum retry delay | 24 hours | `WithMaxBackoff` | — |
+| Retry delay | Exponential backoff with jitter, to a maximum of 24 hours | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
 | Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
 | Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |
 | DLQ cleanup interval | 6 hours | `WithDefaultCleanupDLQInterval` | `WithConsumerCleanupDLQInterval` |

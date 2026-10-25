@@ -49,17 +49,6 @@ func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
 	}
 }
 
-// WithMaxBackoff sets the maximum delay before a retry of a failed job.
-// It applies to the default exponential backoff, and to the functions from WithDefaultBackoffFunc
-// and WithConsumerBackoffFunc. The default is 24 hours. The option ignores a zero or negative value.
-func WithMaxBackoff(maxBackoff time.Duration) NewOption {
-	return func(q *sqlq) {
-		if maxBackoff > 0 {
-			q.maxBackoff = maxBackoff
-		}
-	}
-}
-
 // WithDefaultConcurrency sets default number of concurrent workers for a new consumer.
 // This value may be overridden per individual consumer, see WithConsumerConcurrency.
 func WithDefaultConcurrency(concurrency uint16) NewOption {
