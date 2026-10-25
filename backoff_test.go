@@ -19,32 +19,11 @@ func TestExponentialBackoff(t *testing.T) {
 		minExp   time.Duration
 		maxExp   time.Duration
 	}{
-		{
-			name:     "retry 0",
-			retryNum: 0,
-			minExp:   time.Second, // 2^0 = 1s
-			// Adjust maxExp slightly for the zero case to make the range check work.
-			// We expect exactly 1s, so the range should be [1s, 1s + epsilon).
-			maxExp: time.Second + time.Nanosecond,
-		},
-		{
-			name:     "retry 1",
-			retryNum: 1,
-			minExp:   2 * time.Second, // 2^1 = 2s
-			maxExp:   3 * time.Second, // 2s + 1s jitter = 3s
-		},
-		{
-			name:     "retry 5",
-			retryNum: 5,
-			minExp:   time.Duration(math.Pow(2, 5)) * time.Second,   // 32s
-			maxExp:   time.Duration(math.Pow(2, 5)+5) * time.Second, // 32s + 5s jitter = 37s
-		},
-		{
-			name:     "retry 10",
-			retryNum: 10,
-			minExp:   time.Duration(math.Pow(2, 10)) * time.Second,    // 1024s
-			maxExp:   time.Duration(math.Pow(2, 10)+10) * time.Second, // 1024s + 10s jitter = 1034s
-		},
+		{name: "retry 0", retryNum: 0, minExp: time.Second, maxExp: 1200 * time.Millisecond},
+		{name: "retry 1", retryNum: 1, minExp: 2 * time.Second, maxExp: 2400 * time.Millisecond},
+		{name: "retry 5", retryNum: 5, minExp: 32 * time.Second, maxExp: 38400 * time.Millisecond},
+		{name: "retry 10", retryNum: 10, minExp: 1024 * time.Second, maxExp: 1228800 * time.Millisecond},
+		{name: "retry 32", retryNum: 32, minExp: (1 << 32) * time.Second, maxExp: (1 << 32) * time.Second / 5 * 6},
 	}
 
 	for _, tc := range testCases {
@@ -52,12 +31,18 @@ func TestExponentialBackoff(t *testing.T) {
 			t.Parallel()
 
 			// Run multiple times to account for randomness
+			durations := make(map[time.Duration]bool)
 			for range 100 {
 				duration := exponentialBackoff(tc.retryNum)
 				if duration < tc.minExp || duration >= tc.maxExp {
 					t.Errorf("exponentialBackoff(%d) = %v; want between [%v, %v)",
 						tc.retryNum, duration, tc.minExp, tc.maxExp)
 				}
+				durations[duration] = true
+			}
+			// Jobs that failed together must not all retry together, from the first retry on.
+			if len(durations) < 2 {
+				t.Errorf("exponentialBackoff(%d) returned only %v; want jitter", tc.retryNum, durations)
 			}
 		})
 	}

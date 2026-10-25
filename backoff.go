@@ -2,25 +2,22 @@ package sqlq
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"time"
 )
 
-// exponentialBackoff is the default backoff function: 2^retryNum seconds,
-// plus up to retryNum seconds of random jitter. Consumers cap it at their maxBackoff.
+// exponentialBackoff is the default backoff function: 2^retryNum seconds, plus up to
+// 20% of that at random, so that jobs which failed together don't all retry together.
+// Consumers cap it at their maxBackoff. For any other behavior, set a backoff function
+// of your own with WithDefaultBackoffFunc or WithConsumerBackoffFunc.
 func exponentialBackoff(retryNum uint16) time.Duration {
-	// 2^33 seconds (about 272 years) is the largest power of two in seconds
-	// that a time.Duration can hold. Past it, the delay would overflow into a
-	// negative or zero duration, and the job would be retried at once.
-	if retryNum > 33 {
+	// Past 2^32 seconds (about 136 years), the delay with its jitter would overflow
+	// time.Duration into a negative or zero duration, and the job would be retried at once.
+	if retryNum > 32 {
 		return math.MaxInt64
 	}
-	delay := time.Duration(1<<retryNum) * time.Second
-
-	var jitter time.Duration
-	if retryNum > 0 {
-		jitter = time.Duration(rand.Intn(int(retryNum))) * time.Second
-	}
+	delay := time.Duration(1<<retryNum) * time.Second // 1<<retryNum is 2^retryNum
+	jitter := rand.N(delay / 5)
 
 	return delay + jitter
 }
