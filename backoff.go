@@ -5,25 +5,49 @@ import (
 	"time"
 )
 
-func exponentialBackoff(retryNum uint16) time.Duration {
-	// Bound the exponent before shifting/converting. Unlimited retries must
-	// never overflow time.Duration into a negative or zero retry delay.
-	const maximum = 24 * time.Hour
-	if retryNum >= 17 {
-		return maximum
+// exponentialBackoff returns the default backoff function: 2^retryNum seconds,
+// plus up to retryNum seconds of random jitter, but never more than maxDelay.
+func exponentialBackoff(maxDelay time.Duration) func(retryNum uint16) time.Duration {
+	return func(retryNum uint16) time.Duration {
+		// 2^33 seconds (about 272 years) is the largest power of two in seconds
+		// that a time.Duration can hold. Past it, the delay would overflow into a
+		// negative or zero duration, and the job would be retried at once.
+		if retryNum > 33 {
+			return maxDelay
+		}
+		delay := time.Duration(1<<retryNum) * time.Second
+
+		var jitter time.Duration
+		if retryNum > 0 {
+			jitter = time.Duration(rand.Intn(int(retryNum))) * time.Second
+		}
+
+		return min(delay+jitter, maxDelay)
 	}
-	var jitter time.Duration
-	if retryNum > 0 {
-		// Add jitter: up to retryNum seconds
-		jitter = time.Duration(rand.Intn(int(retryNum))) * time.Second
-	}
-	return min(time.Duration(uint64(1)<<retryNum)*time.Second+jitter, maximum)
 }
 
-// Claim fetch failures often represent short lock contention, not a database
-// outage. Start near the polling interval, then back off exponentially for a
-// persistent failure. Bound both the shift and delay so recovery stays possible.
-func fetchRetryBackoff(retryNum uint16, poll time.Duration) time.Duration {
-	base := min(max(poll, time.Millisecond), 100*time.Millisecond)
-	return min(base*time.Duration(uint64(1)<<min(retryNum, 16)), 30*time.Second)
+const (
+	// The first retry after a failed fetch comes no later than this,
+	// even when the poll interval is longer.
+	fetchRetryMaxFirstDelay = 100 * time.Millisecond
+	// Retries after failed fetches are never further apart than this.
+	fetchRetryMaxDelay = 30 * time.Second
+)
+
+// fetchRetryBackoff returns how long the fetch loop waits after retryNum + 1 failed fetches in a row.
+//
+// A failed fetch usually means brief lock contention, not a database outage. So the first retry
+// comes one poll interval later, or sooner if the poll interval is long. If the fetches keep
+// failing, the database may be down, so each further failure doubles the delay, up to a maximum.
+func fetchRetryBackoff(retryNum uint16, pollInterval time.Duration) time.Duration {
+	firstDelay := pollInterval
+	firstDelay = max(firstDelay, time.Millisecond) // a zero delay would never grow by doubling
+	firstDelay = min(firstDelay, fetchRetryMaxFirstDelay)
+
+	// 16 doublings take even the smallest first delay past the maximum,
+	// and many more would overflow time.Duration.
+	doublings := min(retryNum, 16)
+	delay := firstDelay * time.Duration(1<<doublings)
+
+	return min(delay, fetchRetryMaxDelay)
 }

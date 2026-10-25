@@ -130,7 +130,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				require.Equal(t, 1, healthy)
 				require.Equal(t, []uint32{initial, min(initial+1, 2147483647), min(initial+2, 2147483647)}, retries)
 				require.Equal(t, []uint16{65535, 65535, 65535}, backoffs)
-				require.Equal(t, 24*time.Hour, exponentialBackoff(65535))
+				require.Equal(t, 24*time.Hour, exponentialBackoff(defaultMaxBackoff)(65535))
 			})
 		}
 		t.Run("finite-limit-above-uint16", func(t *testing.T) {

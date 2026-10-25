@@ -233,8 +233,8 @@ func (cons *consumer) processJob(j *job) {
 	if cons.ctx.Err() != nil {
 		return
 	}
-	var ok bool
-	if ok, settled = cons.ensureClaimTime(j); !ok {
+	if err := cons.ensureClaimTime(j); err != nil {
+		settled = errors.Is(err, ErrClaimLost)
 		return
 	}
 	parentCtx := otel.GetTextMapPropagator().Extract(cons.ctx, propagation.MapCarrier(j.TraceContext))
@@ -289,7 +289,8 @@ func (cons *consumer) processJob(j *job) {
 			break
 		}
 		_ = tx.Rollback() // Extending the claim may need this connection.
-		if ok, settled = cons.ensureClaimTime(j); !ok {
+		if err = cons.ensureClaimTime(j); err != nil {
+			settled = errors.Is(err, ErrClaimLost)
 			return
 		}
 	}
@@ -354,26 +355,36 @@ func (cons *consumer) processJob(j *job) {
 	settled = true
 }
 
+// errClaimExpired is returned by ensureClaimTime when the claim ran out before it could be extended.
+// Another consumer may have claimed the job since, or not.
+var errClaimExpired = errors.New("claim expired before the handler could start")
+
 // ensureClaimTime makes sure the claim on j lasts long enough to run the handler and record its result,
-// extending it if needed. It returns whether it does, and if not, whether the claim is already lost
-// (settled), so there is nothing to release.
-func (cons *consumer) ensureClaimTime(j *job) (bool, bool) {
+// extending it if needed. It returns ErrClaimLost if another consumer has claimed the job since,
+// and another error if the claim can't be made long enough for any other reason.
+func (cons *consumer) ensureClaimTime(j *job) error {
 	remaining := time.Until(j.ClaimExpiresAt)
 	if remaining <= 0 {
-		return false, false
+		return errClaimExpired
 	}
 	if remaining >= claimTimeNeeded(cons.jobTimeout) {
-		return true, false
+		return nil
 	}
 	deadline, err := cons.driver.extendClaim(cons.ctx, *j, cons.claimTimeout)
 	if err != nil {
 		if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
 			log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)
 		}
-		return false, errors.Is(err, ErrClaimLost)
+		return err
 	}
 	j.ClaimExpiresAt = deadline
-	return time.Until(deadline) > 0 && cons.ctx.Err() == nil, false
+	if err = cons.ctx.Err(); err != nil {
+		return err
+	}
+	if time.Until(deadline) <= 0 {
+		return errClaimExpired
+	}
+	return nil
 }
 
 // attemptJob runs the handler in tx, marks the job processed if the handler succeeded,
@@ -391,7 +402,7 @@ func (cons *consumer) attemptJob(ctx context.Context, span trace.Span, j *job, i
 	}
 
 	if err := cons.markJobDone(ctx, j, tx); err != nil {
-		if !errors.Is(err, errMarkInFreshTx) {
+		if !errors.Is(err, errStaleReadTx) {
 			return "fail_mark_processed", fmt.Errorf("failed to mark job %d processed: %w", j.ID, err)
 		}
 		// The handler wrote nothing, so there is nothing to commit with the mark.
@@ -420,7 +431,7 @@ func (cons *consumer) markJobDoneInFreshTx(ctx context.Context, j *job) error {
 	delay := time.Millisecond
 	for {
 		err := runInTx(ctx, cons.db, func(tx *sql.Tx) error { return cons.markJobDone(ctx, j, tx) })
-		if !errors.Is(err, errMarkInFreshTx) {
+		if !errors.Is(err, errStaleReadTx) {
 			return err
 		}
 		select {
@@ -451,7 +462,7 @@ func (cons *consumer) handleJob(ctx context.Context, j *job, info JobInfo, tx *s
 	})
 
 	if handlerErr == nil {
-		handlerErr = contextCompletionError(ctx)
+		handlerErr = ctxErrOrPassedDeadline(ctx)
 		if errors.Is(handlerErr, context.DeadlineExceeded) {
 			handlerSpan.SetAttributes(attribute.Bool("sqlq.job_timed_out", true))
 		}
@@ -568,7 +579,7 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	if err == nil {
 		// As with handlers, a hook that outlived its context failed even if it returned nil:
 		// tx doesn't share ctx, so its writes would otherwise still be committed.
-		err = contextCompletionError(ctx)
+		err = ctxErrOrPassedDeadline(ctx)
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -578,10 +589,19 @@ func (cons *consumer) runDeadLetterHook(ctx context.Context, tx *sql.Tx, info Jo
 	return err
 }
 
-// contextCompletionError also checks elapsed deadlines because cancellation is
-// delivered asynchronously. After a process pause (or scheduler delay), a
-// callback can return before the context's overdue timer callback executes.
-func contextCompletionError(ctx context.Context) error {
+// ctxErrOrPassedDeadline is ctx.Err(), except that it also reports context.DeadlineExceeded
+// once ctx's deadline has passed, even if ctx hasn't been canceled yet.
+//
+// Go cancels a context on a timer, and the timer can fire late. Say the process is paused
+// while a handler runs: the container hits its CPU quota and is throttled, the VM loses CPU
+// to steal time, or the process is suspended. When it resumes, the handler's goroutine can
+// run before the timer does. The job timeout may have passed during the pause, but a
+// handler checking ctx.Err() sees nil, finishes its work and returns nil.
+//
+// By then, the claim on the job may have expired too, and another worker may be running
+// the job. The handler's transaction doesn't use ctx, so it would still commit. Calling the
+// handler failed instead makes sqlq roll back its writes, as it does for any timed-out handler.
+func ctxErrOrPassedDeadline(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

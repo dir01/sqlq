@@ -49,12 +49,31 @@ func TestExponentialBackoff(t *testing.T) {
 
 			// Run multiple times to account for randomness
 			for range 100 {
-				duration := exponentialBackoff(tc.retryNum)
+				duration := exponentialBackoff(defaultMaxBackoff)(tc.retryNum)
 				if duration < tc.minExp || duration >= tc.maxExp {
 					t.Errorf("exponentialBackoff(%d) = %v; want between [%v, %v)",
 						tc.retryNum, duration, tc.minExp, tc.maxExp)
 				}
 			}
 		})
+	}
+}
+
+func TestExponentialBackoffMaximum(t *testing.T) {
+	t.Parallel()
+
+	backoff := exponentialBackoff(time.Minute)
+	if got := backoff(5); got >= time.Minute {
+		t.Errorf("backoff(5) = %v; want below the maximum", got)
+	}
+	// Every retry number from where the delay reaches the maximum, past where
+	// 2^retryNum seconds would overflow time.Duration, gets exactly the maximum.
+	for retryNum := uint16(6); retryNum < 100; retryNum++ {
+		if got := backoff(retryNum); got != time.Minute {
+			t.Errorf("backoff(%d) = %v; want %v", retryNum, got, time.Minute)
+		}
+	}
+	if got := backoff(65535); got != time.Minute {
+		t.Errorf("backoff(65535) = %v; want %v", got, time.Minute)
 	}
 }

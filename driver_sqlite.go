@@ -670,7 +670,7 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 		// here means the handler wrote nothing, unless it could write another database (see wroteNothing).
 		// Rollback-journal mode gives no such guarantee.
 		if isSQLiteBusy(err) && wroteNothing(ctx, tx) {
-			err = fmt.Errorf("%w: %w", errMarkInFreshTx, err)
+			err = fmt.Errorf("%w: %w", errStaleReadTx, err)
 		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to mark job as processed")

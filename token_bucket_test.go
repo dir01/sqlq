@@ -131,6 +131,28 @@ func TestTokenBucket(t *testing.T) {
 		require.True(t, b.SpendToken(2000))
 		require.False(t, b.SpendToken(2000))
 	})
+
+	// Above 60,000 RPM, one token takes less than a millisecond, which rounded down to zero:
+	// the refill time never advanced, so calls within one millisecond each earned the same token again.
+	t.Run("rate above one token per millisecond", func(t *testing.T) {
+		t.Parallel()
+
+		b := &tokenBucket{Capacity: 10, RPM: 65535} //nolint: exhaustruct
+		now := int64(1_700_000_000_000)
+		for b.SpendToken(now) {
+		}
+		require.True(t, b.SpendToken(now+1))
+		require.False(t, b.SpendToken(now+1))
+
+		// Over a minute, about RPM tokens are spent, however often they are asked for.
+		spent := 0
+		for ms := range int64(60_000) {
+			for b.SpendToken(now + 1 + ms) {
+				spent++
+			}
+		}
+		require.InDelta(t, 65535, spent, 2)
+	})
 }
 
 func TestAsyncPushRateLimitOption(t *testing.T) {
