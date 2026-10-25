@@ -23,12 +23,10 @@ func exponentialBackoff(retryNum uint16) time.Duration {
 }
 
 const (
-	// The first retry after a failed fetch comes no later than this, even when the poll
-	// interval is longer. A fetch usually fails on brief lock contention, and a retry a
-	// moment later succeeds. But while the fetch loop waits to retry, it neither polls nor
-	// acts on async pushes, so no new jobs start. With a poll interval of, say, a minute
-	// (common with async push), waiting that long after one transient failure would leave
-	// ready jobs sitting for a minute.
+	// The maximum delay before the first retry of a failed fetch.
+	// Most fetch errors occur because of a short lock, and a fast retry is successful.
+	// During the delay, the consumer gets no jobs, also not from async push.
+	// Thus, a long poll interval must not cause a long delay.
 	fetchRetryMaxFirstDelay = 100 * time.Millisecond
 	// Retries after failed fetches are never further apart than this.
 	fetchRetryMaxDelay = 30 * time.Second
