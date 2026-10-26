@@ -119,7 +119,9 @@ func (d *pushDuringBackoffDriver) getJobsForConsumer(context.Context, string, ui
 	if d.calls <= 2 {
 		return nil, errors.New("claim failure")
 	}
-	close(d.fetched)
+	if d.calls == 3 { // A late push can cause more fetches. Close the channel only one time.
+		close(d.fetched)
+	}
 	return nil, nil
 }
 

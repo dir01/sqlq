@@ -157,9 +157,11 @@ func testStaleResumption(t *testing.T, f readinessFixture, db *sql.DB, d driver)
 		return err
 	})
 	defer cons.cancel()
+	// The start of A's attempt counted it, and A wrote no result. B needs one more attempt.
+	cons.maxRetries = 1
 	cons.processJob(&jobs[0])
 	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='replacement'`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='stale'`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE processed_at IS NOT NULL AND retry_count=0`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE processed_at IS NOT NULL AND retry_count=1`))
 }
