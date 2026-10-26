@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
 	"reflect"
@@ -195,6 +196,46 @@ func sqliteRebuildNullable(ctx context.Context, tx *sql.Tx, table sqliteTable) e
 	return nil
 }
 
+// sqliteDisableForeignKeys sets foreign_keys off on conn, if it is on, and returns a function
+// that sets it on again. When foreign keys are on, the DROP TABLE in sqliteRebuildNullable
+// first deletes all rows. Thus, ON DELETE CASCADE in the tables of the application would delete
+// their rows, and other foreign keys would make the migration fail. The pragma has no effect
+// in a transaction, so call this function before BEGIN.
+func sqliteDisableForeignKeys(ctx context.Context, conn *sql.Conn) (func(), error) {
+	var enabled bool
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		return nil, fmt.Errorf("failed to read foreign_keys: %w", err)
+	}
+	if !enabled {
+		return func() {}, nil
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return nil, fmt.Errorf("failed to set foreign_keys off: %w", err)
+	}
+	return func() {
+		// Also after a cancel: the connection goes back to the pool and must keep its settings.
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`); err != nil {
+			// Do not give the connection back to the pool without foreign keys.
+			_ = conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+		}
+	}, nil
+}
+
+// sqliteCheckForeignKeys returns an error if a row in a different table refers to a row of the
+// queue tables that does not exist.
+func sqliteCheckForeignKeys(ctx context.Context, tx *sql.Tx) error {
+	var table, parent string
+	err := tx.QueryRowContext(ctx, `SELECT "table", parent FROM pragma_foreign_key_check WHERE parent IN (?, ?) LIMIT 1`,
+		sqliteJobsTable.name, sqliteDLQTable.name).Scan(&table, &parent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check foreign keys: %w", err)
+	}
+	return fmt.Errorf("a row of %s refers to a row of %s that does not exist", table, parent)
+}
+
 // initSchema creates the necessary tables and indexes for SQLite if they don't exist.
 // It's idempotent and safe to call multiple times.
 func (d *SQLiteDriver) initSchema(ctx context.Context) error {
@@ -209,7 +250,21 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	}
 	defer d.unlock()
 
-	tx, err := d.db.BeginTx(ctx, nil)
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to get a connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	restoreForeignKeys, err := sqliteDisableForeignKeys(ctx, conn)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	// This defer runs after the rollback below, because the pragma has no effect in a transaction.
+	defer restoreForeignKeys()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -269,6 +324,11 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 			span.RecordError(err)
 			return fmt.Errorf("failed to execute query (%s): %w", index, err)
 		}
+	}
+	// The foreign keys were off during the rebuild. Do not commit a change that breaks them.
+	if err = sqliteCheckForeignKeys(ctx, tx); err != nil {
+		span.RecordError(err)
+		return err
 	}
 
 	err = tx.Commit()
