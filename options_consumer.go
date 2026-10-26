@@ -76,9 +76,9 @@ func WithConsumerMaxRetries(maxRetries int32) ConsumerOption {
 // If the handler exceeds this duration, its context will be canceled.
 // A timeout is treated as a job failure.
 // The job timeout also sets the claim: other consumers can take a fetched job after the job
-// timeout plus half of it (at most one minute more). Before a handler starts, the worker
+// timeout plus half of it (at most 10 seconds more). Before a handler starts, the worker
 // extends the claim if necessary.
-// The option ignores a zero or negative timeout, and raises a timeout shorter than 50ms to 50ms.
+// The option ignores a zero or negative timeout, and increases a timeout shorter than 50ms to 50ms.
 // You may also configure default value for all consumers, see WithDefaultJobTimeout.
 func WithConsumerJobTimeout(timeout time.Duration) ConsumerOption {
 	return func(o *consumer) {
@@ -144,12 +144,17 @@ func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 
 // DeadLetterHook is called when a job has exhausted its retries, inside the transaction that moves
 // the job to the dead letter queue. handlerErr is the error returned by the final attempt.
+// If the final attempt did not write a result, for example because the worker process stopped,
+// or if this is a new try after a failed hook, handlerErr starts with "no attempts left".
+// It then includes only the text of the last recorded error, so errors.Is and errors.As do not
+// find the original error.
 //
 // The move and the hook's writes through tx are committed together, and only if the hook returns nil.
 // The queue owns tx: hooks must not call Commit or Rollback, including in a defer.
 // Return an error to abort the transaction; return nil to allow the queue to commit.
-// If the hook returns an error or panics, the move is rolled back and the job is rescheduled
-// like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
+// If the hook returns an error or panics, the move is rolled back and the job is rescheduled.
+// The job has no attempts left, so its handler does not run again: the next attempt only
+// tries the move again, and calls the hook again.
 //
 // ctx is canceled at shutdown and after the consumer's job timeout. A hook whose ctx was canceled
 // counts as failed even if it returns nil.

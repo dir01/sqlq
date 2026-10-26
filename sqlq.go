@@ -88,7 +88,7 @@ var (
 	defaultMaxRetries               int32  = 3
 	infiniteRetries                 int32  = -1
 	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
-	defaultJobTimeout                      = 15 * time.Minute
+	defaultJobTimeout                      = 2 * time.Second
 	defaultCleanupProcessedInterval        = 1 * time.Hour
 	defaultCleanupProcessedAge             = 7 * 24 * time.Hour
 	defaultCleanupDLQInterval              = 6 * time.Hour
@@ -116,7 +116,7 @@ type sqlq struct {
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
 
-	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
+	// Default maximum duration a job can run before being considered timed out. Default is 2 seconds.
 	// Individual consumers may override this using WithConsumerJobTimeout.
 	defaultJobTimeout time.Duration
 
@@ -160,14 +160,18 @@ type sqlq struct {
 type job struct {
 	// ClaimToken shows that this consumer owns the job. A write fails if the jobs table has a different token.
 	ClaimToken string
-	// ClaimExpiresAt is the last time this consumer can start the job. It is a little before the expiry in the jobs table.
+	// ClaimExpiresAt is the local deadline of the claim (see localClaimDeadline). Compare it only with
+	// the local clock. The expiry in the jobs table is a little later. If less than minClaimLeftAtStart
+	// is left, the worker extends the claim before the handler starts.
 	ClaimExpiresAt time.Time
-	JobType        string
-	CreatedAt      time.Time
-	TraceContext   map[string]string
-	Payload        []byte
-	ID             int64
-	RetryCount     uint32
+	// LastError is the error of the last attempt that wrote a failure, or "".
+	LastError    string
+	JobType      string
+	CreatedAt    time.Time
+	TraceContext map[string]string
+	Payload      []byte
+	ID           int64
+	RetryCount   uint32
 }
 
 // DeadLetterJob represents a job that has been moved to the dead letter queue

@@ -12,6 +12,9 @@ type JobInfo struct {
 	JobType    string
 	ID         int64
 	MaxRetries int32 // -1 means unlimited
+	// RetryCount is the number of earlier attempts. It also counts attempts that did not write
+	// a result, for example because the worker process stopped. It does not count attempts that
+	// the worker stopped on purpose, for example at shutdown.
 	// RetryCount stops at 2^31-1, the limit of the database counter. Unlimited retries
 	// continue at that value. Finite limits still get a final attempt.
 	RetryCount uint32
@@ -21,6 +24,13 @@ type JobInfo struct {
 // to the dead letter queue instead of scheduling another retry.
 func (ji JobInfo) IsFinalAttempt() bool {
 	return ji.MaxRetries != infiniteRetries && ji.RetryCount >= uint32(ji.MaxRetries)
+}
+
+// noAttemptsLeft reports whether the earlier attempts used all retries. This occurs if the final
+// attempt did not write its result, for example because the worker process stopped, or because
+// the move to the dead letter queue failed.
+func (ji JobInfo) noAttemptsLeft() bool {
+	return ji.MaxRetries != infiniteRetries && ji.RetryCount > uint32(ji.MaxRetries)
 }
 
 type jobInfoCtxKey struct{}

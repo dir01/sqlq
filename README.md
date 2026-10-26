@@ -127,12 +127,19 @@ q.Consume(ctx, "retry_demo", handler,
     sqlq.WithConsumerMaxRetries(2),
     sqlq.WithConsumerBackoffFunc(func(retryNum uint16) time.Duration { return time.Second }))
 // In handler: info, _ := sqlq.JobInfoFromContext(ctx)
-// info.RetryCount is 0 on the first attempt.
+// info.RetryCount is the number of earlier attempts: 0 on the first attempt.
 ```
 
 Two retries allow three attempts total. A failure on `info.IsFinalAttempt()`
 moves the job to the DLQ; success completes it. Panics use the same failure
 path. [Full retry demo](demo/retry/README.md).
+
+An attempt counts when its handler starts. Thus, an attempt also counts if the
+worker process stops during the handler, for example because of an out-of-memory
+kill or `os.Exit`. A job that has no attempts left goes to the DLQ, and its handler
+does not run again. Its failure reason starts with "no attempts left" and includes
+the last recorded error. An attempt that the worker stops on purpose, for example
+at shutdown, does not count.
 
 `JobInfo.RetryCount` and `DeadLetterJob.RetryCount` are `uint32`. Counts saturate
 at 2,147,483,647 (the PostgreSQL integer limit); unlimited retries continue at
@@ -158,21 +165,27 @@ workers run without an additional batch waiting outside the channel.
 
 ```go
 q.Consume(ctx, "numbered_job", handler,
-    sqlq.WithConsumerJobTimeout(10*time.Minute)) // Claims last 11 minutes.
+    sqlq.WithConsumerJobTimeout(10*time.Minute)) // Claims last 10 minutes and 10 seconds.
 ```
 
 Claims start at fetch time, including time in the local buffer. Another consumer
-can recover unfinished jobs after their claims expire. Recovery does not increment
-the retry count: a prefetched job may never have started. Polling discovers expired
-claims even without a new publish notification.
+can recover unfinished jobs after their claims expire. Recovery itself does not change
+the retry count. The count changes when a handler starts, so a prefetched job that
+never started is not counted. Polling discovers expired claims even without a new
+publish notification.
 
 The job timeout sets the claim. Each claim and each extension lasts the job timeout
-plus a gap: half the job timeout, at most one minute. The job timeout is at least
-50ms; the options raise a shorter value. Before a worker starts a handler, it
-examines the claim. If less than the job timeout plus half the gap is left, the
-worker extends the claim with its token. It examines the claim again when it has a
-connection for the handler. The other half of the gap is for the handler to return
-and for the result writes. A fresh claim needs no extension.
+plus an overhead: half the job timeout, at most 10 seconds. The default job timeout
+of 2 seconds gives an overhead that is sufficient also for a database in a different
+region. A handler that runs longer fails, so set a longer job timeout for long jobs.
+With a database that is near, a shorter job timeout is possible. The options increase
+a job timeout shorter than 50ms to 50ms. Half of the overhead is for the time before
+the handler: the wait for a connection and, if necessary, the extension of the
+claim. The other half is for the time after the job timeout: the handler returns, and
+the worker writes the result. Before a worker starts a handler, it writes one time
+with its token: the write counts the attempt and gives the claim its full length again.
+It examines the claim again when it has a connection for the handler. If less than
+the job timeout plus half the overhead is left, it extends the claim again.
 Expired local copies are discarded; a failed ownership check prevents the handler
 from starting.
 
@@ -239,7 +252,9 @@ q.Consume(ctx, "terminal_task", handler,
     sqlq.WithConsumerOnDeadLetter(onDeadLetter))
 ```
 
-Return an error to roll back the hook's writes and DLQ move. Never commit or
+Return an error to roll back the hook's writes and DLQ move. The job then has no
+attempts left, so the next attempt tries the move again and does not run the
+handler. Never commit or
 roll back its supplied `tx`. On SQLite, use that `tx` for writes inside the
 hook; queue methods such as `Publish` can deadlock there.
 [Full dead-letter hook demo](demo/dead-letter-hook/README.md).
@@ -298,8 +313,8 @@ the library defaults are:
 | Concurrency | min(NumCPU, GOMAXPROCS) | `WithDefaultConcurrency` | `WithConsumerConcurrency` |
 | Prefetch | Consumer's concurrency | `WithDefaultPrefetchCount` | `WithConsumerPrefetchCount` |
 | Maximum retries | 3 | `WithDefaultMaxRetries` | `WithConsumerMaxRetries` |
-| Job timeout | 15 minutes | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
-| Claim | Job timeout + half of it, at most 1 minute more (16 minutes) | — (follows the job timeout) | — |
+| Job timeout | 2 seconds (at least 50ms) | `WithDefaultJobTimeout` | `WithConsumerJobTimeout` |
+| Claim | Job timeout + half of it, at most 10 seconds more (3 seconds) | — (follows the job timeout) | — |
 | Retry delay | Exponential backoff with jitter, to a maximum of 24 hours | `WithDefaultBackoffFunc` | `WithConsumerBackoffFunc` |
 | Processed cleanup interval | 1 hour | `WithDefaultCleanupProcessedInterval` | `WithConsumerCleanupProcessedInterval` |
 | Processed retention | 7 days after processing | `WithDefaultCleanupProcessedAge` | `WithConsumerCleanupProcessedAge` |
@@ -316,7 +331,13 @@ See `./sqlq_testutils_otel_test.go:17` for tracing setup used by the tests.
 The queue also records OpenTelemetry metrics, tagged with `sqlq.job_type`:
 published, fetched, consumed, retried, dead-lettered, requeued, and cleaned-up
 job counts, handler duration, and the number of jobs in progress. Failed
-attempts carry a `sqlq.failure_reason`. Metrics go to the global meter provider
+attempts carry a `sqlq.failure_reason`. Two counters show if the prefetch count
+is too high for the handler time: `sqlq.jobs.claim.extended.count` (a job waited
+in the buffer so long that its claim was too short for the handler) and
+`sqlq.jobs.claim.expired.count` (the claim expired in the buffer, and the job
+went back to the queue). `sqlq.jobs.claim.lost.count` counts results that the
+worker could not write, because a different consumer took the job after the claim
+expired. If it increases, set a longer job timeout. Metrics go to the global meter provider
 unless `WithMeterProvider` sets another. Instruments: `./metrics.go:13`.
 
 ## Storage
@@ -332,8 +353,9 @@ jobs without claim metadata are recoverable; processed jobs remain excluded.
 | `dead_letter_queue` | `original_job_id` (primary key), `job_type`, `payload`, `created_at`, `failed_at`, `retry_count`, `failure_reason`. |
 
 A due job is claimed by setting `consumed_at`, a token, and an expiry. Success sets `processed_at`;
-the row remains until cleanup. A retry increments the retry count, schedules
-another attempt, and clears the claim. A DLQ move inserts the failure and
+the row remains until cleanup. The start of each attempt increments the retry count.
+Success and a release undo that increment. A retry schedules another attempt and
+clears the claim. A DLQ move inserts the failure and
 deletes the original job in a transaction. SQLite stores timestamps as Unix
 milliseconds; PostgreSQL uses SQL timestamps.
 

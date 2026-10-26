@@ -507,7 +507,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 				ORDER BY id
 				LIMIT ?
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+			RETURNING id, payload, retry_count, trace_context, created_at, claim_token, last_error
 		`, claimToken, claimTimeout.Milliseconds(), jobType, prefetchCount)
 		if err != nil {
 			return fmt.Errorf("failed to claim jobs: %w", err)
@@ -521,11 +521,13 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 			var j job
 			var traceContextJSON sql.NullString
 			var createdAtMs int64
+			var lastError sql.NullString
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken, &lastError); err != nil {
 				return fmt.Errorf("failed to scan claimed job: %w", err) // Return error to rollback
 			}
 			j.CreatedAt = time.UnixMilli(createdAtMs)
+			j.LastError = lastError.String
 			j.ClaimExpiresAt = deadline
 
 			// Deserialize trace context
@@ -555,23 +557,24 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	return jobsToReturn, nil
 }
 
-func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
 	deadline := localClaimDeadline(timeout)
 	if err := d.lock(ctx); err != nil {
 		return deadline, err
 	}
 	defer d.unlock()
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?,
+			retry_count = CASE WHEN ? AND retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL AND claim_expires_at > `+sqliteNow,
-		timeout.Milliseconds(), j.ID, j.ClaimToken)
+		timeout.Milliseconds(), startAttempt, j.ID, j.ClaimToken)
 	return deadline, checkClaimResult(result, err)
 }
 
 func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
 	// Do not take dbLock here. A dead-letter hook can hold it for a long time. Shutdown has
 	// a short time for the release, and the wait can use all of it. The SQLite lock is sufficient.
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
-		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = ?
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, int64(j.RetryCount), j.ID, j.ClaimToken)
 	return checkClaimResult(result, err)
 }
 
@@ -660,8 +663,10 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 
 	nowMs := time.Now().UnixMilli()
 
+	// The start of the attempt incremented retry_count (see extendClaim). A success is not a retry.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = ? WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
+		`UPDATE jobs SET processed_at = ?, retry_count = MAX(retry_count - 1, 0)
+			WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
 		nowMs, jobID, claimToken,
 	)
 	if err != nil {
@@ -733,10 +738,10 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	nowMs := time.Now().UnixMilli()
 	scheduledMs := nowMs + backoffDuration.Milliseconds()
 
-	// Update the job: increment retry, set error, schedule, clear consumption/processing state
+	// Set the error and the schedule, and clear the claim. The start of the attempt already
+	// incremented retry_count (see extendClaim).
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET 
-			retry_count = CASE WHEN retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END,
 			last_error = ?, 
 			scheduled_at = ?,
 			consumed_at = NULL, 
@@ -799,7 +804,7 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		SELECT id, job_type, payload, created_at, ?, retry_count, ?
+		SELECT id, job_type, payload, created_at, ?, MAX(retry_count - 1, 0), ?
 		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
 	`, nowMs, reason, jobID, claimToken)
 	if err = checkClaimResult(res, err); err != nil {

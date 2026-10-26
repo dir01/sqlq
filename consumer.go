@@ -246,7 +246,7 @@ func (cons *consumer) processJob(j *job) {
 	if cons.ctx.Err() != nil {
 		return
 	}
-	if err := cons.ensureClaimTime(j); err != nil {
+	if err := cons.ensureClaimTime(j, true); err != nil {
 		settled = errors.Is(err, ErrClaimLost)
 		return
 	}
@@ -284,6 +284,14 @@ func (cons *consumer) processJob(j *job) {
 
 	info := cons.jobInfo(j)
 
+	if info.noAttemptsLeft() {
+		// The earlier attempts used all retries, but at least one of them did not write a result.
+		// For example, the worker process stopped during the handler. Do not run the handler again.
+		metricFailureReason = "no_attempts_left"
+		settled = cons.finishFailedAttempt(ctx, span, j, info, noAttemptsLeftError(j), &metricFailureReason)
+		return
+	}
+
 	var tx *sql.Tx
 	var err error
 	for {
@@ -298,11 +306,11 @@ func (cons *consumer) processJob(j *job) {
 		}
 		// BeginTx can wait for a pool connection. During that time, the claim can expire, and a
 		// different consumer can complete the job. Thus, examine the claim again before the handler starts.
-		if time.Until(j.ClaimExpiresAt) >= claimTimeToStart(cons.jobTimeout) {
+		if time.Until(j.ClaimExpiresAt) >= minClaimLeftAtStart(cons.jobTimeout) {
 			break
 		}
 		_ = tx.Rollback() // The extension of the claim can need this connection.
-		if err = cons.ensureClaimTime(j); err != nil {
+		if err = cons.ensureClaimTime(j, false); err != nil {
 			settled = errors.Is(err, ErrClaimLost)
 			return
 		}
@@ -317,6 +325,7 @@ func (cons *consumer) processJob(j *job) {
 	}
 	metricFailureReason = failureReason
 	if errors.Is(handlerErr, ErrClaimLost) || cons.ctx.Err() != nil {
+		cons.countLostResult(ctx, handlerErr)
 		settled = errors.Is(handlerErr, ErrClaimLost)
 		return
 	}
@@ -326,69 +335,100 @@ func (cons *consumer) processJob(j *job) {
 	span.SetAttributes(attribute.String("sqlq.handler_error", handlerErr.Error()))
 	span.SetStatus(codes.Error, "handler failed or timed out")
 
+	settled = cons.finishFailedAttempt(ctx, span, j, info, handlerErr, &metricFailureReason)
+}
+
+// finishFailedAttempt schedules a retry, or moves the job to the dead letter queue after the final
+// attempt. It returns true if the job has its next state, or if a different attempt has the claim.
+// In both cases, the worker must not release the claim. It sets failureReason if a write fails.
+func (cons *consumer) finishFailedAttempt(ctx context.Context, span trace.Span, j *job, info JobInfo, handlerErr error, failureReason *string) bool {
 	if !info.IsFinalAttempt() {
-		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
+		if err := cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+			cons.countLostResult(ctx, err)
 
-			metricFailureReason = "fail_retry"
-			settled = errors.Is(err, ErrClaimLost)
-		} else {
-			settled = true
+			*failureReason = "fail_retry"
+			return errors.Is(err, ErrClaimLost)
 		}
-
-		return
+		return true
 	}
 
 	// Max retries exceeded or retries disabled, move to Dead Letter Queue
-	if err = cons.moveJobToDLQ(ctx, j, info, handlerErr); err != nil {
+	if err := cons.moveJobToDLQ(ctx, j, info, handlerErr); err != nil {
+		cons.countLostResult(ctx, err)
 		if errors.Is(err, ErrClaimLost) || cons.ctx.Err() != nil {
-			settled = errors.Is(err, ErrClaimLost)
-			return
+			return errors.Is(err, ErrClaimLost)
 		}
-		// Reschedule the job rather than leave it consumed and never processed.
-		// Its handler runs again, and if it fails again, moving it is attempted again.
+		// Reschedule the job rather than leave it consumed and never processed. The job has
+		// no attempts left. Thus, the next attempt moves it again, and does not run the handler.
 		span.RecordError(err)
 		log.Printf("sqlq: failed to move job %d of type %s to the dead letter queue, rescheduling it: %v", j.ID, cons.jobType, err)
 
-		metricFailureReason = "fail_move_dlq"
+		*failureReason = "fail_move_dlq"
 
 		if err = cons.retryJob(ctx, j, handlerErr.Error()); err != nil {
 			span.RecordError(err)
+			cons.countLostResult(ctx, err)
 
-			metricFailureReason = "fail_retry"
-			settled = errors.Is(err, ErrClaimLost)
-		} else {
-			settled = true
+			*failureReason = "fail_retry"
+			return errors.Is(err, ErrClaimLost)
 		}
-
-		return
+		return true
 	}
 
 	span.SetAttributes(attribute.Bool("sqlq.moved_to_dlq", true))
-	settled = true
+	return true
 }
 
-// ensureClaimTime returns errClaimExpired if the claim expired before the extension.
-// A different consumer possibly has the claim now.
-var errClaimExpired = errors.New("claim expired before the handler could start")
+// noAttemptsLeftError returns the error for a job that used all its attempts, but did not get
+// a result from each of them. It includes the last error that an attempt wrote, if there is one.
+func noAttemptsLeftError(j *job) error {
+	err := fmt.Errorf("no attempts left after %d attempts, the worker possibly stopped during the handler", j.RetryCount)
+	if j.LastError != "" {
+		err = fmt.Errorf("%w; last recorded error: %s", err, j.LastError)
+	}
+	return err
+}
+
+// countLostResult counts a result that the worker could not write, because a different consumer
+// took the job after the claim expired.
+func (cons *consumer) countLostResult(ctx context.Context, err error) {
+	if errors.Is(err, ErrClaimLost) {
+		cons.metrics.claimLostCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType)))
+	}
+}
+
+// ensureClaimTime returns errClaimExpired if the new claim expired before the extension query
+// was complete. The claim in the database can still be valid, so the worker releases it.
+var errClaimExpired = errors.New("claim expired during its extension")
 
 // ensureClaimTime makes sure that the claim on j is sufficiently long for the handler and its result.
-// If necessary, it extends the claim. It returns ErrClaimLost if a different consumer has the claim now.
+// If necessary, it extends the claim. If startAttempt is true, it always writes: the write counts
+// the attempt (see driver.extendClaim) and gives the claim its full length.
+// It returns ErrClaimLost if the claim expired before the write, or if a different consumer has
+// the claim now. In both cases, the worker does not release the claim: the fetch query already
+// sees an expired claim as available.
 // It returns a different error if it cannot extend the claim for a different reason.
-func (cons *consumer) ensureClaimTime(j *job) error {
+func (cons *consumer) ensureClaimTime(j *job, startAttempt bool) error {
+	metricAttrs := metric.WithAttributes(attribute.String("sqlq.job_type", cons.jobType))
 	remaining := time.Until(j.ClaimExpiresAt)
 	if remaining <= 0 {
-		return errClaimExpired
+		cons.metrics.claimExpiredCounter.Add(cons.ctx, 1, metricAttrs)
+		return fmt.Errorf("job %d: claim expired before the handler started: %w", j.ID, ErrClaimLost)
 	}
-	if remaining >= claimTimeToStart(cons.jobTimeout) {
+	short := remaining < minClaimLeftAtStart(cons.jobTimeout)
+	if !short && !startAttempt {
 		return nil
 	}
-	deadline, err := cons.driver.extendClaim(cons.ctx, *j, claimLength(cons.jobTimeout))
+	deadline, err := cons.driver.extendClaim(cons.ctx, *j, claimLength(cons.jobTimeout), startAttempt)
 	if err != nil {
 		if !errors.Is(err, ErrClaimLost) && !errors.Is(err, context.Canceled) {
 			log.Printf("sqlq: failed to extend claim for job %d: %v", j.ID, err)
 		}
 		return err
+	}
+	if short {
+		cons.metrics.claimExtendedCounter.Add(cons.ctx, 1, metricAttrs)
 	}
 	j.ClaimExpiresAt = deadline
 	if err = cons.ctx.Err(); err != nil {

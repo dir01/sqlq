@@ -360,7 +360,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 				FOR UPDATE SKIP LOCKED
 				LIMIT $2 -- Correct parameter index
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+			RETURNING id, payload, retry_count, trace_context, created_at, claim_token, last_error
 		`, jobType, prefetchCount, claimToken, claimTimeout.Milliseconds())
 
 		if err != nil {
@@ -374,14 +374,16 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			var j job
 			var traceContextJSON sql.NullString
 			var createdAt sql.NullTime // The column is NOT NULL, but a failed scan would block the claimed job
-			j.JobType = jobType        // Set job type as it's not returned by RETURNING
+			var lastError sql.NullString
+			j.JobType = jobType // Set job type as it's not returned by RETURNING
 
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken, &lastError); err != nil {
 				// Undo the whole batch. Otherwise this job would stay claimed but never reach a worker.
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
 				return err
 			}
 			j.CreatedAt = createdAt.Time // Zero if created_at is NULL
+			j.LastError = lastError.String
 			j.ClaimExpiresAt = deadline
 
 			j.TraceContext = make(map[string]string)
@@ -405,17 +407,18 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 	return jobsToReturn, nil
 }
 
-func (d *PostgresDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+func (d *PostgresDriver) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
 	deadline := localClaimDeadline(timeout)
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = clock_timestamp() + $1 * interval '1 millisecond'
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = clock_timestamp() + $1 * interval '1 millisecond',
+			retry_count = CASE WHEN $4 AND retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END
 		WHERE id = $2 AND claim_token = $3 AND processed_at IS NULL AND claim_expires_at > clock_timestamp()`,
-		timeout.Milliseconds(), j.ID, j.ClaimToken)
+		timeout.Milliseconds(), j.ID, j.ClaimToken, startAttempt)
 	return deadline, checkClaimResult(result, err)
 }
 
 func (d *PostgresDriver) releaseClaim(ctx context.Context, j job) error {
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
-		WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = $3
+		WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`, j.ID, j.ClaimToken, int64(j.RetryCount))
 	return checkClaimResult(result, err)
 }
 
@@ -452,9 +455,11 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 	}
 	var res sql.Result
 	var err error
+	// The start of the attempt incremented retry_count (see extendClaim). A success is not a retry.
 	for attempt := 1; ; attempt++ {
 		res, err = tx.ExecContext(ctx,
-			`UPDATE jobs SET processed_at = clock_timestamp() WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`,
+			`UPDATE jobs SET processed_at = clock_timestamp(), retry_count = GREATEST(retry_count - 1, 0)
+				WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL`,
 			jobID, claimToken,
 		)
 		if err == nil || attempt == markProcessedLockAttempts || !isLockTimeout(err) {
@@ -515,10 +520,10 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 		}
 	}()
 
-	// Update the job: increment retry, set error, schedule, clear consumption/processing state
+	// Set the error and the schedule, and clear the claim. The start of the attempt already
+	// incremented retry_count (see extendClaim).
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET
-			retry_count = CASE WHEN retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END,
 			last_error = $1,
 			scheduled_at = clock_timestamp() + $2 * interval '1 microsecond',
 			consumed_at = NULL,
@@ -572,7 +577,7 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		RetryCount uint32
 	}
 	err = tx.QueryRowContext(ctx, `
-		SELECT job_type, payload, created_at, retry_count
+		SELECT job_type, payload, created_at, GREATEST(retry_count - 1, 0)
 		FROM jobs WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL FOR UPDATE
 	`, jobID, claimToken).Scan(&j.JobType, &j.Payload, &j.CreatedAt, &j.RetryCount)
 	if err != nil {

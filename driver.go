@@ -33,7 +33,12 @@ type driver interface {
 	// getJobsForConsumer executes the query for finding jobs for a consumer
 	// Unprocessed jobs can be returned again after their claim expires.
 	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error)
-	extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error)
+	// extendClaim gives the claim on j a new length of timeout, if the claim is still valid.
+	// If startAttempt is true, it also increments retry_count. Thus, the attempt counts also if the
+	// worker process stops before it writes a result. It returns the new local deadline.
+	extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error)
+	// releaseClaim makes j available again, and sets retry_count back to j.RetryCount. Thus, an
+	// attempt that the worker stopped on purpose, for example at shutdown, does not count.
 	releaseClaim(ctx context.Context, j job) error
 
 	// subscribeForConsumer will post new jobs to a channel according to tokenBucket

@@ -20,6 +20,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -120,7 +122,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
-		_, err = d.extendClaim(ctx, old, time.Minute)
+		_, err = d.extendClaim(ctx, old, time.Minute, false)
 		require.ErrorIs(t, err, ErrClaimLost)
 		require.ErrorIs(t, d.releaseClaim(ctx, old), ErrClaimLost)
 		require.ErrorIs(t, d.markJobFailedAndReschedule(ctx, old.ID, old.ClaimToken, "stale", 0), ErrClaimLost)
@@ -160,11 +162,11 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("renewal extends only a live owned claim", func(t *testing.T) {
 		j := seed(1)[0]
-		deadline, err := d.extendClaim(ctx, j, 2*time.Minute)
+		deadline, err := d.extendClaim(ctx, j, 2*time.Minute, false)
 		require.NoError(t, err)
 		require.True(t, deadline.After(j.ClaimExpiresAt))
 		expire()
-		_, err = d.extendClaim(ctx, j, time.Minute)
+		_, err = d.extendClaim(ctx, j, time.Minute, false)
 		require.ErrorIs(t, err, ErrClaimLost)
 	})
 
@@ -192,33 +194,73 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	})
 
 	t.Run("consumer fast path and conditional extension", func(t *testing.T) {
+		// Each attempt that starts writes one time: the write counts the attempt and renews the claim.
+		// The extended counter shows the jobs that waited so long that the claim was too short.
 		for _, scenario := range []struct {
-			name       string
-			remaining  time.Duration
-			extensions int
-			called     bool
+			name      string
+			remaining time.Duration
+			extended  int
+			expired   int
+			called    bool
 		}{
 			// testClaimConsumer has a 10s job timeout, so a handler needs 12.5s of claim time.
-			{"fresh", time.Minute, 0, true},
-			{"enough for job timeout and margin", 20 * time.Second, 0, true},
-			{"enough for job timeout but not margin", 12 * time.Second, 1, true},
-			{"near expiry", time.Second, 1, true},
-			{"expired buffer", -time.Second, 0, false},
+			{"fresh", time.Minute, 0, 0, true},
+			{"enough for job timeout and margin", 20 * time.Second, 0, 0, true},
+			{"enough for job timeout but not margin", 12 * time.Second, 1, 0, true},
+			{"near expiry", time.Second, 1, 0, true},
+			// The fetch query sees an expired claim as available, so the worker sends no release.
+			{"expired buffer", -time.Second, 0, 1, false},
 		} {
 			t.Run(scenario.name, func(t *testing.T) {
 				j := seed(1)[0]
 				j.ClaimExpiresAt = time.Now().Add(scenario.remaining)
-				spy := &claimDriverSpy{driver: d, extensions: 0}
+				spy := &claimDriverSpy{driver: d, starts: 0, extensions: 0, releases: 0}
 				called := false
 				cons := testClaimConsumer(ctx, db, spy, func(context.Context, *sql.Tx, []byte) error {
 					called = true
 					return nil
 				})
+				metrics := sdkmetric.NewManualReader()
+				var err error
+				cons.metrics, err = newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)).Meter("claims"))
+				require.NoError(t, err)
 				cons.processJob(&j)
 				require.Equal(t, scenario.called, called)
-				require.Equal(t, scenario.extensions, spy.extensions)
+				wantStarts := 0
+				if scenario.called {
+					wantStarts = 1
+				}
+				require.Equal(t, wantStarts, spy.starts)
+				require.Zero(t, spy.extensions)
+				require.Zero(t, spy.releases)
+				require.Equal(t, int64(scenario.extended), counterValue(t, metrics, "sqlq.jobs.claim.extended.count"))
+				require.Equal(t, int64(scenario.expired), counterValue(t, metrics, "sqlq.jobs.claim.expired.count"))
 			})
 		}
+	})
+
+	t.Run("a result after a lost claim is counted and not written", func(t *testing.T) {
+		j := seed(1)[0]
+		spy := &claimDriverSpy{driver: d, starts: 0, extensions: 0, releases: 0}
+		cons := testClaimConsumer(ctx, db, spy, func(context.Context, *sql.Tx, []byte) error {
+			// While the handler runs, the claim expires, and a different consumer takes the job.
+			expire()
+			jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
+			if err == nil && len(jobs) != 1 {
+				err = fmt.Errorf("the other consumer got %d jobs", len(jobs))
+			}
+			return err
+		})
+		metrics := sdkmetric.NewManualReader()
+		var err error
+		cons.metrics, err = newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)).Meter("claims"))
+		require.NoError(t, err)
+		cons.processJob(&j)
+		require.Equal(t, int64(1), counterValue(t, metrics, "sqlq.jobs.claim.lost.count"))
+		require.Zero(t, spy.releases)
+		var processed int
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE processed_at IS NOT NULL`).Scan(&processed))
+		require.Zero(t, processed)
 	})
 
 	t.Run("stale buffered job fails extension without invoking handler", func(t *testing.T) {
@@ -238,12 +280,58 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("retry releases ownership and increments only actual failures", func(t *testing.T) {
 		j := seed(1)[0]
+		_, err := d.extendClaim(ctx, j, time.Minute, true)
+		require.NoError(t, err)
 		require.NoError(t, d.markJobFailedAndReschedule(ctx, j.ID, j.ClaimToken, "failed", 0))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 		require.Equal(t, uint32(1), jobs[0].RetryCount)
+		require.Equal(t, "failed", jobs[0].LastError)
 		require.NotEqual(t, j.ClaimToken, jobs[0].ClaimToken)
+	})
+
+	// The start of an attempt counts it. Only a result or a release changes the count again.
+	t.Run("an attempt counts when it starts", func(t *testing.T) {
+		for _, scenario := range []struct {
+			finish  func(j job)
+			name    string
+			retries uint32
+		}{
+			{func(job) { expire() }, "the worker stops", 1},
+			{func(j job) { require.NoError(t, d.releaseClaim(ctx, j)) }, "the worker releases the claim", 0},
+		} {
+			t.Run(scenario.name, func(t *testing.T) {
+				j := seed(1)[0]
+				_, err := d.extendClaim(ctx, j, time.Minute, true)
+				require.NoError(t, err)
+				scenario.finish(j)
+				jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+				require.Equal(t, scenario.retries, jobs[0].RetryCount)
+				require.Empty(t, jobs[0].LastError)
+			})
+		}
+		t.Run("a success is not a retry", func(t *testing.T) {
+			j := seed(1)[0]
+			_, err := d.extendClaim(ctx, j, time.Minute, true)
+			require.NoError(t, err)
+			require.NoError(t, runInTx(ctx, db, func(tx *sql.Tx) error { return d.markJobProcessed(ctx, tx, j.ID, j.ClaimToken) }))
+			var retries int
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT retry_count FROM jobs`).Scan(&retries))
+			require.Zero(t, retries)
+		})
+		t.Run("the dead letter queue does not count the final attempt as a retry", func(t *testing.T) {
+			j := seed(1)[0]
+			_, err := d.extendClaim(ctx, j, time.Minute, true)
+			require.NoError(t, err)
+			require.NoError(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failed", nil))
+			dlq, err := d.getDeadLetterJobs(ctx, "claims", 1)
+			require.NoError(t, err)
+			require.Len(t, dlq, 1)
+			require.Zero(t, dlq[0].RetryCount)
+		})
 	})
 
 	t.Run("shutdown releases active and buffered jobs without counting failures", func(t *testing.T) {
@@ -426,33 +514,40 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 func TestClaimLength(t *testing.T) {
 	t.Parallel()
 	for _, scenario := range []struct {
-		jobTimeout, length, timeToStart time.Duration
+		jobTimeout, length, minLeftAtStart time.Duration
 	}{
-		{15 * time.Minute, 16 * time.Minute, 15*time.Minute + 30*time.Second}, // the gap stops at one minute
-		{10 * time.Second, 15 * time.Second, 12500 * time.Millisecond},        // the gap is half the job timeout
-		{minJobTimeout, 75 * time.Millisecond, 62500 * time.Microsecond},      // the shortest job timeout
+		{15 * time.Minute, 15*time.Minute + 10*time.Second, 15*time.Minute + 5*time.Second}, // the overhead stops at 10 seconds
+		{10 * time.Second, 15 * time.Second, 12500 * time.Millisecond},                      // the overhead is half the job timeout
+		{time.Second, 1500 * time.Millisecond, 1250 * time.Millisecond},                     // a short job timeout
+		{minJobTimeout, 75 * time.Millisecond, 62500 * time.Microsecond},                    // the shortest job timeout
 	} {
 		require.Equal(t, scenario.length, claimLength(scenario.jobTimeout), scenario.jobTimeout)
-		require.Equal(t, scenario.timeToStart, claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
-		// After an extension, the claim must still have claimTimeToStart left after the rounding
-		// in claimBudget. Otherwise, the worker extends the claim again and again.
-		require.Greater(t, claimBudget(claimLength(scenario.jobTimeout)), claimTimeToStart(scenario.jobTimeout), scenario.jobTimeout)
+		require.Equal(t, scenario.minLeftAtStart, minClaimLeftAtStart(scenario.jobTimeout), scenario.jobTimeout)
 	}
 }
 
-// The job timeout options raise a timeout shorter than 50ms, and ignore a timeout of zero or less.
-func TestJobTimeoutLowerLimit(t *testing.T) {
+// The job timeout options increase a timeout shorter than 50ms, and ignore a timeout of zero or less.
+func TestJobTimeoutOptions(t *testing.T) {
 	t.Parallel()
-	for timeout, want := range map[time.Duration]time.Duration{
-		-time.Second: defaultJobTimeout, 0: defaultJobTimeout, time.Millisecond: minJobTimeout,
-		minJobTimeout: minJobTimeout, time.Second: time.Second,
+	for _, scenario := range []struct {
+		name      string
+		queueOpts []NewOption
+		consOpts  []ConsumerOption
+		want      time.Duration
+	}{
+		{"default", nil, nil, 2 * time.Second},
+		{"short consumer timeout", nil, []ConsumerOption{WithConsumerJobTimeout(100 * time.Millisecond)}, 100 * time.Millisecond},
+		{"consumer timeout below the minimum", nil, []ConsumerOption{WithConsumerJobTimeout(time.Millisecond)}, minJobTimeout},
+		{"queue timeout below the minimum", []NewOption{WithDefaultJobTimeout(time.Millisecond)}, nil, minJobTimeout},
+		{"zero timeout is ignored", nil, []ConsumerOption{WithConsumerJobTimeout(0)}, defaultJobTimeout},
+		{"negative timeout is ignored", []NewOption{WithDefaultJobTimeout(-time.Second)}, nil, defaultJobTimeout},
 	} {
-		cons := &consumer{jobTimeout: defaultJobTimeout} //nolint:exhaustruct
-		WithConsumerJobTimeout(timeout)(cons)
-		q := &sqlq{defaultJobTimeout: defaultJobTimeout} //nolint:exhaustruct
-		WithDefaultJobTimeout(timeout)(q)
-		require.Equal(t, want, cons.jobTimeout, timeout)
-		require.Equal(t, want, q.defaultJobTimeout, timeout)
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+			cons, err := consumeOnTestQueue(t, scenario.queueOpts, scenario.consOpts)
+			require.NoError(t, err)
+			require.Equal(t, scenario.want, cons.jobTimeout)
+		})
 	}
 }
 
@@ -518,12 +613,41 @@ func openClaimTestDB(dbType DBType, dsn, schema string) (*sql.DB, error) {
 
 type claimDriverSpy struct {
 	driver
+	starts     int
 	extensions int
+	releases   int
 }
 
-func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
-	d.extensions++
-	return d.driver.extendClaim(ctx, j, timeout)
+func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
+	if startAttempt {
+		d.starts++
+	} else {
+		d.extensions++
+	}
+	return d.driver.extendClaim(ctx, j, timeout, startAttempt)
+}
+
+func (d *claimDriverSpy) releaseClaim(ctx context.Context, j job) error {
+	d.releases++
+	return d.driver.releaseClaim(ctx, j)
+}
+
+// counterValue returns the sum of all data points of the named counter.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == name {
+				for _, dp := range sum.DataPoints {
+					total += dp.Value
+				}
+			}
+		}
+	}
+	return total
 }
 
 // noopMetrics returns instruments that record nothing, for consumers built without New.

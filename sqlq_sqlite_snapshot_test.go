@@ -170,14 +170,15 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	}, sqlq.WithConsumerMaxRetries(3))
 	require.NoError(t, err)
 
-	// Wait until the job is processed, or until the queue counts a retry.
+	// Wait until the job is processed, or until the queue writes a failure. retry_count is not
+	// a signal: the start of the attempt increments it, and the processed mark decrements it.
 	var processedAt sql.NullInt64
 	var retryCount int
 	var lastError sql.NullString
 	require.Eventually(t, func() bool {
 		scanErr := db.QueryRowContext(ctx, "SELECT processed_at, retry_count, last_error FROM jobs WHERE job_type = ?", jobType).
 			Scan(&processedAt, &retryCount, &lastError)
-		return scanErr == nil && (processedAt.Valid || retryCount > 0)
+		return scanErr == nil && (processedAt.Valid || lastError.Valid)
 	}, 5*time.Second, 20*time.Millisecond)
 	<-released
 	assert.Zero(t, retryCount, "a successful handler was charged a retry: %s", lastError.String)

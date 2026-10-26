@@ -13,51 +13,57 @@ import (
 // When a claim expires, a different consumer can claim the job with a new token.
 // Thus, the jobs of a worker that stopped are processed again.
 //
-// The job timeout sets the length of each claim:
+// A claim lasts the job timeout plus the claim overhead. The overhead is the time for
+// the work that the claim must cover, apart from the handler. It has two halves:
 //
-//	| start | job timeout | finish |
-//	        ^ the handler starts
+//	| before the handler | job timeout | after the job timeout |
+//	                     ^ the handler starts
 //
-//   - Start: the worker gets a connection and, if necessary, extends the claim.
-//   - Finish: the handler returns, and the worker writes the result.
+// Before the handler, the worker:
+//   - waits for a database connection for the handler's transaction.
+//   - if necessary, extends the claim. That is one more round trip to the database.
 //
-// The start and the finish are each half of the claim gap.
+// After the job timeout:
+//   - the handler returns. It can return a short time after its context is canceled.
+//   - the worker commits or rolls back the handler's transaction.
+//   - the worker writes the result: it marks the job processed, or writes a retry,
+//     or locks the job row to move it to the dead letter queue.
+//
+// The claim does not cover these times:
+//   - The time in the buffer. When the job leaves the buffer, the worker extends the claim if necessary.
+//   - The dead letter hook. It runs while the job row is locked, so no other consumer can claim the job.
+//
+// Both halves also absorb small differences between the local deadline and the expiry
+// in the database, for example the rounding to whole milliseconds.
 
 // minJobTimeout is the shortest job timeout. The job timeout options increase a shorter value to it.
-// Then each half of the claim gap is at least 12.5ms. That is sufficient for the rounding
-// in claimBudget and for one round trip to the database.
+// It keeps a small safety margin in the claim overhead, also when a user sets a very short job timeout.
 const minJobTimeout = 50 * time.Millisecond
 
-// claimGap returns the claim time after the job timeout: half the job timeout, but not more than one minute.
-func claimGap(jobTimeout time.Duration) time.Duration {
-	return min(time.Minute, jobTimeout/2)
+// claimOverhead returns the claim time in addition to the job timeout:
+// half the job timeout, but not more than 10 seconds.
+func claimOverhead(jobTimeout time.Duration) time.Duration {
+	return min(10*time.Second, jobTimeout/2)
 }
 
 // claimLength returns the length of each new claim and of each extension.
 func claimLength(jobTimeout time.Duration) time.Duration {
-	return jobTimeout + claimGap(jobTimeout)
+	return jobTimeout + claimOverhead(jobTimeout)
 }
 
-// claimTimeToStart returns the claim time that must be left when the handler starts.
+// minClaimLeftAtStart returns the minimum claim time that must be left when the handler starts:
+// the job timeout and the half of the overhead after it.
 // If less time is left, processJob extends the claim before the handler starts.
-func claimTimeToStart(jobTimeout time.Duration) time.Duration {
-	return jobTimeout + claimGap(jobTimeout)/2
-}
-
-// claimBudget returns the time that a worker can use from a claim of the given length.
-// It is the length minus up to 2ms. Thus, the local deadline is never later than the expiry in the database:
-//   - The database gets the length in whole milliseconds.
-//   - SQLite stores the start of the claim in whole milliseconds, so the start can be up to 1ms too early.
-func claimBudget(timeout time.Duration) time.Duration {
-	return timeout.Truncate(time.Millisecond) - time.Millisecond
+func minClaimLeftAtStart(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + claimOverhead(jobTimeout)/2
 }
 
 // localClaimDeadline returns the time at which the worker must think that a claim expires.
-// The drivers call it before they send the claim UPDATE, so the deadline is not later than
-// the expiry that the database stores. The worker compares the deadline with its own clock,
-// so it does not need a query for each check.
+// The drivers call it before they send the claim UPDATE. Thus, the round trip and the waits
+// for locks make the deadline earlier than the expiry that the database stores. The worker
+// compares the deadline with its own clock, so it does not need a query for each check.
 func localClaimDeadline(timeout time.Duration) time.Time {
-	return time.Now().Add(claimBudget(timeout))
+	return time.Now().Add(timeout)
 }
 
 // claimKey returns the key of a claim in consumer.claims. The consumer uses that map to count
