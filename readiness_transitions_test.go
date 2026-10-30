@@ -54,7 +54,7 @@ func completeReadinessJob(t *testing.T, db *sql.DB, d driver, j job) {
 	})
 	defer cons.cancel()
 	cons.processJob(&j)
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
 	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='completed'`))
 }
 
@@ -66,20 +66,20 @@ func testAmbiguousClaim(t *testing.T, f readinessFixture, observer, db *sql.DB, 
 	require.Empty(t, jobs, "a failed claim response must not deliver speculative jobs")
 	var oldToken string
 	if fault == 2 {
-		require.NoError(t, observer.QueryRowContext(t.Context(), `SELECT claim_token FROM jobs`).Scan(&oldToken))
+		require.NoError(t, observer.QueryRowContext(t.Context(), `SELECT claim_token FROM sqlq_jobs`).Scan(&oldToken))
 		require.NotEmpty(t, oldToken)
 		jobs, err = d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Empty(t, jobs, "an acknowledged-lost claim must remain exclusively held until expiry")
-		// Natural expiry is covered by the SIGSTOP test. Fast-forward only the
-		// database fixture here to cheaply test the lost-claim-response branch.
-		expire := `UPDATE jobs SET claim_expires_at=0`
+		// The SIGSTOP test examines a real expiry. Here, only the database time moves forward.
+		// Thus, the test of the lost-claim branch is fast.
+		expire := `UPDATE sqlq_jobs SET claim_expires_at=0`
 		if f.kind == DBTypePostgres {
-			expire = `UPDATE jobs SET claim_expires_at=clock_timestamp()-interval '1 second'`
+			expire = `UPDATE sqlq_jobs SET claim_expires_at=clock_timestamp()-interval '1 second'`
 		}
 		require.NoError(t, execSQL(t.Context(), observer, expire))
 	} else {
-		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE claim_token IS NULL AND consumed_at IS NULL`))
+		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs WHERE claim_token IS NULL AND consumed_at IS NULL`))
 	}
 	j := claimReadinessJob(t, d)
 	require.NotEqual(t, oldToken, j.ClaimToken)
@@ -100,8 +100,8 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 			return err
 		}
 		if attempts == 1 {
-			// The failed attempt rolls back. Its retry/DLQ settlement is the
-			// next COMMIT, so this fault targets settlement, not the handler.
+			// The failed attempt rolls back. The next COMMIT records the retry or the DLQ move.
+			// Thus, this fault applies to that record, not to the handler.
 			arm(fault)
 		}
 		return errors.New("deliberate handler failure")
@@ -122,18 +122,18 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 	require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects WHERE value='failed-attempt'`))
 	if terminal {
 		if fault == 1 {
-			// The DLQ transaction rolled back; the consumer reschedules the job.
-			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
+			// The DLQ transaction rolled back. The consumer schedules the job again.
+			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
-			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE job_type='terminal-child'`))
+			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs WHERE job_type='terminal-child'`))
 			next := claimReadinessJob(t, d)
 			require.Equal(t, uint32(1), next.RetryCount)
 			cons.processJob(&next)
 		}
-		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
+		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects WHERE value='terminal-hook'`))
-		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE job_type='terminal-child'`))
-		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE job_type='claims'`))
+		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs WHERE job_type='terminal-child'`))
+		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs WHERE job_type='claims'`))
 	} else {
 		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
 		next := claimReadinessJob(t, d)
@@ -142,13 +142,13 @@ func testAmbiguousFailure(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 			wantRetries = 1
 		}
 		require.Equal(t, wantRetries, next.RetryCount, "only committed retry settlements advance the count")
-		// Repeating settlement with the old token must not count a second failure
-		// or interfere with a freshly acquired claim.
+		// A second record with the old token must not count a second failure,
+		// and must not change a new claim.
 		require.ErrorIs(t, d.markJobFailedAndReschedule(t.Context(), j.ID, j.ClaimToken, "stale", 0), ErrClaimLost)
 		cons.processJob(&next)
 		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects WHERE value='completed'`))
-		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM jobs WHERE processed_at IS NOT NULL`))
-		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
+		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs WHERE processed_at IS NOT NULL`))
+		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 	}
 }
 
@@ -159,14 +159,14 @@ func testAmbiguousRequeue(t *testing.T, observer, db *sql.DB, d driver, q JobsQu
 	arm(fault)
 	require.Error(t, q.RequeueDeadLetterJob(t.Context(), j.ID))
 	if fault == 1 {
-		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
-		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs`))
+		require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+		require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs`))
 		require.NoError(t, q.RequeueDeadLetterJob(t.Context(), j.ID))
 	} else {
 		require.ErrorIs(t, q.RequeueDeadLetterJob(t.Context(), j.ID), ErrJobNotFound)
 	}
-	require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
-	require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM jobs`))
+	require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+	require.Equal(t, 1, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs`))
 	replacement := claimReadinessJob(t, d)
 	require.NotEqual(t, j.ID, replacement.ID)
 	require.Equal(t, j.Payload, replacement.Payload)
@@ -190,10 +190,10 @@ func testReadinessPublishing(t *testing.T, f readinessFixture, observer *sql.DB,
 			require.NoError(t, err)
 			require.NoError(t, q.PublishTx(t.Context(), tx, "claims", "first"))
 			require.NoError(t, q.PublishTx(t.Context(), tx, "claims", "second"))
-			// PublishTx success is not a commit. An independent connection must
-			// see neither the application's writes nor either queue publication.
+			// A successful PublishTx is not a commit. A different connection must not see
+			// the application writes, and must not see the two published jobs.
 			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
-			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM jobs`))
+			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs`))
 			committed := false
 			switch outcome {
 			case "rollback":
@@ -216,8 +216,8 @@ func testReadinessPublishing(t *testing.T, f readinessFixture, observer *sql.DB,
 				wantWrites, wantJobs = 1, 2
 			}
 			require.Equal(t, wantWrites, countReadiness(t, observer, `SELECT count(*) FROM readiness_effects`))
-			require.Equal(t, wantJobs, countReadiness(t, observer, `SELECT count(*) FROM jobs`))
-			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM dead_letter_queue`))
+			require.Equal(t, wantJobs, countReadiness(t, observer, `SELECT count(*) FROM sqlq_jobs`))
+			require.Zero(t, countReadiness(t, observer, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 		})
 	}
 }

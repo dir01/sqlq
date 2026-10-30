@@ -34,17 +34,19 @@ var durationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5
 
 // metrics holds the queue's OpenTelemetry instruments.
 type metrics struct {
-	published  metric.Int64Counter
-	attempts   metric.Int64Counter
-	duration   metric.Float64Histogram
-	lag        metric.Float64Histogram
-	queueDepth metric.Int64ObservableGauge
-	queueLag   metric.Float64ObservableGauge
+	published      metric.Int64Counter
+	attempts       metric.Int64Counter
+	duration       metric.Float64Histogram
+	lag            metric.Float64Histogram
+	queueDepth     metric.Int64ObservableGauge
+	queueLag       metric.Float64ObservableGauge
+	claimsExtended metric.Int64Counter
+	claimsExpired  metric.Int64Counter
 }
 
 func newMetrics(meter metric.Meter) (*metrics, error) {
 	var m metrics
-	var errs [6]error
+	var errs [8]error
 	m.published, errs[0] = meter.Int64Counter("sqlq.jobs.published", metric.WithUnit("{job}"),
 		metric.WithDescription("Jobs inserted by Publish and PublishTx, also those whose transaction rolls back later."))
 	m.attempts, errs[1] = meter.Int64Counter("sqlq.job.attempts", metric.WithUnit("{attempt}"),
@@ -59,6 +61,10 @@ func newMetrics(meter metric.Meter) (*metrics, error) {
 		metric.WithDescription("Jobs that are due and not claimed, for each job type that the queue consumes."))
 	m.queueLag, errs[5] = meter.Float64ObservableGauge("sqlq.queue.lag", metric.WithUnit("s"),
 		metric.WithDescription("How long the oldest job that is due and not claimed has been due, for each consumed job type."))
+	m.claimsExtended, errs[6] = meter.Int64Counter("sqlq.claim.extended", metric.WithUnit("{claim}"),
+		metric.WithDescription("Claims extended before the handler started, because the job waited in the buffer for a long time."))
+	m.claimsExpired, errs[7] = meter.Int64Counter("sqlq.claim.expired", metric.WithUnit("{claim}"),
+		metric.WithDescription("Claims that expired in the buffer, before the handler started. The job went back to the queue."))
 	if err := errors.Join(errs[:]...); err != nil {
 		return nil, fmt.Errorf("failed to create metrics: %w", err)
 	}
@@ -70,6 +76,17 @@ func (m *metrics) recordAttempt(ctx context.Context, jobType, result string, d t
 	attrs := metric.WithAttributes(attribute.String(jobTypeAttr, jobType), attribute.String(resultAttr, result))
 	m.attempts.Add(ctx, 1, attrs)
 	m.duration.Record(ctx, d.Seconds(), attrs)
+}
+
+// recordResult records the result of an attempt that did not write it. For example, the worker
+// process stopped during the handler. It does not record a duration, because the queue does not know it.
+func (m *metrics) recordResult(ctx context.Context, jobType, result string) {
+	m.attempts.Add(ctx, 1, metric.WithAttributes(attribute.String(jobTypeAttr, jobType), attribute.String(resultAttr, result)))
+}
+
+// recordClaim adds one to counter, which is one of the claim counters.
+func (m *metrics) recordClaim(ctx context.Context, counter metric.Int64Counter, jobType string) {
+	counter.Add(ctx, 1, metric.WithAttributes(attribute.String(jobTypeAttr, jobType)))
 }
 
 // recordLag records how long a job waited for its handler to start, after the job became due.

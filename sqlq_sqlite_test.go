@@ -168,7 +168,7 @@ func newSQLiteTestCase(t *testing.T, dbName string, tracer trace.Tracer) *TestCa
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
-		sqlq.WithDefaultPollInterval(25*time.Millisecond),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(25*time.Millisecond)),
 		sqlq.WithTracer(tracer),
 	)
 	require.NoError(t, err)

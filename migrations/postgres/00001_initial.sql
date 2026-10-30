@@ -1,5 +1,5 @@
 -- +goose Up
-CREATE TABLE jobs (
+CREATE TABLE sqlq_jobs (
     id BIGSERIAL PRIMARY KEY,
     job_type TEXT NOT NULL,
     payload BYTEA,
@@ -13,11 +13,11 @@ CREATE TABLE jobs (
     claim_token TEXT NULL,
     claim_expires_at TIMESTAMP WITH TIME ZONE NULL
 );
-CREATE INDEX idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL;
-CREATE INDEX idx_jobs_job_type_processed_at ON jobs(job_type, processed_at); -- Cleaning up processed jobs
+CREATE INDEX idx_sqlq_jobs_available_claims ON sqlq_jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL;
+CREATE INDEX idx_sqlq_jobs_job_type_processed_at ON sqlq_jobs(job_type, processed_at); -- Cleaning up processed jobs
 
 -- Dead-lettered jobs keep their original IDs.
-CREATE TABLE dead_letter_queue (
+CREATE TABLE sqlq_dead_letter_queue (
     original_job_id BIGINT PRIMARY KEY,
     job_type TEXT NOT NULL,
     payload BYTEA,
@@ -26,8 +26,8 @@ CREATE TABLE dead_letter_queue (
     retry_count INTEGER NOT NULL DEFAULT 0,
     failure_reason TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX idx_dlq_job_type ON dead_letter_queue(job_type);
+CREATE INDEX idx_sqlq_dlq_job_type ON sqlq_dead_letter_queue(job_type);
 
 -- +goose Down
-DROP TABLE dead_letter_queue;
-DROP TABLE jobs;
+DROP TABLE sqlq_dead_letter_queue;
+DROP TABLE sqlq_jobs;

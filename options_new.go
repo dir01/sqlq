@@ -43,24 +43,27 @@ func WithLogger(logger *slog.Logger) NewOption {
 // Default values for per-consumer options
 //////////////////////////////////////////
 
-// WithDefaultPollInterval allows to configure default poll interval.
-// A zero or negative interval is ignored, as it is by WithConsumerPollInterval.
-// This value may be overridden per individual consumer, see WithConsumerPollInterval.
-func WithDefaultPollInterval(tick time.Duration) NewOption {
+// WithDefaultPollDelayFunc sets the function that calculates the delay to the next poll for new jobs.
+// emptyPolls is the number of polls since the last poll that found jobs. It stops at 65535.
+// The default starts at 100ms and becomes 10% longer after each poll that finds no jobs,
+// to a maximum of 30s. For a fixed interval, use func(emptyPolls uint16) time.Duration { return 100 * time.Millisecond }.
+// A zero or negative delay polls again immediately. The option ignores nil.
+// This value may be overridden per individual consumer, see WithConsumerPollDelayFunc.
+func WithDefaultPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
-		if tick > 0 {
-			q.defaultPollInterval = tick
+		if pollDelayFunc != nil {
+			q.defaultPollDelayFunc = pollDelayFunc
 		}
 	}
 }
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
-// The retry argument saturates at 65535; JobInfo.RetryCount retains the wider count.
-// If backoffFunc panics, the panic is logged and the retry uses the built-in exponential backoff
-// with jitter, capped at 24 hours.
+// The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
+// If backoffFunc panics, the queue logs the panic, and the retry uses the default exponential
+// backoff with jitter, to a maximum of 24 hours.
 // Consume returns ErrNilBackoffFunc if backoffFunc is nil and the consumer does not set its own.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
-func WithDefaultBackoffFunc(backoffFunc func(uint16) time.Duration) NewOption {
+func WithDefaultBackoffFunc(backoffFunc func(retryNum uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
 		q.defaultBackoffFunc = backoffFunc
 	}
@@ -151,22 +154,13 @@ func WithDefaultMaxRetries(maxRetries int32) NewOption {
 
 // WithDefaultJobTimeout sets a maximum execution duration for a single job handler invocation.
 // If the handler exceeds this duration, its context will be canceled.
-// A timeout is treated as a job failure.
+// A timeout is treated as a job failure. The default is 2 seconds.
+// The option ignores a zero or negative timeout, and increases a timeout shorter than 50ms to 50ms.
 // This value may be overridden per individual consumer, see WithConsumerJobTimeout.
 func WithDefaultJobTimeout(timeout time.Duration) NewOption {
 	return func(o *sqlq) {
 		if timeout > 0 {
-			o.defaultJobTimeout = timeout
-		}
-	}
-}
-
-// WithDefaultClaimTimeout sets the claim timeout for all consumers.
-// Default is twice the job timeout of each consumer. See WithConsumerClaimTimeout for details.
-func WithDefaultClaimTimeout(timeout time.Duration) NewOption {
-	return func(q *sqlq) {
-		if claimBudget(timeout) > 0 {
-			q.defaultClaimTimeout = timeout
+			o.defaultJobTimeout = max(timeout, minJobTimeout)
 		}
 	}
 }

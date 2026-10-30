@@ -37,7 +37,7 @@ func (tc *TestCase) TestPublishTx(ctx context.Context, t *testing.T) {
 			var payload []byte
 			var delayed bool
 			err = tx.QueryRowContext(ctx,
-				"SELECT payload, scheduled_at > created_at FROM jobs WHERE job_type = $1", name,
+				"SELECT payload, scheduled_at > created_at FROM sqlq_jobs WHERE job_type = $1", name,
 			).Scan(&payload, &delayed)
 			require.NoError(t, err, "the job must be visible in the caller's transaction")
 			var decoded TestPayload
@@ -46,7 +46,7 @@ func (tc *TestCase) TestPublishTx(ctx context.Context, t *testing.T) {
 			require.True(t, delayed, "transactional publishing must preserve the delay")
 
 			var count int
-			err = tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE job_type = $1", name).Scan(&count)
+			err = tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs WHERE job_type = $1", name).Scan(&count)
 			require.NoError(t, err)
 			require.Zero(t, count, "uncommitted jobs must not be visible on another connection")
 
@@ -60,7 +60,7 @@ func (tc *TestCase) TestPublishTx(ctx context.Context, t *testing.T) {
 			if commit {
 				expected = 1
 			}
-			err = tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE job_type = $1", name).Scan(&count)
+			err = tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs WHERE job_type = $1", name).Scan(&count)
 			require.NoError(t, err)
 			require.Equal(t, expected, count)
 			err = tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM publish_tx_records WHERE name = $1", name).Scan(&count)

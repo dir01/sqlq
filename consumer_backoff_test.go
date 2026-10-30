@@ -30,8 +30,9 @@ func TestRetryJobBackoffPanic(t *testing.T) {
 		minDelay   time.Duration
 		maxDelay   time.Duration
 	}{
-		{"first retry", 0, 1, 2 * time.Second, 2 * time.Second},
-		{"jitter", 4, 5, 32 * time.Second, 36 * time.Second},
+		// The default backoff adds a jitter of up to 20% to each delay.
+		{"first retry", 0, 1, 2 * time.Second, 2400 * time.Millisecond},
+		{"jitter", 4, 5, 32 * time.Second, 38400 * time.Millisecond},
 		{"saturated callback", 65535, 65535, 24 * time.Hour, 24 * time.Hour},
 		{"maximum count", ^uint32(0), 65535, 24 * time.Hour, 24 * time.Hour},
 	} {
