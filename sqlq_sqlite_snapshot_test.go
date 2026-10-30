@@ -57,7 +57,7 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 
 		// The handler reads. This sets the snapshot of the transaction.
 		var n int
-		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&n); readErr != nil {
+		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs").Scan(&n); readErr != nil {
 			handlerErrs.Add(1)
 			return readErr
 		}
@@ -79,7 +79,7 @@ func TestSQLiteHandlerReadThenConcurrentWrite(t *testing.T) {
 	var processed bool
 	require.Eventually(t, func() bool {
 		var processedAt sql.NullInt64
-		if scanErr := db.QueryRowContext(ctx, "SELECT processed_at FROM jobs WHERE job_type = ?", jobType).Scan(&processedAt); scanErr == nil {
+		if scanErr := db.QueryRowContext(ctx, "SELECT processed_at FROM sqlq_jobs WHERE job_type = ?", jobType).Scan(&processedAt); scanErr == nil {
 			processed = processedAt.Valid
 			return processed
 		}
@@ -147,7 +147,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 			return nil
 		}
 		var n int
-		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&n); readErr != nil {
+		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs").Scan(&n); readErr != nil {
 			return readErr
 		}
 		// A different process takes the write lock, and keeps it until after the claim expires.
@@ -176,7 +176,7 @@ func TestSQLiteHandlerReadThenLongLock(t *testing.T) {
 	var retryCount int
 	var lastError sql.NullString
 	require.Eventually(t, func() bool {
-		scanErr := db.QueryRowContext(ctx, "SELECT processed_at, retry_count, last_error FROM jobs WHERE job_type = ?", jobType).
+		scanErr := db.QueryRowContext(ctx, "SELECT processed_at, retry_count, last_error FROM sqlq_jobs WHERE job_type = ?", jobType).
 			Scan(&processedAt, &retryCount, &lastError)
 		return scanErr == nil && (processedAt.Valid || lastError.Valid)
 	}, 5*time.Second, 20*time.Millisecond)

@@ -352,8 +352,8 @@ existed are not upgraded: drain the queue and drop its tables first.
 
 | Table | Contents |
 | --- | --- |
-| `jobs` | `id`, `job_type`, JSON `payload`, `created_at`, `scheduled_at`, `retry_count`, `last_error`, `trace_context`, `consumed_at`, `claim_token`, `claim_expires_at`, `processed_at`. |
-| `dead_letter_queue` | `original_job_id` (primary key), `job_type`, `payload`, `created_at`, `failed_at`, `retry_count`, `failure_reason`. |
+| `sqlq_jobs` | `id`, `job_type`, JSON `payload`, `created_at`, `scheduled_at`, `retry_count`, `last_error`, `trace_context`, `consumed_at`, `claim_token`, `claim_expires_at`, `processed_at`. |
+| `sqlq_dead_letter_queue` | `original_job_id` (primary key), `job_type`, `payload`, `created_at`, `failed_at`, `retry_count`, `failure_reason`. |
 
 A due job is claimed by setting `consumed_at`, a token, and an expiry. Success sets `processed_at`;
 the row remains until cleanup. The start of each attempt increments the retry count.

@@ -123,10 +123,10 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			res, err := tx.ExecContext(ctx, `
-				DELETE FROM jobs
+				DELETE FROM sqlq_jobs
 				WHERE rowid IN (
 					SELECT rowid
-					FROM jobs
+					FROM sqlq_jobs
 					WHERE job_type = ? AND processed_at < ?
 					LIMIT ?
 				)
@@ -171,10 +171,10 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			resDLQ, err := tx.ExecContext(ctx, `
-				DELETE FROM dead_letter_queue
+				DELETE FROM sqlq_dead_letter_queue
 				WHERE rowid IN (
 					SELECT rowid
-					FROM dead_letter_queue
+					FROM sqlq_dead_letter_queue
 					WHERE job_type = ? AND failed_at < ?
 					LIMIT ?
 				)
@@ -253,14 +253,14 @@ func (d *SQLiteDriver) insertJob(
 
 	if delay <= 0 {
 		query = `
-			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
+			INSERT INTO sqlq_jobs (job_type, payload, created_at, scheduled_at, trace_context) 
 			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, nowMs, string(traceContextJSON)}
 	} else {
 		scheduledMs := nowMs + delay.Milliseconds()
 		query = `
-			INSERT INTO jobs (job_type, payload, created_at, scheduled_at, trace_context) 
+			INSERT INTO sqlq_jobs (job_type, payload, created_at, scheduled_at, trace_context) 
 			VALUES (?, ?, ?, ?, ?)
 		`
 		args = []any{jobType, payload, nowMs, scheduledMs, string(traceContextJSON)}
@@ -318,12 +318,12 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	}
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
-			UPDATE jobs
+			UPDATE sqlq_jobs
 			SET consumed_at = `+sqliteNow+`, claim_token = ? || ':' || id,
 				claim_expires_at = `+sqliteNow+` + ?
 			WHERE id IN (
 				SELECT id
-				FROM jobs
+				FROM sqlq_jobs
 				WHERE job_type = ?
 				AND scheduled_at <= `+sqliteNow+`
 				AND processed_at IS NULL
@@ -387,7 +387,7 @@ func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Dura
 		return deadline, err
 	}
 	defer d.unlock()
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?,
+	result, err := d.db.ExecContext(ctx, `UPDATE sqlq_jobs SET claim_expires_at = `+sqliteNow+` + ?,
 			retry_count = CASE WHEN ? AND retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL AND claim_expires_at > `+sqliteNow,
 		timeout.Milliseconds(), startAttempt, j.ID, j.ClaimToken)
@@ -397,7 +397,7 @@ func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Dura
 func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
 	// Do not take dbLock here. A dead-letter hook can hold it for a long time. Shutdown has
 	// a short time for the release, and the wait can use all of it. The SQLite lock is sufficient.
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = ?
+	result, err := d.db.ExecContext(ctx, `UPDATE sqlq_jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = ?
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, int64(j.RetryCount), j.ID, j.ClaimToken)
 	return checkClaimResult(result, err)
 }
@@ -489,7 +489,7 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 
 	// The start of the attempt incremented retry_count (see extendClaim). A success is not a retry.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = ?, retry_count = MAX(retry_count - 1, 0)
+		`UPDATE sqlq_jobs SET processed_at = ?, retry_count = MAX(retry_count - 1, 0)
 			WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
 		nowMs, jobID, claimToken,
 	)
@@ -565,7 +565,7 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	// Set the error and the schedule, and clear the claim. The start of the attempt already
 	// incremented retry_count (see extendClaim).
 	res, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET 
+		UPDATE sqlq_jobs SET 
 			last_error = ?, 
 			scheduled_at = ?,
 			consumed_at = NULL, 
@@ -590,7 +590,7 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	return err
 }
 
-// moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
+// moveToDeadLetterQueue moves a failed job from the sqlq_jobs table to the sqlq_dead_letter_queue table in SQLite, using the original job ID as the primary key.
 // inTx runs while dbLock is locked. Thus, it must not call driver methods that take dbLock.
 func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
@@ -626,10 +626,10 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	// with SQLITE_BUSY_SNAPSHOT. dbLock applies only to this process. A first write waits
 	// for the lock, and does not fail.
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO dead_letter_queue
+		INSERT INTO sqlq_dead_letter_queue
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
 		SELECT id, job_type, payload, created_at, ?, MAX(retry_count - 1, 0), ?
-		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
+		FROM sqlq_jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
 	`, nowMs, reason, jobID, claimToken)
 	if err = checkClaimResult(res, err); err != nil {
 		span.RecordError(err)
@@ -637,7 +637,7 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	}
 
 	// Delete from jobs table (no CASCADE in SQLite by default, but job_consumers is gone anyway)
-	res, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
+	res, err = tx.ExecContext(ctx, `DELETE FROM sqlq_jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, jobID, claimToken)
 	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
@@ -660,7 +660,7 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	return err
 }
 
-// getDeadLetterJobs retrieves jobs from the dead_letter_queue table in SQLite, optionally filtered by job type.
+// getDeadLetterJobs retrieves jobs from the sqlq_dead_letter_queue table in SQLite, optionally filtered by job type.
 func (d *SQLiteDriver) getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error) { //nolint:revive // Limit is fine
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.get_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -677,7 +677,7 @@ func (d *SQLiteDriver) getDeadLetterJobs(ctx context.Context, jobType string, li
 
 	query := `
 		SELECT original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
-		FROM dead_letter_queue
+		FROM sqlq_dead_letter_queue
 		WHERE job_type = ?
 		ORDER BY failed_at DESC -- Still order by failure time
 		LIMIT ?
@@ -685,7 +685,7 @@ func (d *SQLiteDriver) getDeadLetterJobs(ctx context.Context, jobType string, li
 	if jobType == "" {
 		query = `
 			SELECT original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
-			FROM dead_letter_queue
+			FROM sqlq_dead_letter_queue
 			ORDER BY failed_at DESC -- Still order by failure time
 			LIMIT ?
 		`
@@ -747,7 +747,7 @@ func (d *SQLiteDriver) queryDeadLetterJobs(ctx context.Context, query string, ar
 	return jobs, nil
 }
 
-// requeueDeadLetterJob moves a job from the dead_letter_queue back into the main jobs table for reprocessing in SQLite, identifying the job by its original ID.
+// requeueDeadLetterJob moves a job from the sqlq_dead_letter_queue back into the sqlq_jobs table for reprocessing in SQLite, identifying the job by its original ID.
 func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) (string, error) {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.requeue_dead_letter_job", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -784,9 +784,9 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 	// starts with a write. For the reason, see moveToDeadLetterQueue.
 	var jobType string
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)
+		INSERT INTO sqlq_jobs (job_type, payload, retry_count, created_at, scheduled_at)
 		SELECT job_type, payload, 0, ?, ?
-		FROM dead_letter_queue WHERE original_job_id = ?
+		FROM sqlq_dead_letter_queue WHERE original_job_id = ?
 		RETURNING job_type
 	`, nowMs, nowMs, originalJobID).Scan(&jobType)
 	if err != nil {
@@ -797,7 +797,7 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 		return "", err // Rollback will happen
 	}
 
-	_, err = tx.ExecContext(ctx, "DELETE FROM dead_letter_queue WHERE original_job_id = ?", originalJobID) // Use originalJobID in WHERE
+	_, err = tx.ExecContext(ctx, "DELETE FROM sqlq_dead_letter_queue WHERE original_job_id = ?", originalJobID) // Use originalJobID in WHERE
 	if err != nil {
 		span.RecordError(err)
 		return "", err // Rollback will happen

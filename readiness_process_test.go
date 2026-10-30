@@ -102,16 +102,16 @@ func testStaleResumption(t *testing.T, f readinessFixture, db *sql.DB, d driver)
 		t.Fatal("worker did not reach pre-transaction barrier")
 	}
 	var oldToken string
-	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT claim_token FROM jobs WHERE job_type='claims'`).Scan(&oldToken))
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT claim_token FROM sqlq_jobs WHERE job_type='claims'`).Scan(&oldToken))
 	require.NotEmpty(t, oldToken)
 	require.NoError(t, cmd.Process.Signal(syscall.SIGSTOP))
 	var status syscall.WaitStatus
 	_, err = syscall.Wait4(cmd.Process.Pid, &status, syscall.WUNTRACED, nil)
 	require.NoError(t, err)
 	require.True(t, status.Stopped(), "must observe an actual process pause")
-	expired := `SELECT count(*) FROM jobs WHERE claim_expires_at <= ` + sqliteNow
+	expired := `SELECT count(*) FROM sqlq_jobs WHERE claim_expires_at <= ` + sqliteNow
 	if f.kind == DBTypePostgres {
-		expired = `SELECT count(*) FROM jobs WHERE claim_expires_at <= clock_timestamp()`
+		expired = `SELECT count(*) FROM sqlq_jobs WHERE claim_expires_at <= clock_timestamp()`
 	}
 	awaitReadiness(t, "paused worker's claim naturally expired", func() bool { return countReadiness(t, db, expired) == 1 })
 	jobs, err := d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
@@ -150,7 +150,7 @@ func testStaleResumption(t *testing.T, f readinessFixture, db *sql.DB, d driver)
 	}
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects`))
 	var currentToken string
-	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT claim_token FROM jobs WHERE processed_at IS NULL`).Scan(&currentToken))
+	require.NoError(t, db.QueryRowContext(t.Context(), `SELECT claim_token FROM sqlq_jobs WHERE processed_at IS NULL`).Scan(&currentToken))
 	require.Equal(t, jobs[0].ClaimToken, currentToken, "stale settlement/release must preserve B's ownership")
 	cons := testClaimConsumer(t.Context(), db, d, func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO readiness_effects VALUES ('replacement')`)
@@ -162,6 +162,6 @@ func testStaleResumption(t *testing.T, f readinessFixture, db *sql.DB, d driver)
 	cons.processJob(&jobs[0])
 	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='replacement'`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='stale'`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE processed_at IS NOT NULL AND retry_count=1`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE processed_at IS NOT NULL AND retry_count=1`))
 }

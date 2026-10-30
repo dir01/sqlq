@@ -79,18 +79,18 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	require.NoError(t, err)
 	expire := func() {
 		t.Helper()
-		query := `UPDATE jobs SET claim_expires_at = 0`
+		query := `UPDATE sqlq_jobs SET claim_expires_at = 0`
 		if dbType == DBTypePostgres {
-			query = `UPDATE jobs SET claim_expires_at = clock_timestamp() - interval '1 second'`
+			query = `UPDATE sqlq_jobs SET claim_expires_at = clock_timestamp() - interval '1 second'`
 		}
 		_, err := db.ExecContext(ctx, query)
 		require.NoError(t, err)
 	}
 	seed := func(count int) []job {
 		t.Helper()
-		_, err := db.ExecContext(ctx, `DELETE FROM jobs`)
+		_, err := db.ExecContext(ctx, `DELETE FROM sqlq_jobs`)
 		require.NoError(t, err)
-		_, err = db.ExecContext(ctx, `DELETE FROM dead_letter_queue`)
+		_, err = db.ExecContext(ctx, `DELETE FROM sqlq_dead_letter_queue`)
 		require.NoError(t, err)
 		for range count {
 			require.NoError(t, d.insertJob(ctx, nil, "claims", []byte(`{}`), 0, nil))
@@ -259,7 +259,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		require.Equal(t, int64(1), counterValue(t, metrics, "sqlq.jobs.claim.lost.count"))
 		require.Zero(t, spy.releases)
 		var processed int
-		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE processed_at IS NOT NULL`).Scan(&processed))
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NOT NULL`).Scan(&processed))
 		require.Zero(t, processed)
 	})
 
@@ -319,7 +319,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 			require.NoError(t, err)
 			require.NoError(t, runInTx(ctx, db, func(tx *sql.Tx) error { return d.markJobProcessed(ctx, tx, j.ID, j.ClaimToken) }))
 			var retries int
-			require.NoError(t, db.QueryRowContext(ctx, `SELECT retry_count FROM jobs`).Scan(&retries))
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT retry_count FROM sqlq_jobs`).Scan(&retries))
 			require.Zero(t, retries)
 		})
 		t.Run("the dead letter queue does not count the final attempt as a retry", func(t *testing.T) {
@@ -337,7 +337,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	t.Run("shutdown releases active and buffered jobs without counting failures", func(t *testing.T) {
 		seed(3)
 		// Clear seed's claims, so the consumer below can claim all three jobs.
-		_, err := db.ExecContext(ctx, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`)
+		_, err := db.ExecContext(ctx, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`)
 		require.NoError(t, err)
 		started := make(chan struct{})
 		cons := testClaimConsumer(ctx, db, d, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
@@ -370,26 +370,26 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 			require.NoError(t, db.QueryRowContext(ctx, query).Scan(&n))
 			return n
 		}
-		inJobs := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d`, j.ID)
-		stillClaimed := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d AND claim_token = '%s'`, j.ID, j.ClaimToken)
-		inDLQ := fmt.Sprintf(`SELECT COUNT(*) FROM dead_letter_queue WHERE original_job_id = %d`, j.ID)
+		inJobs := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_jobs WHERE id = %d`, j.ID)
+		stillClaimed := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_jobs WHERE id = %d AND claim_token = '%s'`, j.ID, j.ClaimToken)
+		inDLQ := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_dead_letter_queue WHERE original_job_id = %d`, j.ID)
 
 		rejected := fmt.Errorf("hook rejected")
 		require.ErrorIs(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", func(*sql.Tx) error {
 			return rejected
 		}), rejected)
 		require.Equal(t, 1, count(stillClaimed), "a rolled-back move must preserve the original job and its claim")
-		require.Zero(t, count(`SELECT COUNT(*) FROM dead_letter_queue`))
+		require.Zero(t, count(`SELECT COUNT(*) FROM sqlq_dead_letter_queue`))
 
 		require.NoError(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", nil))
 		require.Zero(t, count(inJobs), "a committed move must delete the job")
 		require.Equal(t, 1, count(inDLQ))
-		require.Equal(t, 1, count(`SELECT COUNT(*) FROM dead_letter_queue`))
+		require.Equal(t, 1, count(`SELECT COUNT(*) FROM sqlq_dead_letter_queue`))
 	})
 
 	t.Run("canceled delivery releases jobs that never reached the channel", func(t *testing.T) {
 		seed(3)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
@@ -407,7 +407,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("prefetch keeps workers supplied without claiming beyond local capacity", func(t *testing.T) {
 		seed(6)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job, 3)
@@ -447,7 +447,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("worker process loss rolls back running effects and recovers prefetch", func(t *testing.T) {
 		seed(3)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		require.NoError(t, execSQL(ctx, db, `CREATE TABLE claim_crash_effects (id INTEGER PRIMARY KEY)`))
 		cmd := exec.Command(os.Args[0], "-test.run=^TestClaimCrashHelper$")
 		cmd.Env = append(os.Environ(), "SQLQ_CLAIM_CRASH_DSN="+dsn, "SQLQ_CLAIM_CRASH_TYPE="+string(dbType), "SQLQ_CLAIM_CRASH_SCHEMA="+schema)

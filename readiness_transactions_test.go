@@ -142,14 +142,14 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 				require.Equal(t, fault, fired(), "the intended commit boundary must actually fire")
 				if fault == 1 {
 					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='handler'`))
-					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='child'`))
+					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='child'`))
 					if maxRetries == 0 {
-						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='hook'`))
-						require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs`))
+						require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
 						return
 					}
-					require.Equal(t, 1, countReadiness(t, db, `SELECT retry_count FROM jobs WHERE job_type='claims'`))
+					require.Equal(t, 1, countReadiness(t, db, `SELECT retry_count FROM sqlq_jobs WHERE job_type='claims'`))
 					attempt()
 					require.Equal(t, 2, attempts)
 				} else {
@@ -157,9 +157,9 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 				}
 				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='handler'`))
 				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='hook'`))
-				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='child'`))
-				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
-				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='child'`))
+				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
+				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 				jobs, err := d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 				require.NoError(t, err)
 				require.Empty(t, jobs, "lost acknowledgment must not resurrect completed work")

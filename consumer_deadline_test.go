@@ -114,10 +114,10 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 				}
 				counts := deadlineCounts{
 					effects:   count("SELECT COUNT(*) FROM effects"),
-					poison:    count("SELECT COUNT(*) FROM jobs WHERE job_type='poison'"),
-					pending:   count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NULL"),
-					processed: count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NOT NULL"),
-					dlq:       count("SELECT COUNT(*) FROM dead_letter_queue"),
+					poison:    count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='poison'"),
+					pending:   count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='deadline' AND processed_at IS NULL"),
+					processed: count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='deadline' AND processed_at IS NOT NULL"),
+					dlq:       count("SELECT COUNT(*) FROM sqlq_dead_letter_queue"),
 				}
 				switch {
 				case expired:

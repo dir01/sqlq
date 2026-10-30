@@ -55,7 +55,7 @@ func (tc *TestCase) TestConsumerTransaction(ctx context.Context, t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		var processed int
-		err := tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE job_type = 'consumer_tx' AND processed_at IS NOT NULL").Scan(&processed)
+		err := tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs WHERE job_type = 'consumer_tx' AND processed_at IS NOT NULL").Scan(&processed)
 		return err == nil && processed == 1
 	}, 5*time.Second, 10*time.Millisecond, "the successful attempt must commit job completion")
 
