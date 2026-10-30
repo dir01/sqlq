@@ -13,12 +13,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// boundaryConnector delegates all SQL to the real database driver. It only
-// controls Begin/Commit boundaries, with no production failpoints or mock SQL.
+// boundaryConnector sends all SQL to the real database driver. It only controls
+// Begin and Commit. It does not use failpoints in the production code or mock SQL.
 type boundaryConnector struct {
 	sqldriver.Connector
 	beforeBegin func()
-	commitFault atomic.Int32 // 1: disconnect before commit; 2: lose successful acknowledgment
+	commitFault atomic.Int32 // 1: disconnect before commit. 2: lose the acknowledgment of a successful commit
 	fired       atomic.Int32
 }
 
@@ -89,7 +89,7 @@ func (tx *boundaryTx) Commit() error {
 		return tx.Tx.Commit()
 	}
 	if fault == 1 {
-		// A lost connection before COMMIT leaves the transaction rolled back.
+		// If the connection is lost before COMMIT, the transaction rolls back.
 		if err := tx.Rollback(); err != nil {
 			return err
 		}
@@ -97,7 +97,7 @@ func (tx *boundaryTx) Commit() error {
 		return err
 	}
 	tx.control.fired.Store(fault)
-	// Do not return ErrBadConn, which permits database/sql transparent retries.
+	// Do not return ErrBadConn. With ErrBadConn, database/sql can retry without a report.
 	return errors.New("injected ambiguous commit outcome")
 }
 
@@ -142,14 +142,14 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 				require.Equal(t, fault, fired(), "the intended commit boundary must actually fire")
 				if fault == 1 {
 					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='handler'`))
-					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='child'`))
+					require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='child'`))
 					if maxRetries == 0 {
-						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 						require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='hook'`))
-						require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs`))
+						require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
 						return
 					}
-					require.Equal(t, 1, countReadiness(t, db, `SELECT retry_count FROM jobs WHERE job_type='claims'`))
+					require.Equal(t, 1, countReadiness(t, db, `SELECT retry_count FROM sqlq_jobs WHERE job_type='claims'`))
 					attempt()
 					require.Equal(t, 2, attempts)
 				} else {
@@ -157,9 +157,9 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 				}
 				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='handler'`))
 				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM readiness_effects WHERE value='hook'`))
-				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='child'`))
-				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
-				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='child'`))
+				require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE job_type='claims' AND processed_at IS NOT NULL`))
+				require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 				jobs, err := d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 				require.NoError(t, err)
 				require.Empty(t, jobs, "lost acknowledgment must not resurrect completed work")
@@ -170,12 +170,12 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 
 func readinessBoundaryDB(t *testing.T, f readinessFixture) (*sql.DB, driver, func(int32), func() int32) {
 	t.Helper()
-	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // Faults are initially disarmed.
+	control := &boundaryConnector{Connector: f.connector(t)} //nolint:exhaustruct // At the start, all faults are off.
 	var connector sqldriver.Connector = control
 	arm, fired := control.commitFault.Store, control.fired.Load
 	if f.kind == DBTypePostgres {
-		// The real PostgreSQL wire test confirms the outcome on the server;
-		// SQLite uses the real transaction with a synthesized driver error.
+		// The PostgreSQL network test examines the result on the server.
+		// SQLite uses the real transaction with a simulated driver error.
 		proxy := newReadinessProxy(t, f)
 		f.dsn = proxy.dsn
 		connector = f.connector(t)

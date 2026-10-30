@@ -3,7 +3,6 @@ package sqlq_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -14,23 +13,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAcceptedClaimTimeoutRunsHandler checks claim timeouts just above the job timeout:
-// Consume either rejects one, or the handler runs. A worker extends a claim with less than the
-// job timeout plus a margin left before it starts a handler. If the claim timeout cannot cover
-// that, extending again never helps, and an accepted consumer would never run anything.
-func TestAcceptedClaimTimeoutRunsHandler(t *testing.T) {
+// TestShortJobTimeoutRunsHandler examines very short job timeouts. The job timeout sets the claim.
+// The options raise a job timeout shorter than 50ms to 50ms.
+// Before a worker starts a handler, it extends the claim if the remaining time is too short. If an
+// extension also left too little time, the worker would extend the claim again and again, and the
+// handler would never run.
+func TestShortJobTimeoutRunsHandler(t *testing.T) {
 	t.Parallel()
-	const jobTimeout = 100 * time.Millisecond
-	for _, claimTimeout := range []time.Duration{
-		jobTimeout + time.Millisecond, 110 * time.Millisecond, 150 * time.Millisecond, 152 * time.Millisecond,
-		160 * time.Millisecond, 177 * time.Millisecond, 200 * time.Millisecond,
-	} {
-		t.Run(claimTimeout.String(), func(t *testing.T) {
+	for _, jobTimeout := range []time.Duration{time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond} {
+		t.Run(jobTimeout.String(), func(t *testing.T) {
 			t.Parallel()
 			dsn := "file:" + filepath.Join(t.TempDir(), "claim.db") + "?_journal_mode=WAL&_busy_timeout=1000"
 			db, err := sql.Open("sqlite3", dsn)
 			require.NoError(t, err)
-			q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollInterval(10*time.Millisecond))
+			q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollDelayFunc(pollEvery(10*time.Millisecond)))
 			require.NoError(t, err)
 			require.NoError(t, q.Run(t.Context()))
 			t.Cleanup(func() {
@@ -38,19 +34,18 @@ func TestAcceptedClaimTimeoutRunsHandler(t *testing.T) {
 				assert.NoError(t, db.Close())
 			})
 			ran := make(chan struct{}, 1)
-			err = q.Consume(t.Context(), "claimed", func(context.Context, *sql.Tx, []byte) error {
-				ran <- struct{}{}
+			require.NoError(t, q.Consume(t.Context(), "claimed", func(context.Context, *sql.Tx, []byte) error {
+				select {
+				case ran <- struct{}{}:
+				default:
+				}
 				return nil
-			}, sqlq.WithConsumerJobTimeout(jobTimeout), sqlq.WithConsumerClaimTimeout(claimTimeout))
-			if errors.Is(err, sqlq.ErrClaimTimeoutTooShort) {
-				return
-			}
-			require.NoError(t, err)
-			require.NoError(t, q.Publish(t.Context(), "claimed", TestPayload{Message: fmt.Sprint(claimTimeout)}))
+			}, sqlq.WithConsumerJobTimeout(jobTimeout)))
+			require.NoError(t, q.Publish(t.Context(), "claimed", TestPayload{Message: fmt.Sprint(jobTimeout)}))
 			select {
 			case <-ran:
 			case <-time.After(3 * time.Second):
-				t.Fatalf("claim timeout %s was accepted for job timeout %s, but the handler never ran", claimTimeout, jobTimeout)
+				t.Fatalf("the handler never ran with job timeout %s", jobTimeout)
 			}
 		})
 	}

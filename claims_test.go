@@ -21,7 +21,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"go.opentelemetry.io/otel/attribute"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -79,18 +82,18 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	require.NoError(t, err)
 	expire := func() {
 		t.Helper()
-		query := `UPDATE jobs SET claim_expires_at = 0`
+		query := `UPDATE sqlq_jobs SET claim_expires_at = 0`
 		if dbType == DBTypePostgres {
-			query = `UPDATE jobs SET claim_expires_at = clock_timestamp() - interval '1 second'`
+			query = `UPDATE sqlq_jobs SET claim_expires_at = clock_timestamp() - interval '1 second'`
 		}
 		_, err := db.ExecContext(ctx, query)
 		require.NoError(t, err)
 	}
 	seed := func(count int) []job {
 		t.Helper()
-		_, err := db.ExecContext(ctx, `DELETE FROM jobs`)
+		_, err := db.ExecContext(ctx, `DELETE FROM sqlq_jobs`)
 		require.NoError(t, err)
-		_, err = db.ExecContext(ctx, `DELETE FROM dead_letter_queue`)
+		_, err = db.ExecContext(ctx, `DELETE FROM sqlq_dead_letter_queue`)
 		require.NoError(t, err)
 		for range count {
 			require.NoError(t, d.insertJob(ctx, nil, "claims", []byte(`{}`), 0, nil))
@@ -122,7 +125,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
-		_, err = d.extendClaim(ctx, old, time.Minute)
+		_, err = d.extendClaim(ctx, old, time.Minute, false)
 		require.ErrorIs(t, err, ErrClaimLost)
 		require.ErrorIs(t, d.releaseClaim(ctx, old), ErrClaimLost)
 		require.ErrorIs(t, d.markJobFailedAndReschedule(ctx, old.ID, old.ClaimToken, "stale", 0), ErrClaimLost)
@@ -162,11 +165,11 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("renewal extends only a live owned claim", func(t *testing.T) {
 		j := seed(1)[0]
-		deadline, err := d.extendClaim(ctx, j, 2*time.Minute)
+		deadline, err := d.extendClaim(ctx, j, 2*time.Minute, false)
 		require.NoError(t, err)
 		require.True(t, deadline.After(j.ClaimExpiresAt))
 		expire()
-		_, err = d.extendClaim(ctx, j, time.Minute)
+		_, err = d.extendClaim(ctx, j, time.Minute, false)
 		require.ErrorIs(t, err, ErrClaimLost)
 	})
 
@@ -194,33 +197,73 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	})
 
 	t.Run("consumer fast path and conditional extension", func(t *testing.T) {
+		// Each attempt that starts writes one time: the write counts the attempt and renews the claim.
+		// The extended counter shows the jobs that waited so long that the claim was too short.
 		for _, scenario := range []struct {
-			name       string
-			remaining  time.Duration
-			extensions int
-			called     bool
+			name      string
+			remaining time.Duration
+			extended  int
+			expired   int
+			called    bool
 		}{
-			// testClaimConsumer has a 10s job timeout, so a handler needs 15s of claim time.
-			{"fresh", time.Minute, 0, true},
-			{"enough for job timeout and margin", 20 * time.Second, 0, true},
-			{"enough for job timeout but not margin", 12 * time.Second, 1, true},
-			{"near expiry", time.Second, 1, true},
-			{"expired buffer", -time.Second, 0, false},
+			// testClaimConsumer has a 10s job timeout, so a handler needs 12.5s of claim time.
+			{"fresh", time.Minute, 0, 0, true},
+			{"enough for job timeout and margin", 20 * time.Second, 0, 0, true},
+			{"enough for job timeout but not margin", 12 * time.Second, 1, 0, true},
+			{"near expiry", time.Second, 1, 0, true},
+			// The fetch query sees an expired claim as available, so the worker sends no release.
+			{"expired buffer", -time.Second, 0, 1, false},
 		} {
 			t.Run(scenario.name, func(t *testing.T) {
 				j := seed(1)[0]
 				j.ClaimExpiresAt = time.Now().Add(scenario.remaining)
-				spy := &claimDriverSpy{driver: d, extensions: 0}
+				spy := &claimDriverSpy{driver: d, starts: 0, extensions: 0, releases: 0}
 				called := false
 				cons := testClaimConsumer(ctx, db, spy, func(context.Context, *sql.Tx, []byte) error {
 					called = true
 					return nil
 				})
+				metrics := sdkmetric.NewManualReader()
+				var err error
+				cons.metrics, err = newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)).Meter("claims"))
+				require.NoError(t, err)
 				cons.processJob(&j)
 				require.Equal(t, scenario.called, called)
-				require.Equal(t, scenario.extensions, spy.extensions)
+				wantStarts := 0
+				if scenario.called {
+					wantStarts = 1
+				}
+				require.Equal(t, wantStarts, spy.starts)
+				require.Zero(t, spy.extensions)
+				require.Zero(t, spy.releases)
+				require.Equal(t, int64(scenario.extended), counterValue(t, metrics, "sqlq.claim.extended"))
+				require.Equal(t, int64(scenario.expired), counterValue(t, metrics, "sqlq.claim.expired"))
 			})
 		}
+	})
+
+	t.Run("a result after a lost claim is counted and not written", func(t *testing.T) {
+		j := seed(1)[0]
+		spy := &claimDriverSpy{driver: d, starts: 0, extensions: 0, releases: 0}
+		cons := testClaimConsumer(ctx, db, spy, func(context.Context, *sql.Tx, []byte) error {
+			// While the handler runs, the claim expires, and a different consumer takes the job.
+			expire()
+			jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
+			if err == nil && len(jobs) != 1 {
+				err = fmt.Errorf("the other consumer got %d jobs", len(jobs))
+			}
+			return err
+		})
+		metrics := sdkmetric.NewManualReader()
+		var err error
+		cons.metrics, err = newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)).Meter("claims"))
+		require.NoError(t, err)
+		cons.processJob(&j)
+		require.Equal(t, int64(1), counterValue(t, metrics, "sqlq.job.attempts", attribute.String(resultAttr, resultClaimLost)))
+		require.Zero(t, spy.releases)
+		var processed int
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NOT NULL`).Scan(&processed))
+		require.Zero(t, processed)
 	})
 
 	t.Run("stale buffered job fails extension without invoking handler", func(t *testing.T) {
@@ -240,18 +283,64 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("retry releases ownership and increments only actual failures", func(t *testing.T) {
 		j := seed(1)[0]
+		_, err := d.extendClaim(ctx, j, time.Minute, true)
+		require.NoError(t, err)
 		require.NoError(t, d.markJobFailedAndReschedule(ctx, j.ID, j.ClaimToken, "failed", 0))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 		require.Equal(t, uint32(1), jobs[0].RetryCount)
+		require.Equal(t, "failed", jobs[0].LastError)
 		require.NotEqual(t, j.ClaimToken, jobs[0].ClaimToken)
+	})
+
+	// The start of an attempt counts it. Only a result or a release changes the count again.
+	t.Run("an attempt counts when it starts", func(t *testing.T) {
+		for _, scenario := range []struct {
+			finish  func(j job)
+			name    string
+			retries uint32
+		}{
+			{func(job) { expire() }, "the worker stops", 1},
+			{func(j job) { require.NoError(t, d.releaseClaim(ctx, j)) }, "the worker releases the claim", 0},
+		} {
+			t.Run(scenario.name, func(t *testing.T) {
+				j := seed(1)[0]
+				_, err := d.extendClaim(ctx, j, time.Minute, true)
+				require.NoError(t, err)
+				scenario.finish(j)
+				jobs, err := other.getJobsForConsumer(ctx, "claims", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+				require.Equal(t, scenario.retries, jobs[0].RetryCount)
+				require.Empty(t, jobs[0].LastError)
+			})
+		}
+		t.Run("a success is not a retry", func(t *testing.T) {
+			j := seed(1)[0]
+			_, err := d.extendClaim(ctx, j, time.Minute, true)
+			require.NoError(t, err)
+			require.NoError(t, runInTx(ctx, db, func(tx *sql.Tx) error { return d.markJobProcessed(ctx, tx, j.ID, j.ClaimToken) }))
+			var retries int
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT retry_count FROM sqlq_jobs`).Scan(&retries))
+			require.Zero(t, retries)
+		})
+		t.Run("the dead letter queue does not count the final attempt as a retry", func(t *testing.T) {
+			j := seed(1)[0]
+			_, err := d.extendClaim(ctx, j, time.Minute, true)
+			require.NoError(t, err)
+			require.NoError(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failed", nil))
+			dlq, err := d.getDeadLetterJobs(ctx, "claims", 1)
+			require.NoError(t, err)
+			require.Len(t, dlq, 1)
+			require.Zero(t, dlq[0].RetryCount)
+		})
 	})
 
 	t.Run("shutdown releases active and buffered jobs without counting failures", func(t *testing.T) {
 		seed(3)
 		// Clear seed's claims, so the consumer below can claim all three jobs.
-		_, err := db.ExecContext(ctx, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`)
+		_, err := db.ExecContext(ctx, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`)
 		require.NoError(t, err)
 		started := make(chan struct{})
 		cons := testClaimConsumer(ctx, db, d, func(ctx context.Context, _ *sql.Tx, _ []byte) error {
@@ -284,30 +373,30 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 			require.NoError(t, db.QueryRowContext(ctx, query).Scan(&n))
 			return n
 		}
-		inJobs := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d`, j.ID)
-		stillClaimed := fmt.Sprintf(`SELECT COUNT(*) FROM jobs WHERE id = %d AND claim_token = '%s'`, j.ID, j.ClaimToken)
-		inDLQ := fmt.Sprintf(`SELECT COUNT(*) FROM dead_letter_queue WHERE original_job_id = %d`, j.ID)
+		inJobs := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_jobs WHERE id = %d`, j.ID)
+		stillClaimed := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_jobs WHERE id = %d AND claim_token = '%s'`, j.ID, j.ClaimToken)
+		inDLQ := fmt.Sprintf(`SELECT COUNT(*) FROM sqlq_dead_letter_queue WHERE original_job_id = %d`, j.ID)
 
 		rejected := fmt.Errorf("hook rejected")
 		require.ErrorIs(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", func(*sql.Tx) error {
 			return rejected
 		}), rejected)
 		require.Equal(t, 1, count(stillClaimed), "a rolled-back move must preserve the original job and its claim")
-		require.Zero(t, count(`SELECT COUNT(*) FROM dead_letter_queue`))
+		require.Zero(t, count(`SELECT COUNT(*) FROM sqlq_dead_letter_queue`))
 
 		require.NoError(t, d.moveToDeadLetterQueue(ctx, j.ID, j.ClaimToken, "failure", nil))
 		require.Zero(t, count(inJobs), "a committed move must delete the job")
 		require.Equal(t, 1, count(inDLQ))
-		require.Equal(t, 1, count(`SELECT COUNT(*) FROM dead_letter_queue`))
+		require.Equal(t, 1, count(`SELECT COUNT(*) FROM sqlq_dead_letter_queue`))
 	})
 
 	t.Run("canceled delivery releases jobs that never reached the channel", func(t *testing.T) {
 		seed(3)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
-		cons.fetchWg.Go(func() { _ = cons.fetchJobs(cons.ctx) })
+		cons.fetchWg.Go(func() { _, _ = cons.fetchJobs(cons.ctx) })
 		require.Eventually(t, func() bool {
 			cons.claimsMutex.Lock()
 			defer cons.claimsMutex.Unlock()
@@ -321,14 +410,18 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("prefetch keeps workers supplied without claiming beyond local capacity", func(t *testing.T) {
 		seed(6)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job, 3)
-		require.NoError(t, cons.fetchJobs(ctx))
+		fetch := func() {
+			_, err := cons.fetchJobs(ctx)
+			require.NoError(t, err)
+		}
+		fetch()
 		<-cons.jobsChan // Take one job, like a busy worker. Its claim stays open.
-		require.NoError(t, cons.fetchJobs(ctx))
-		require.NoError(t, cons.fetchJobs(ctx)) // The consumer is full, so this fetch must claim nothing.
+		fetch()
+		fetch() // The consumer is full, so this fetch must claim nothing.
 		require.Len(t, cons.claims, 4)
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 6, time.Minute)
 		require.NoError(t, err)
@@ -357,7 +450,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 
 	t.Run("worker process loss rolls back running effects and recovers prefetch", func(t *testing.T) {
 		seed(3)
-		require.NoError(t, execSQL(ctx, db, `UPDATE jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
+		require.NoError(t, execSQL(ctx, db, `UPDATE sqlq_jobs SET claim_token = NULL, claim_expires_at = NULL, consumed_at = NULL`))
 		require.NoError(t, execSQL(ctx, db, `CREATE TABLE claim_crash_effects (id INTEGER PRIMARY KEY)`))
 		cmd := exec.Command(os.Args[0], "-test.run=^TestClaimCrashHelper$")
 		cmd.Env = append(os.Environ(), "SQLQ_CLAIM_CRASH_DSN="+dsn, "SQLQ_CLAIM_CRASH_TYPE="+string(dbType), "SQLQ_CLAIM_CRASH_SCHEMA="+schema)
@@ -389,74 +482,42 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 	})
 }
 
-func TestClaimTimeoutLeavesLocalBudget(t *testing.T) {
+func TestClaimLength(t *testing.T) {
 	t.Parallel()
-	for timeout, accepted := range map[time.Duration]bool{
-		time.Millisecond: false, 1999 * time.Microsecond: false, 2 * time.Millisecond: true,
+	for _, scenario := range []struct {
+		jobTimeout, length, minLeftAtStart time.Duration
+	}{
+		{15 * time.Minute, 15*time.Minute + 10*time.Second, 15*time.Minute + 5*time.Second}, // the overhead stops at 10 seconds
+		{10 * time.Second, 15 * time.Second, 12500 * time.Millisecond},                      // the overhead is half the job timeout
+		{time.Second, 1500 * time.Millisecond, 1250 * time.Millisecond},                     // a short job timeout
+		{minJobTimeout, 75 * time.Millisecond, 62500 * time.Microsecond},                    // the shortest job timeout
 	} {
-		cons := &consumer{} //nolint:exhaustruct
-		WithConsumerClaimTimeout(timeout)(cons)
-		q := &sqlq{} //nolint:exhaustruct
-		WithDefaultClaimTimeout(timeout)(q)
-		want := time.Duration(0)
-		if accepted {
-			want = timeout
-		}
-		require.Equal(t, want, cons.claimTimeout, timeout)
-		require.Equal(t, want, q.defaultClaimTimeout, timeout)
+		require.Equal(t, scenario.length, claimLength(scenario.jobTimeout), scenario.jobTimeout)
+		require.Equal(t, scenario.minLeftAtStart, minClaimLeftAtStart(scenario.jobTimeout), scenario.jobTimeout)
 	}
 }
 
-func TestConsumeClaimTimeout(t *testing.T) {
+// The job timeout options increase a timeout shorter than 50ms, and ignore a timeout of zero or less.
+func TestJobTimeoutOptions(t *testing.T) {
 	t.Parallel()
 	for _, scenario := range []struct {
 		name      string
-		err       error
 		queueOpts []NewOption
 		consOpts  []ConsumerOption
 		want      time.Duration
 	}{
-		{"defaults to twice the job timeout", nil, nil, nil, 2 * defaultJobTimeout},
-		{"follows a consumer job timeout", nil, nil, []ConsumerOption{WithConsumerJobTimeout(time.Hour)}, 2 * time.Hour},
-		{"follows a queue job timeout", nil, []NewOption{WithDefaultJobTimeout(time.Hour)}, nil, 2 * time.Hour},
-		{
-			"consumer claim timeout wins", nil, []NewOption{WithDefaultClaimTimeout(time.Hour)},
-			[]ConsumerOption{WithConsumerClaimTimeout(20 * time.Minute)}, 20 * time.Minute,
-		},
-		{
-			"claim timeout equal to job timeout is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerClaimTimeout(defaultJobTimeout)}, 0,
-		},
-		{
-			"claim timeout shorter than a worker needs before it starts a handler is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1100 * time.Millisecond)}, 0,
-		},
-		{
-			"claim timeout with no time for its extension is rejected", ErrClaimTimeoutTooShort, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(claimTimeNeeded(time.Second) + 2*time.Millisecond)}, 0,
-		},
-		{
-			"shortest claim timeout is accepted", nil, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(time.Second), WithConsumerClaimTimeout(1752 * time.Millisecond)}, 1752 * time.Millisecond,
-		},
-		{
-			"default covers a very short job timeout", nil, nil,
-			[]ConsumerOption{WithConsumerJobTimeout(4 * time.Millisecond)}, 9 * time.Millisecond,
-		},
-		{
-			"queue claim timeout shorter than consumer job timeout is rejected", ErrClaimTimeoutTooShort,
-			[]NewOption{WithDefaultClaimTimeout(time.Hour)}, []ConsumerOption{WithConsumerJobTimeout(2 * time.Hour)}, 0,
-		},
+		{"default", nil, nil, 2 * time.Second},
+		{"short consumer timeout", nil, []ConsumerOption{WithConsumerJobTimeout(100 * time.Millisecond)}, 100 * time.Millisecond},
+		{"consumer timeout below the minimum", nil, []ConsumerOption{WithConsumerJobTimeout(time.Millisecond)}, minJobTimeout},
+		{"queue timeout below the minimum", []NewOption{WithDefaultJobTimeout(time.Millisecond)}, nil, minJobTimeout},
+		{"zero timeout is ignored", nil, []ConsumerOption{WithConsumerJobTimeout(0)}, defaultJobTimeout},
+		{"negative timeout is ignored", []NewOption{WithDefaultJobTimeout(-time.Second)}, nil, defaultJobTimeout},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Parallel()
 			cons, err := consumeOnTestQueue(t, scenario.queueOpts, scenario.consOpts)
-			if scenario.err != nil {
-				require.ErrorIs(t, err, scenario.err)
-				return
-			}
 			require.NoError(t, err)
-			require.Equal(t, scenario.want, cons.claimTimeout)
+			require.Equal(t, scenario.want, cons.jobTimeout)
 		})
 	}
 }
@@ -523,12 +584,53 @@ func openClaimTestDB(dbType DBType, dsn, schema string) (*sql.DB, error) {
 
 type claimDriverSpy struct {
 	driver
+	starts     int
 	extensions int
+	releases   int
 }
 
-func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
-	d.extensions++
-	return d.driver.extendClaim(ctx, j, timeout)
+func (d *claimDriverSpy) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
+	if startAttempt {
+		d.starts++
+	} else {
+		d.extensions++
+	}
+	return d.driver.extendClaim(ctx, j, timeout, startAttempt)
+}
+
+func (d *claimDriverSpy) releaseClaim(ctx context.Context, j job) error {
+	d.releases++
+	return d.driver.releaseClaim(ctx, j)
+}
+
+// counterValue returns the sum of all data points of the named counter.
+// counterValue returns the sum of the counter name. If attrs are given, it adds only the data points that have all of them.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string, attrs ...attribute.KeyValue) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == name {
+				for _, dp := range sum.DataPoints {
+					if hasAttributes(dp.Attributes, attrs) {
+						total += dp.Value
+					}
+				}
+			}
+		}
+	}
+	return total
+}
+
+func hasAttributes(set attribute.Set, attrs []attribute.KeyValue) bool {
+	for _, want := range attrs {
+		if got, ok := set.Value(want.Key); !ok || got != want.Value {
+			return false
+		}
+	}
+	return true
 }
 
 func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(context.Context, *sql.Tx, []byte) error) *consumer {
@@ -537,9 +639,9 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
 		logger: slog.New(slog.DiscardHandler), metrics: noopMetrics(),
-		claimTimeout: time.Minute, jobTimeout: 10 * time.Second,
-		claims: make(map[string]heldClaim), concurrency: 1, prefetchCount: 1,
-		pollInterval: time.Millisecond, jobsChan: make(chan job, 1),
+		jobTimeout: 10 * time.Second,
+		claims:     make(map[string]heldClaim), concurrency: 1, prefetchCount: 1,
+		pollDelayFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
 }

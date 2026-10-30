@@ -51,7 +51,7 @@ func TestPublishSQLiteSingleConnection(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	var count int
-	require.NoError(t, tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&count))
+	require.NoError(t, tc.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs").Scan(&count))
 	require.Equal(t, 2, count)
 }
 
@@ -59,7 +59,7 @@ func TestPublishSQLiteInsertError(t *testing.T) {
 	t.Parallel()
 
 	tc := newPublishingSQLiteTestCase(t)
-	_, err := tc.DB.ExecContext(t.Context(), "DROP TABLE jobs")
+	_, err := tc.DB.ExecContext(t.Context(), "DROP TABLE sqlq_jobs")
 	require.NoError(t, err)
 	require.Error(t, tc.Q.Publish(t.Context(), "missing_table", "hello"))
 

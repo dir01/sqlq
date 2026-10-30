@@ -16,6 +16,11 @@ type TestPayload struct {
 	Message string `json:"message"`
 }
 
+// pollEvery returns a poll delay function with a fixed delay.
+func pollEvery(delay time.Duration) func(uint16) time.Duration {
+	return func(uint16) time.Duration { return delay }
+}
+
 // TestCase contains actual logic of tests that will work across all the different drivers
 // The idea is that you create per-driver test, and then call methods of test case
 // This solution aims at providing an easy way to run and debug individual tests while sharing test logic

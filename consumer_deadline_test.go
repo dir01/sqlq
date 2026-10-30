@@ -12,9 +12,9 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// delayedDeadlineContext models the interval after a deadline passes but before
-// the runtime executes its cancellation callback (e.g. after process resumption).
-// Err and Done come from the live parent, independent of the exposed deadline.
+// delayedDeadlineContext simulates the time after a deadline, but before the runtime
+// cancels the context (for example, after the process continues from a stop).
+// Err and Done come from the parent, and do not change with the deadline.
 type delayedDeadlineContext struct {
 	context.Context
 	deadline time.Time
@@ -67,7 +67,7 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 				called := false
 				writeEffects := func(ctx context.Context, tx *sql.Tx) error {
 					called = true
-					// Cancellation has not been delivered: SQL writes succeed.
+					// The context is not canceled yet. Thus, SQL writes are successful.
 					require.NoError(t, ctx.Err())
 					_, execErr := tx.ExecContext(ctx, "INSERT INTO effects VALUES (1)")
 					if execErr != nil {
@@ -76,7 +76,7 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 					return d.insertJob(ctx, tx, "poison", []byte("1"), 0, nil)
 				}
 				tracer := noop.NewTracerProvider().Tracer("deadline-test")
-				cons := &consumer{ //nolint:exhaustruct // Only callback/transaction dependencies are needed.
+				cons := &consumer{ //nolint:exhaustruct // The test needs only the callback and transaction dependencies.
 					ctx: base, driver: d, tracer: tracer,
 					handler: func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 						return writeEffects(ctx, tx)
@@ -85,8 +85,8 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 						return writeEffects(ctx, tx)
 					},
 				}
-				// No local timeout is necessary: the callback inherits ctx's
-				// deadline. This exposes timer-delivery lag without sleeps/signals.
+				// A local timeout is not necessary. The callback gets the deadline of ctx.
+				// Thus, the test shows a late timer without sleep or signals.
 				if callback == handlerCallback {
 					tx, beginErr := db.BeginTx(base, nil)
 					require.NoError(t, beginErr)
@@ -111,10 +111,10 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 				}
 				counts := deadlineCounts{
 					effects:   count("SELECT COUNT(*) FROM effects"),
-					poison:    count("SELECT COUNT(*) FROM jobs WHERE job_type='poison'"),
-					pending:   count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NULL"),
-					processed: count("SELECT COUNT(*) FROM jobs WHERE job_type='deadline' AND processed_at IS NOT NULL"),
-					dlq:       count("SELECT COUNT(*) FROM dead_letter_queue"),
+					poison:    count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='poison'"),
+					pending:   count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='deadline' AND processed_at IS NULL"),
+					processed: count("SELECT COUNT(*) FROM sqlq_jobs WHERE job_type='deadline' AND processed_at IS NOT NULL"),
+					dlq:       count("SELECT COUNT(*) FROM sqlq_dead_letter_queue"),
 				}
 				switch {
 				case expired:

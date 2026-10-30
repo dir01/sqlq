@@ -62,7 +62,7 @@ func TestBackgroundErrorsReachTheLogger(t *testing.T) {
 	logs := &syncBuffer{} //nolint:exhaustruct
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite,
 		sqlq.WithLogger(slog.New(slog.NewTextHandler(logs, nil))),
-		sqlq.WithDefaultPollInterval(10*time.Millisecond),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(10*time.Millisecond)),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -70,20 +70,20 @@ func TestBackgroundErrorsReachTheLogger(t *testing.T) {
 		assert.NoError(t, db.Close())
 	})
 
-	// Run was not called, so the jobs table is missing and each poll fails.
+	// Run was not called, so the sqlq_jobs table is missing and each poll fails.
 	require.NoError(t, q.Consume(t.Context(), "unmigrated", func(context.Context, *sql.Tx, []byte) error { return nil }))
 	require.Eventually(t, func() bool {
 		out := logs.String()
 		return strings.Contains(out, "sqlq: failed to fetch jobs") &&
 			strings.Contains(out, "job_type=unmigrated") &&
-			strings.Contains(out, "no such table: jobs")
+			strings.Contains(out, "no such table: sqlq_jobs")
 	}, 5*time.Second, 10*time.Millisecond, "a failed poll must be logged; logs: %s", logs)
 }
 
 func TestShutdownStopsWaitingWhenItsContextEnds(t *testing.T) {
 	t.Parallel()
 	db := openLifecycleDB(t)
-	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollInterval(10*time.Millisecond))
+	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollDelayFunc(pollEvery(10*time.Millisecond)))
 	require.NoError(t, err)
 	require.NoError(t, q.Run(t.Context()))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
@@ -109,7 +109,7 @@ func TestShutdownStopsWaitingWhenItsContextEnds(t *testing.T) {
 		require.NoError(t, db.QueryRowContext(t.Context(), query).Scan(&n))
 		return n
 	}
-	const claimed = `SELECT COUNT(*) FROM jobs WHERE claim_token IS NOT NULL`
+	const claimed = `SELECT COUNT(*) FROM sqlq_jobs WHERE claim_token IS NOT NULL`
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -131,7 +131,7 @@ func TestShutdownStopsWaitingWhenItsContextEnds(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 	require.NoError(t, q.Shutdown(t.Context()))
 	require.Zero(t, count(claimed))
-	require.Equal(t, 3, count(`SELECT COUNT(*) FROM jobs WHERE processed_at IS NULL`),
+	require.Equal(t, 3, count(`SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NULL`),
 		"an attempt that outlived its context must not complete its job")
 }
 

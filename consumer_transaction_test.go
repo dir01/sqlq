@@ -22,14 +22,14 @@ func TestAttemptJobTransactionFailure(t *testing.T) {
 	}{
 		{
 			name:       "completion update fails",
-			setup:      "CREATE TRIGGER reject_completion BEFORE UPDATE OF processed_at ON jobs BEGIN SELECT RAISE(ABORT, 'completion rejected'); END",
+			setup:      "CREATE TRIGGER reject_completion BEFORE UPDATE OF processed_at ON sqlq_jobs BEGIN SELECT RAISE(ABORT, 'completion rejected'); END",
 			handlerSQL: "INSERT INTO effects VALUES (1)",
 			wantError:  "failed to mark job",
 		},
 		{
 			name:       "completion updates no row",
 			setup:      "SELECT 1",
-			handlerSQL: "INSERT INTO effects VALUES (1); DELETE FROM jobs",
+			handlerSQL: "INSERT INTO effects VALUES (1); DELETE FROM sqlq_jobs",
 			wantError:  "no longer claimed",
 		},
 		{
@@ -80,7 +80,7 @@ func TestAttemptJobTransactionFailure(t *testing.T) {
 			var effects, pending int
 			require.NoError(t, db.QueryRowContext(ctx, "SELECT COUNT(*) FROM effects").Scan(&effects))
 			require.Zero(t, effects, "handler writes must not survive a failed attempt")
-			require.NoError(t, db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE processed_at IS NULL").Scan(&pending))
+			require.NoError(t, db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NULL").Scan(&pending))
 			require.Equal(t, 1, pending, "completion must not survive a failed attempt")
 		})
 	}

@@ -22,10 +22,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// readinessProxy understands PostgreSQL message boundaries, not TCP chunk
-// boundaries. For fault 2 it reads the server's CommandComplete(COMMIT) before
-// dropping the connection, proving the commit succeeded without delivering its
-// acknowledgment. Fault 1 closes before forwarding COMMIT at all.
+// readinessProxy finds the limits of PostgreSQL messages, not of TCP chunks.
+// For fault 2, it reads CommandComplete(COMMIT) from the server, and then closes the connection.
+// Thus, the commit is successful, but the client does not get the acknowledgment.
+// For fault 1, it closes the connection before it sends COMMIT.
 type readinessProxy struct {
 	listener net.Listener
 	conns    map[net.Conn]bool
@@ -52,7 +52,7 @@ func newReadinessProxy(t *testing.T, f readinessFixture) *readinessProxy {
 		query.Set(k, v)
 	}
 	u := url.URL{Scheme: "postgres", User: url.UserPassword(c.User, c.Password), Host: ln.Addr().String(), Path: "/" + c.Database, RawQuery: query.Encode()} //nolint:exhaustruct // Only URL connection fields are needed.
-	p := &readinessProxy{listener: ln, target: net.JoinHostPort(c.Host, fmt.Sprint(c.Port)), dsn: u.String(), conns: make(map[net.Conn]bool)}                //nolint:exhaustruct // Faults are initially disarmed.
+	p := &readinessProxy{listener: ln, target: net.JoinHostPort(c.Host, fmt.Sprint(c.Port)), dsn: u.String(), conns: make(map[net.Conn]bool)}                //nolint:exhaustruct // At the start, all faults are off.
 	t.Cleanup(p.close)
 	p.wg.Add(1)
 	go func() {
@@ -94,7 +94,7 @@ func (p *readinessProxy) serve(client net.Conn) {
 	p.conns[server] = true
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.conns, server); p.mu.Unlock() }()
-	// Startup has a length but no message-type byte; all subsequent messages do.
+	// The startup message has a length, but no message-type byte. All other messages have one.
 	startup, err := readPGFrame(client)
 	if err != nil {
 		return
@@ -192,14 +192,14 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 	workerDB := sql.OpenDB(f.connector(t))
 	defer func() { require.NoError(t, workerDB.Close()) }()
 	q, err := New(workerDB, DBTypePostgres,
-		WithDefaultConcurrency(2), WithDefaultPrefetchCount(2), WithDefaultPollInterval(20*time.Millisecond),
-		WithDefaultJobTimeout(2*time.Second), WithDefaultClaimTimeout(5*time.Second),
+		WithDefaultConcurrency(2), WithDefaultPrefetchCount(2), WithDefaultPollDelayFunc(func(uint16) time.Duration { return 20 * time.Millisecond }),
+		WithDefaultJobTimeout(2*time.Second),
 		WithDefaultMaxRetries(-1), WithDefaultBackoffFunc(func(uint16) time.Duration { return 0 }),
 		WithDefaultCleanupProcessedInterval(0), WithDefaultCleanupDLQInterval(0))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
-	// The admin/publisher bypasses network impairment. The consumer queue and
-	// pool below are created once and stay alive through every recovery cycle.
+	// The network faults do not apply to the admin and publisher connection. The test makes the
+	// consumer queue and pool below one time. They stay open through all recovery cycles.
 	publisher, err := New(db, DBTypePostgres)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, publisher.Shutdown(t.Context())) }()
@@ -218,8 +218,8 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 		}
 		if value == "restart-inflight" && !gateOnce.Swap(true) {
 			close(restartWritten)
-			// Keep this transaction open until the supervisor has crashed the
-			// server. A timer must not roll it back before the intended boundary.
+			// Keep this transaction open until the supervisor stops the server.
+			// A timer must not roll it back before that time.
 			<-release
 		}
 		return nil
@@ -252,7 +252,7 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 		case <-time.After(30 * time.Second):
 			t.Fatal("handler never reached its uncommitted write")
 		}
-		// Immediate shutdown forces WAL crash recovery using the same data directory.
+		// An immediate shutdown causes WAL crash recovery on the same data directory.
 		pgctl := func(args ...string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
@@ -280,8 +280,8 @@ func testInPlaceRecovery(t *testing.T, f readinessFixture, db *sql.DB) {
 		assertEffect("after-restart")
 	})
 	require.NoError(t, q.Shutdown(t.Context()))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs WHERE processed_at IS NULL`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs WHERE processed_at IS NULL`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM (SELECT value FROM readiness_effects GROUP BY value HAVING count(*) <> 1) duplicates`))
 	require.NoError(t, workerDB.Close())
 	awaitReadiness(t, "worker pool drained", func() bool { return workerDB.Stats().OpenConnections == 0 })

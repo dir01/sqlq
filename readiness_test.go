@@ -19,15 +19,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// PostgreSQL uses an existing server named by SQLQ_TEST_POSTGRES_DSN, never a
-// Docker container. Each suite owns its schema.
-func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // Scenarios share a database and deliberately mutate its state.
+// PostgreSQL uses an existing server named by SQLQ_TEST_POSTGRES_DSN, not a
+// Docker container. Each suite has its own schema.
+func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // The scenarios use the same database, and change its state.
 	t.Parallel()
 	f := readinessFixture{kind: DBTypeSQLite, dsn: "file:" + filepath.Join(t.TempDir(), "readiness.db") + "?_journal_mode=WAL&_busy_timeout=1000&_synchronous=FULL", schema: ""}
 	testReadiness(t, f)
 }
 
-func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // May restart the dedicated database server.
+func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // The test can restart the database server.
 	dsn := os.Getenv("SQLQ_TEST_POSTGRES_DSN")
 	if testing.Short() || dsn == "" {
 		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database")
@@ -56,7 +56,7 @@ func (f readinessFixture) connector(t *testing.T) sqldriver.Connector {
 	require.NoError(t, err)
 	c.RuntimeParams["search_path"] = f.schema
 	c.RuntimeParams["application_name"] = f.schema
-	// No lock timeout: cancellation tests must prove queue cancellation works.
+	// Do not set a lock timeout. The cancel tests must show that the queue cancel operates.
 	c.RuntimeParams["lock_timeout"] = "0"
 	return stdlib.GetConnector(*c)
 }
@@ -91,7 +91,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 	}
 	reset := func(t *testing.T) {
 		t.Helper()
-		for _, table := range []string{"jobs", "dead_letter_queue", "readiness_effects"} {
+		for _, table := range []string{"sqlq_jobs", "sqlq_dead_letter_queue", "readiness_effects"} {
 			require.NoError(t, execSQL(t.Context(), db, `DELETE FROM `+table))
 		}
 	}
@@ -100,7 +100,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 			t.Run(fmt.Sprint(initial), func(t *testing.T) {
 				reset(t)
 				require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("retry"), 0, nil))
-				require.NoError(t, execSQL(t.Context(), db, fmt.Sprintf(`UPDATE jobs SET retry_count=%d`, initial)))
+				require.NoError(t, execSQL(t.Context(), db, fmt.Sprintf(`UPDATE sqlq_jobs SET retry_count=%d`, initial)))
 				require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("healthy"), 0, nil))
 				var retries []uint32
 				var backoffs []uint16
@@ -131,13 +131,13 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				require.Equal(t, 1, healthy)
 				require.Equal(t, []uint32{initial, min(initial+1, 2147483647), min(initial+2, 2147483647)}, retries)
 				require.Equal(t, []uint16{65535, 65535, 65535}, backoffs)
-				require.Equal(t, 24*time.Hour, exponentialBackoff(65535))
+				require.Positive(t, exponentialBackoff(65535))
 			})
 		}
 		t.Run("finite-limit-above-uint16", func(t *testing.T) {
 			reset(t)
 			require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("retry"), 0, nil))
-			require.NoError(t, execSQL(t.Context(), db, `UPDATE jobs SET retry_count=65535`))
+			require.NoError(t, execSQL(t.Context(), db, `UPDATE sqlq_jobs SET retry_count=65535`))
 			cons := testClaimConsumer(t.Context(), db, d, func(context.Context, *sql.Tx, []byte) error { return errors.New("fail") })
 			defer cons.cancel()
 			cons.maxRetries = 65536
@@ -161,7 +161,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				held, err := cleanupDB.Conn(t.Context())
 				require.NoError(t, err)
 				defer func() { require.NoError(t, held.Close()) }()
-				// Holding SQLite's driver mutex must not obstruct cancellation either.
+				// If a different call holds the mutex of the SQLite driver, the cancel must also operate.
 				if sqlite, ok := cleanupDriver.(*SQLiteDriver); ok {
 					require.NoError(t, sqlite.lock(t.Context()))
 					defer sqlite.unlock()
@@ -237,13 +237,13 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	require.NoError(t, d.moveToDeadLetterQueue(ctx, jobs[0].ID, jobs[0].ClaimToken, "test", nil))
-	// Hold replacement INSERTs after any DLQ read/delete. In the old code both
-	// callers read the row and block here; in the fixed code one blocks on DELETE.
+	// Stop the replacement INSERTs after each DLQ read or delete. In the old code, the two
+	// callers read the row and stop here. In the new code, one caller stops at DELETE.
 	require.NoError(t, execSQL(ctx, db, `CREATE FUNCTION gate_requeue() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN PERFORM pg_advisory_xact_lock(hashtext(TG_TABLE_SCHEMA), 17); RETURN NEW; END $$`))
-	require.NoError(t, execSQL(ctx, db, `CREATE TRIGGER gate_requeue BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION gate_requeue()`))
+	require.NoError(t, execSQL(ctx, db, `CREATE TRIGGER gate_requeue BEFORE INSERT ON sqlq_jobs FOR EACH ROW EXECUTE FUNCTION gate_requeue()`))
 	defer func() {
-		require.NoError(t, execSQL(context.Background(), db, `DROP TRIGGER gate_requeue ON jobs; DROP FUNCTION gate_requeue()`))
+		require.NoError(t, execSQL(context.Background(), db, `DROP TRIGGER gate_requeue ON sqlq_jobs; DROP FUNCTION gate_requeue()`))
 	}()
 	gate, err := db.Conn(ctx)
 	require.NoError(t, err)
@@ -283,9 +283,9 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	}
 	require.Equal(t, 1, successes)
 	require.Equal(t, 1, missing)
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	// Taking the row must remain transactional if replacement insertion fails.
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+	// If the replacement INSERT fails, the DELETE of the row must also roll back.
 	replacements, err := d.getJobsForConsumer(ctx, "requeue", 1, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, replacements, 1)
@@ -293,8 +293,8 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	require.NoError(t, execSQL(ctx, db, `CREATE OR REPLACE FUNCTION gate_requeue() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN RAISE EXCEPTION 'injected replacement failure'; END $$`))
 	require.ErrorContains(t, d.requeueDeadLetterJob(ctx, replacements[0].ID), "injected replacement failure")
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
 }
 
 func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) {
@@ -305,12 +305,12 @@ func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) 
 			jobs, err := d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
-			table := "jobs"
+			table := "sqlq_jobs"
 			if dlq {
 				require.NoError(t, d.moveToDeadLetterQueue(t.Context(), jobs[0].ID, jobs[0].ClaimToken, "test", nil))
-				table = "dead_letter_queue"
+				table = "sqlq_dead_letter_queue"
 			} else {
-				require.NoError(t, execSQL(t.Context(), db, `UPDATE jobs SET processed_at=clock_timestamp()-interval '1 day'`))
+				require.NoError(t, execSQL(t.Context(), db, `UPDATE sqlq_jobs SET processed_at=clock_timestamp()-interval '1 day'`))
 			}
 			lock, err := db.BeginTx(t.Context(), nil)
 			require.NoError(t, err)

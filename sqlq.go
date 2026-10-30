@@ -55,7 +55,7 @@ type JobsQueue interface {
 	// returns ctx's error: a handler that ignores its context keeps running, and the job it holds
 	// becomes available again when its claim expires. Do not give a context that is already done,
 	// such as the one that a shutdown signal canceled.
-	// Consume fails with ErrShutDown once Shutdown has been called.
+	// After a call to Shutdown, Consume fails with ErrShutDown.
 	Shutdown(ctx context.Context) error
 
 	// Run creates or migrates the queue's tables. Call it before Publish and Consume, and stop if it
@@ -77,8 +77,8 @@ const (
 var (
 	// ErrDuplicateConsumer is returned when Consume is called multiple times for the same job type.
 	ErrDuplicateConsumer = errors.New(".Consume was called twice for same job type")
-	// ErrShutDown is returned when Consume is called once Shutdown has been, even while Shutdown is
-	// still waiting for consumers: a consumer started then would outlive it.
+	// ErrShutDown is the error from Consume after a call to Shutdown, also while Shutdown waits
+	// for consumers. A consumer that starts at that time can continue after Shutdown completes.
 	ErrShutDown = errors.New("queue is shut down")
 	// ErrUnsupportedDBType is returned when an unsupported database type is provided to New.
 	ErrUnsupportedDBType = errors.New("unsupported database type")
@@ -88,10 +88,6 @@ var (
 	ErrJobNotFound = errors.New("job not found")
 	// ErrClaimLost means the consumer no longer owns the job, so its write had no effect.
 	ErrClaimLost = errors.New("job is no longer claimed by this attempt")
-	// ErrClaimTimeoutTooShort means the claim timeout cannot cover the job timeout and the margin
-	// a worker needs before it starts a handler (see WithConsumerClaimTimeout), so handlers would
-	// either outlive their claims or never start.
-	ErrClaimTimeoutTooShort = errors.New("claim timeout is too short for the job timeout")
 	// ErrPushNotSupported indicates that async push was configured, but selected db driver does not support it.
 	ErrPushNotSupported = errors.New("async push is not supported")
 	// ErrNilHandler is returned when Consume is given a nil handler.
@@ -105,7 +101,7 @@ var (
 	defaultMaxRetries               int32  = 3
 	infiniteRetries                 int32  = -1
 	defaultConcurrency                     = uint16(min(runtime.NumCPU(), runtime.GOMAXPROCS(0)))
-	defaultJobTimeout                      = 15 * time.Minute
+	defaultJobTimeout                      = 2 * time.Second
 	defaultCleanupProcessedInterval        = 1 * time.Hour
 	defaultCleanupProcessedAge             = 7 * 24 * time.Hour
 	defaultCleanupDLQInterval              = 6 * time.Hour
@@ -121,8 +117,11 @@ type sqlq struct {
 	// This is a default that will be used for all consumers
 	// unless they define their own backoff function using WithConsumerBackoffFunc.
 	defaultBackoffFunc func(retryNum uint16) time.Duration
-	tracer             trace.Tracer
-	meterProvider      metric.MeterProvider
+	// Function for calculating the delay to the next poll for new jobs. Default is defaultPollDelay.
+	// Individual consumers may override this using WithConsumerPollDelayFunc.
+	defaultPollDelayFunc func(emptyPolls uint16) time.Duration
+	tracer               trace.Tracer
+	meterProvider        metric.MeterProvider
 	// Stops the callback that reports queue depth and lag. Shutdown calls Unregister.
 	metricsRegistration metric.Registration
 	metricsCtx          context.Context
@@ -134,13 +133,7 @@ type sqlq struct {
 	dbType              DBType
 	consumersMapMutex   sync.RWMutex // guard consumersMap //nolint:revive // Field name is descriptive
 
-	// How often to poll database for new jobs. Default is 100ms.
-	// Individual consumers may override this using WithConsumerPollInterval.
-	defaultPollInterval time.Duration
-	// Zero means twice the job timeout of each consumer. See WithDefaultClaimTimeout.
-	defaultClaimTimeout time.Duration
-
-	// Default maximum duration a job can run before being considered timed out. Default is 15 minutes.
+	// Default maximum duration a job can run before being considered timed out. Default is 2 seconds.
 	// Individual consumers may override this using WithConsumerJobTimeout.
 	defaultJobTimeout time.Duration
 
@@ -177,17 +170,21 @@ type sqlq struct {
 	// Individual consumers may override this using WithConsumerCleanupBatch.
 	defaultCleanupBatch uint16
 
-	// Set by Shutdown, under consumersMapMutex. Consume fails once it is.
+	// Shutdown sets this, with consumersMapMutex locked. When it is true, Consume fails.
 	shutDown bool
 }
 
 type job struct {
 	// ClaimToken shows that this consumer owns the job. A write fails if the jobs table has a different token.
 	ClaimToken string
-	// ClaimExpiresAt is the last time this consumer can start the job. It is a little before the expiry in the jobs table.
+	// ClaimExpiresAt is the local deadline of the claim (see localClaimDeadline). Compare it only with
+	// the local clock. The expiry in the jobs table is a little later. If less than minClaimLeftAtStart
+	// is left, the worker extends the claim before the handler starts.
 	ClaimExpiresAt time.Time
-	JobType        string
-	CreatedAt      time.Time
+	// LastError is the error of the last attempt that wrote a failure, or "".
+	LastError string
+	JobType   string
+	CreatedAt time.Time
 	// ScheduledAt is when the job became due, by the database clock.
 	ScheduledAt  time.Time
 	TraceContext map[string]string
@@ -222,12 +219,11 @@ func New(db *sql.DB, dbType DBType, opts ...NewOption) (JobsQueue, error) {
 		consumersMap:                    make(map[string]*consumer),
 		consumersMapMutex:               sync.RWMutex{},
 		shutDown:                        false,
-		defaultPollInterval:             100 * time.Millisecond,
+		defaultPollDelayFunc:            defaultPollDelay,
 		defaultConcurrency:              defaultConcurrency,
 		defaultPrefetchCount:            0,
 		defaultMaxRetries:               defaultMaxRetries,
 		defaultJobTimeout:               defaultJobTimeout,
-		defaultClaimTimeout:             0,
 		defaultBackoffFunc:              exponentialBackoff,
 		defaultCleanupProcessedInterval: defaultCleanupProcessedInterval,
 		defaultCleanupProcessedAge:      defaultCleanupProcessedAge,
@@ -350,9 +346,8 @@ func (q *sqlq) Consume(
 		concurrency:              q.defaultConcurrency,
 		prefetchCount:            q.defaultPrefetchCount,
 		maxRetries:               q.defaultMaxRetries,
-		pollInterval:             q.defaultPollInterval,
+		pollDelayFunc:            q.defaultPollDelayFunc,
 		jobTimeout:               q.defaultJobTimeout,
-		claimTimeout:             q.defaultClaimTimeout,
 		claims:                   make(map[string]heldClaim),
 		backoffFunc:              q.defaultBackoffFunc,
 		cleanupBatch:             q.defaultCleanupBatch,
@@ -386,15 +381,6 @@ func (q *sqlq) Consume(
 	// it would only leave workers idle between polls.
 	if cons.prefetchCount < cons.concurrency {
 		cons.prefetchCount = cons.concurrency
-	}
-	if cons.claimTimeout == 0 {
-		// Leaves about as much claim time for the buffer as for the handler.
-		cons.claimTimeout = max(2*cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
-	}
-	if cons.claimTimeout < minClaimTimeout(cons.jobTimeout) {
-		cancel()
-		return fmt.Errorf("%w: claim timeout %s, job timeout %s, at least %s needed",
-			ErrClaimTimeoutTooShort, cons.claimTimeout, cons.jobTimeout, minClaimTimeout(cons.jobTimeout))
 	}
 	if cons.asyncPushEnabled && q.dbType != DBTypeSQLite {
 		cancel()
@@ -456,7 +442,7 @@ func (q *sqlq) RequeueDeadLetterJob(ctx context.Context, originalJobID int64) er
 	return err
 }
 
-// Shutdown stops the job processing. Consume fails with ErrShutDown from then on.
+// Shutdown stops the job processing. After this call, Consume fails with ErrShutDown.
 func (q *sqlq) Shutdown(ctx context.Context) error {
 	q.consumersMapMutex.Lock()
 	firstShutdown := !q.shutDown

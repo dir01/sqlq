@@ -25,7 +25,7 @@ func (tc *TestCase) TestMetrics(ctx context.Context, t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	q, err := sqlq.New(tc.DB, tc.DBType,
 		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))),
-		sqlq.WithDefaultPollInterval(10*time.Millisecond),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(10*time.Millisecond)),
 		sqlq.WithDefaultMaxRetries(0),
 		sqlq.WithDefaultCleanupProcessedInterval(0),
 		sqlq.WithDefaultCleanupDLQInterval(0),
