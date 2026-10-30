@@ -103,10 +103,10 @@ func (d *PostgresDriver) cleanupJobs(ctx context.Context, jobType string, maxAge
 // cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 // It deletes DLQ jobs older than maxAge, in batches.
 func (d *PostgresDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (int64, error) {
-	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_jobs", trace.WithAttributes(
+	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.cleanup_dlq_jobs", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.String("sqlq.job_type", jobType),
-		attribute.String("sqlq.cleanup.age.processed", maxAge.String()),
+		attribute.String("sqlq.cleanup.age", maxAge.String()),
 		attribute.Int("sqlq.cleanup.batch_size", int(batchSize)),
 	))
 	defer span.End()
@@ -224,15 +224,15 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			WHERE id IN (
 				SELECT id
 				FROM sqlq_jobs
-				WHERE job_type = $1 -- Correct parameter index
+				WHERE job_type = $1
 				  AND scheduled_at <= NOW()
 				  AND processed_at IS NULL
 				  AND (claim_expires_at IS NULL OR claim_expires_at <= clock_timestamp())
 				ORDER BY scheduled_at, id
 				FOR UPDATE SKIP LOCKED
-				LIMIT $2 -- Correct parameter index
+				LIMIT $2
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token, last_error
+			RETURNING id, payload, retry_count, trace_context, created_at, scheduled_at, claim_token, last_error
 		`, jobType, prefetchCount, claimToken, claimTimeout.Milliseconds())
 
 		if err != nil {
@@ -249,7 +249,7 @@ func (d *PostgresDriver) getJobsForConsumer(ctx context.Context, jobType string,
 			var lastError sql.NullString
 			j.JobType = jobType // Set job type as it's not returned by RETURNING
 
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ClaimToken, &lastError); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAt, &j.ScheduledAt, &j.ClaimToken, &lastError); err != nil {
 				// Undo the whole batch. Otherwise this job would stay claimed but never reach a worker.
 				span.RecordError(fmt.Errorf("failed to scan returned job details (job_id: %d): %w", j.ID, err))
 				return err
@@ -313,7 +313,6 @@ func (d *PostgresDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.mark_processed", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.job_id", jobID),
-		// Removed consumerName attribute
 	))
 	defer span.End()
 
@@ -383,7 +382,6 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
-		span.RecordError(fmt.Errorf("failed to begin transaction for reschedule: %w", err))
 		return err
 	}
 	defer func() {
@@ -411,8 +409,6 @@ func (d *PostgresDriver) markJobFailedAndReschedule(ctx context.Context, jobID i
 		return err // Rollback will happen
 	}
 
-	// No need to delete from job_consumers anymore
-
 	err = tx.Commit()
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to commit transaction for reschedule: %w", err))
@@ -431,7 +427,6 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 
 	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
-		span.RecordError(err)
 		span.RecordError(err)
 		return err
 	}
@@ -472,15 +467,13 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		return err // Rollback will happen
 	}
 
-	// Delete from jobs table (job_consumers is deleted via CASCADE)
+	// Delete from the sqlq_jobs table
 	res, err := tx.ExecContext(ctx, "DELETE FROM sqlq_jobs WHERE id = $1 AND claim_token = $2 AND processed_at IS NULL", jobID, claimToken)
 	err = checkClaimResult(res, err)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to delete job from main table: %w", err)
 	}
-
-	// No need to delete from job_consumers explicitly due to CASCADE
 
 	if inTx != nil {
 		if err = inTx(tx); err != nil {
@@ -494,6 +487,21 @@ func (d *PostgresDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64,
 		span.RecordError(err)
 	}
 	return err
+}
+
+// getReadyJobStats counts the jobs of jobType that a consumer can claim now, in PostgreSQL.
+// now() is stable within the statement, so the planner can use it in index conditions.
+func (d *PostgresDriver) getReadyJobStats(ctx context.Context, jobType string) (readyJobStats, error) {
+	var stats readyJobStats
+	var lagSeconds float64
+	err := d.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM now() - MIN(scheduled_at)), 0)::float8
+		FROM sqlq_jobs
+		WHERE job_type = $1 AND processed_at IS NULL AND scheduled_at <= now()
+		  AND (claim_expires_at IS NULL OR claim_expires_at <= now())
+	`, jobType).Scan(&stats.count, &lagSeconds)
+	stats.lag = time.Duration(lagSeconds * float64(time.Second))
+	return stats, err
 }
 
 // getDeadLetterJobs retrieves jobs from the sqlq_dead_letter_queue table in PostgreSQL, optionally filtered by job type.
@@ -546,10 +554,7 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 		return nil, err
 	}
 	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			// Cannot add to span here as it's not available, log instead or ignore.
-			fmt.Printf("WARN: Failed to close rows in queryDeadLetterJobs helper: %v\n", closeErr)
-		}
+		_ = rows.Close() // rows.Err reports read errors; a Close error after that changes nothing.
 	}()
 
 	var jobs []DeadLetterJob
@@ -579,7 +584,7 @@ func (d *PostgresDriver) queryDeadLetterJobs(ctx context.Context, query string, 
 }
 
 // requeueDeadLetterJob moves a job from the sqlq_dead_letter_queue back into the sqlq_jobs table for reprocessing in PostgreSQL, identifying the job by its original ID.
-func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) (string, error) {
+func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID int64) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.postgres.requeue_dlq_job", trace.WithAttributes(
 		semconv.DBSystemPostgreSQL,
 		attribute.Int64("sqlq.original_job_id", originalJobID), // Use original_job_id in attribute
@@ -589,8 +594,7 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 	tx, err := d.db.BeginTx(ctx, nil) // Use BeginTx with context
 	if err != nil {
 		span.RecordError(err)
-		span.RecordError(err)
-		return "", err
+		return err
 	}
 	defer func() {
 		if rErr := tx.Rollback(); rErr != nil && !errors.Is(rErr, sql.ErrTxDone) {
@@ -613,9 +617,9 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 		span.RecordError(err)
 		if errors.Is(err, sql.ErrNoRows) {
 			// Use ErrJobNotFound consistently
-			return "", ErrJobNotFound
+			return ErrJobNotFound
 		}
-		return "", err
+		return err
 	}
 
 	// Insert back into the main queue with reset retry count and scheduled_at = NOW()
@@ -625,13 +629,12 @@ func (d *PostgresDriver) requeueDeadLetterJob(ctx context.Context, originalJobID
 	`, dlqJob.JobType, dlqJob.Payload) // Use ExecContext
 	if err != nil {
 		span.RecordError(err)
-		return "", err // Rollback will happen
+		return err // Rollback will happen
 	}
 
 	err = tx.Commit()
 	if err != nil {
 		span.RecordError(err)
-		return "", err
 	}
-	return dlqJob.JobType, nil
+	return err
 }

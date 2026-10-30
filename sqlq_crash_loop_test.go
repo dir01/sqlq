@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dir01/sqlq"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,8 +34,8 @@ func TestCrashingJobGoesToDeadLetterQueue(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite)
 	require.NoError(t, err)
-	require.NoError(t, q.Run()) // Run makes the tables. The parent has no consumers.
-	t.Cleanup(q.Shutdown)
+	require.NoError(t, q.Run(t.Context())) // Run makes the tables. The parent has no consumers.
+	t.Cleanup(func() { assert.NoError(t, q.Shutdown(context.Background())) })
 	require.NoError(t, q.Publish(t.Context(), crashLoopJobType, TestPayload{Message: "stops the process"}))
 
 	crashes := 0
@@ -73,8 +74,8 @@ func TestCrashLoopWorkerHelper(t *testing.T) {
 	require.NoError(t, err)
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollDelayFunc(pollEvery(10*time.Millisecond)))
 	require.NoError(t, err)
-	require.NoError(t, q.Run())
-	t.Cleanup(q.Shutdown)
+	require.NoError(t, q.Run(t.Context()))
+	t.Cleanup(func() { assert.NoError(t, q.Shutdown(context.Background())) })
 	require.NoError(t, q.Consume(t.Context(), crashLoopJobType, func(context.Context, *sql.Tx, []byte) error {
 		os.Exit(crashLoopExitCode)
 		return nil

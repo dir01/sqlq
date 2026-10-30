@@ -3,12 +3,12 @@ package sqlq
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -85,13 +85,11 @@ func TestFetchLoopRecoversFromTransientFailure(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	metrics, err := newMetrics(metricnoop.NewMeterProvider().Meter("fetch-test"))
-	require.NoError(t, err)
 	d := &transientFetchDriver{recovered: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                         //nolint:exhaustruct // The test uses only the polling loop.
-		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
+		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"),
 		pollDelayFunc: func(uint16) time.Duration { return 5 * time.Millisecond }, prefetchCount: 1, concurrency: 1,
-		claims: make(map[string]job),
+		claims: make(map[string]heldClaim), logger: slog.New(slog.DiscardHandler),
 	}
 	done := make(chan struct{})
 	go func() { defer close(done); cons.fetchJobsLoop() }()
@@ -131,13 +129,11 @@ func TestFetchLoopPushStopsBackoff(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	metrics, err := newMetrics(metricnoop.NewMeterProvider().Meter("fetch-test"))
-	require.NoError(t, err)
 	d := &pushDuringBackoffDriver{push: make(chan struct{}), fetched: make(chan struct{})} //nolint:exhaustruct
 	cons := &consumer{                                                                     //nolint:exhaustruct // The test uses only the polling loop.
-		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), metrics: metrics,
+		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("fetch-test"), logger: slog.New(slog.DiscardHandler),
 		pollDelayFunc: func(uint16) time.Duration { return time.Minute }, prefetchCount: 1, concurrency: 1, asyncPushEnabled: true,
-		claims: make(map[string]job),
+		claims: make(map[string]heldClaim),
 	}
 	done := make(chan struct{})
 	go func() { defer close(done); cons.fetchJobsLoop() }()

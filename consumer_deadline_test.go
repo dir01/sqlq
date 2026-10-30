@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -77,10 +76,8 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 					return d.insertJob(ctx, tx, "poison", []byte("1"), 0, nil)
 				}
 				tracer := noop.NewTracerProvider().Tracer("deadline-test")
-				metrics, metricsErr := newMetrics(metricnoop.NewMeterProvider().Meter("deadline-test"))
-				require.NoError(t, metricsErr)
 				cons := &consumer{ //nolint:exhaustruct // The test needs only the callback and transaction dependencies.
-					ctx: base, driver: d, tracer: tracer, metrics: metrics,
+					ctx: base, driver: d, tracer: tracer,
 					handler: func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 						return writeEffects(ctx, tx)
 					},
@@ -95,7 +92,7 @@ func TestCallbackDeadlineTransaction(t *testing.T) {
 					require.NoError(t, beginErr)
 					defer func() { _ = tx.Rollback() }()
 					attemptCtx, span := tracer.Start(ctx, "attempt")
-					_, err = cons.attemptJob(attemptCtx, span, &jobs[0], cons.jobInfo(&jobs[0]), tx)
+					err = cons.attemptJob(attemptCtx, span, &jobs[0], cons.jobInfo(&jobs[0]), tx)
 					span.End()
 				} else {
 					err = cons.moveJobToDLQ(ctx, &jobs[0], cons.jobInfo(&jobs[0]), errors.New("handler failure"))

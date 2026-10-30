@@ -15,17 +15,6 @@ type driver interface {
 	// It should be safe to call multiple times, even though there is no reason to do so
 	initSchema(ctx context.Context) error
 
-	/*
-		type job struct {
-			JobType      string
-			CreatedAt    time.Time
-			TraceContext map[string]string
-			Payload      []byte
-			ID           int64
-			RetryCount   uint32
-		}
-	*/
-
 	// insertJob inserts through tx when provided, otherwise through the database.
 	// The caller owns committing or rolling back tx.
 	insertJob(ctx context.Context, tx *sql.Tx, jobType string, payload []byte, delay time.Duration, traceContext map[string]string) error
@@ -63,7 +52,7 @@ type driver interface {
 	getDeadLetterJobs(ctx context.Context, jobType string, limit int) ([]DeadLetterJob, error)
 
 	// requeueDeadLetterJob moves a job from the dead letter queue back to the main queue
-	requeueDeadLetterJob(ctx context.Context, dlqID int64) (jobType string, err error)
+	requeueDeadLetterJob(ctx context.Context, dlqID int64) error
 
 	// cleanupJobs deletes old processed jobs for a specific job type.
 	// It deletes processed jobs of type jobType older than maxAge, in batches of batchSize.
@@ -72,6 +61,16 @@ type driver interface {
 	// cleanupDeadLetterQueueJobs deletes old jobs from the dead-letter queue for a specific job type.
 	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
+
+	// getReadyJobStats counts the jobs of jobType that a consumer can claim now, and finds how long
+	// the oldest of them has been due. The metrics callback calls it.
+	getReadyJobStats(ctx context.Context, jobType string) (readyJobStats, error)
+}
+
+// readyJobStats describes the jobs of one type that a consumer can claim now: due and not claimed.
+type readyJobStats struct {
+	lag   time.Duration // How long the oldest of them has been due. Zero when there are none.
+	count int64
 }
 
 // markJobProcessed returns errStaleReadTx if the handler transaction only read, and a different

@@ -1,6 +1,7 @@
 package sqlq
 
 import (
+	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
@@ -17,11 +18,24 @@ func WithTracer(tracer trace.Tracer) NewOption {
 	}
 }
 
-// WithMeterProvider allows setting the OpenTelemetry MeterProvider.
-// If not set, the global MeterProvider will be used.
+// WithMeterProvider sets the OpenTelemetry meter provider for the queue's metrics.
+// The default is the global meter provider. A nil provider is ignored.
 func WithMeterProvider(provider metric.MeterProvider) NewOption {
 	return func(q *sqlq) {
-		q.meterProvider = provider
+		if provider != nil {
+			q.meterProvider = provider
+		}
+	}
+}
+
+// WithLogger sets the logger for errors in the queue's background work, such as failed polls,
+// claim releases, and cleanups. The default is slog.Default() when New is called.
+// A nil logger is ignored. To discard the logs, use slog.New(slog.DiscardHandler).
+func WithLogger(logger *slog.Logger) NewOption {
+	return func(q *sqlq) {
+		if logger != nil {
+			q.logger = logger
+		}
 	}
 }
 
@@ -45,6 +59,7 @@ func WithDefaultPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duratio
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
 // The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
+// Consume returns ErrNilBackoffFunc if backoffFunc is nil and the consumer does not set its own.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
 func WithDefaultBackoffFunc(backoffFunc func(retryNum uint16) time.Duration) NewOption {
 	return func(q *sqlq) {
@@ -103,7 +118,7 @@ func WithDefaultCleanupDLQAge(age time.Duration) NewOption {
 }
 
 // WithDefaultCleanupBatch sets the default number of jobs to delete in a single cleanup batch.
-// Default is 1000.
+// Default is 500.
 // This value may be overridden per individual consumer using WithConsumerCleanupBatch.
 func WithDefaultCleanupBatch(batchSize uint16) NewOption {
 	return func(q *sqlq) {

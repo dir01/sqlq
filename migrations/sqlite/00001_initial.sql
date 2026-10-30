@@ -15,8 +15,6 @@ CREATE TABLE sqlq_jobs (
     claim_expires_at INTEGER NULL
 );
 CREATE INDEX idx_sqlq_jobs_available_claims ON sqlq_jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL;
-CREATE INDEX idx_sqlq_jobs_job_type ON sqlq_jobs(job_type);
-CREATE INDEX idx_sqlq_jobs_scheduled_at_consumed_at ON sqlq_jobs(scheduled_at, consumed_at); -- Finding available jobs
 CREATE INDEX idx_sqlq_jobs_job_type_processed_at ON sqlq_jobs(job_type, processed_at); -- Cleaning up processed jobs
 
 -- Dead-lettered jobs keep their original IDs.

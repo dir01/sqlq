@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,9 +17,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"go.opentelemetry.io/otel/attribute"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -233,8 +236,8 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 				require.Equal(t, wantStarts, spy.starts)
 				require.Zero(t, spy.extensions)
 				require.Zero(t, spy.releases)
-				require.Equal(t, int64(scenario.extended), counterValue(t, metrics, "sqlq.jobs.claim.extended.count"))
-				require.Equal(t, int64(scenario.expired), counterValue(t, metrics, "sqlq.jobs.claim.expired.count"))
+				require.Equal(t, int64(scenario.extended), counterValue(t, metrics, "sqlq.claim.extended"))
+				require.Equal(t, int64(scenario.expired), counterValue(t, metrics, "sqlq.claim.expired"))
 			})
 		}
 	})
@@ -256,7 +259,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons.metrics, err = newMetrics(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics)).Meter("claims"))
 		require.NoError(t, err)
 		cons.processJob(&j)
-		require.Equal(t, int64(1), counterValue(t, metrics, "sqlq.jobs.claim.lost.count"))
+		require.Equal(t, int64(1), counterValue(t, metrics, "sqlq.job.attempts", attribute.String(resultAttr, resultClaimLost)))
 		require.Zero(t, spy.releases)
 		var processed int
 		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NOT NULL`).Scan(&processed))
@@ -353,7 +356,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("handler did not start")
 		}
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 3, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
@@ -393,13 +396,13 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		cons := testClaimConsumer(ctx, db, d, nil)
 		cons.prefetchCount = 3
 		cons.jobsChan = make(chan job) // Nobody reads this channel, so the consumer claims jobs and then blocks.
-		cons.workerWg.Go(func() { _, _ = cons.fetchJobs(cons.ctx) })
+		cons.fetchWg.Go(func() { _, _ = cons.fetchJobs(cons.ctx) })
 		require.Eventually(t, func() bool {
 			cons.claimsMutex.Lock()
 			defer cons.claimsMutex.Unlock()
 			return len(cons.claims) == 3
 		}, 5*time.Second, time.Millisecond)
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 3, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 3)
@@ -423,7 +426,7 @@ func testClaims(t *testing.T, db *sql.DB, dbType DBType, dsn, schema string) {
 		jobs, err := other.getJobsForConsumer(ctx, "claims", 6, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 2, "unneeded jobs remain available to other consumers")
-		cons.shutdown()
+		require.NoError(t, cons.shutdown(ctx))
 	})
 
 	if dbType == DBTypeSQLite {
@@ -553,8 +556,8 @@ func consumeOnTestQueue(t *testing.T, queueOpts []NewOption, consOpts []Consumer
 	require.NoError(t, err)
 	q, ok := queue.(*sqlq)
 	require.True(t, ok)
-	require.NoError(t, q.Run())
-	t.Cleanup(q.Shutdown)
+	require.NoError(t, q.Run(t.Context()))
+	t.Cleanup(func() { assert.NoError(t, q.Shutdown(context.Background())) })
 	handler := func(context.Context, *sql.Tx, []byte) error { return nil }
 	if err = q.Consume(t.Context(), "claims", handler, consOpts...); err != nil {
 		return nil, err
@@ -601,7 +604,8 @@ func (d *claimDriverSpy) releaseClaim(ctx context.Context, j job) error {
 }
 
 // counterValue returns the sum of all data points of the named counter.
-func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int64 {
+// counterValue returns the sum of the counter name. If attrs are given, it adds only the data points that have all of them.
+func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string, attrs ...attribute.KeyValue) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -610,7 +614,9 @@ func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int
 		for _, m := range sm.Metrics {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == name {
 				for _, dp := range sum.DataPoints {
-					total += dp.Value
+					if hasAttributes(dp.Attributes, attrs) {
+						total += dp.Value
+					}
 				}
 			}
 		}
@@ -618,13 +624,13 @@ func counterValue(t *testing.T, reader *sdkmetric.ManualReader, name string) int
 	return total
 }
 
-// noopMetrics returns instruments that record nothing, for consumers built without New.
-func noopMetrics() *sqlqMetrics {
-	m, err := newMetrics(metricnoop.NewMeterProvider().Meter("claims"))
-	if err != nil {
-		panic(err)
+func hasAttributes(set attribute.Set, attrs []attribute.KeyValue) bool {
+	for _, want := range attrs {
+		if got, ok := set.Value(want.Key); !ok || got != want.Value {
+			return false
+		}
 	}
-	return m
+	return true
 }
 
 func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(context.Context, *sql.Tx, []byte) error) *consumer {
@@ -632,12 +638,21 @@ func testClaimConsumer(ctx context.Context, db *sql.DB, d driver, handler func(c
 	return &consumer{ //nolint:exhaustruct
 		db: db, driver: d, handler: handler, ctx: ctx, cancel: cancel,
 		tracer: noop.NewTracerProvider().Tracer("claims"), jobType: "claims",
-		metrics:    noopMetrics(),
+		logger: slog.New(slog.DiscardHandler), metrics: noopMetrics(),
 		jobTimeout: 10 * time.Second,
-		claims:     make(map[string]job), concurrency: 1, prefetchCount: 1,
+		claims:     make(map[string]heldClaim), concurrency: 1, prefetchCount: 1,
 		pollDelayFunc: func(uint16) time.Duration { return time.Millisecond }, jobsChan: make(chan job, 1),
 		backoffFunc: func(uint16) time.Duration { return 0 },
 	}
+}
+
+// noopMetrics returns instruments that record nothing, for consumers that tests build directly.
+func noopMetrics() *metrics {
+	m, err := newMetrics(metricnoop.NewMeterProvider().Meter("test"))
+	if err != nil {
+		panic(err)
+	}
+	return m
 }
 
 // TestClaimCrashHelper runs in a child process that the parent test kills.

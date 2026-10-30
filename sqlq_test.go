@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/dir01/sqlq"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
@@ -26,9 +25,10 @@ func pollEvery(delay time.Duration) func(uint16) time.Duration {
 // The idea is that you create per-driver test, and then call methods of test case
 // This solution aims at providing an easy way to run and debug individual tests while sharing test logic
 type TestCase struct {
-	Q       sqlq.JobsQueue
-	DB      *sql.DB                 // The database Q works on, for tests that need tables of their own
-	Metrics *sdkmetric.ManualReader // Reads the metrics Q records; nil if the test case doesn't collect them
+	Q  sqlq.JobsQueue
+	DB *sql.DB // The database Q works on, for tests that need tables of their own
+	// DBType is the type of DB, for tests that need a queue of their own on it.
+	DBType sqlq.DBType
 }
 
 // GracefulContext creates a context that inherits values from its parent

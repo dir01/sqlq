@@ -15,21 +15,22 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// The VM image also contains these tests. PostgreSQL uses the server in the guest,
-// not a Docker container in the guest. Each suite has its own schema.
+// PostgreSQL uses an existing server named by SQLQ_TEST_POSTGRES_DSN, not a
+// Docker container. Each suite has its own schema.
 func TestReadinessSQLite(t *testing.T) { //nolint:tparallel // The scenarios use the same database, and change its state.
 	t.Parallel()
 	f := readinessFixture{kind: DBTypeSQLite, dsn: "file:" + filepath.Join(t.TempDir(), "readiness.db") + "?_journal_mode=WAL&_busy_timeout=1000&_synchronous=FULL", schema: ""}
 	testReadiness(t, f)
 }
 
-func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // The test can restart the database server of the VM.
+func TestReadinessPostgres(t *testing.T) { //nolint:paralleltest // The test can restart the database server.
 	dsn := os.Getenv("SQLQ_TEST_POSTGRES_DSN")
 	if testing.Short() || dsn == "" {
-		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database (the VM supplies it)")
+		t.Skip("set SQLQ_TEST_POSTGRES_DSN to an isolated test database")
 	}
 	f := readinessFixture{kind: DBTypePostgres, dsn: dsn, schema: "readiness_" + strings.ToLower(newClaimToken())}
 	admin, err := sql.Open("pgx", dsn)
@@ -176,7 +177,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 				}
 				awaitReadiness(t, "cleanup waiting for a pool connection", func() bool { return cleanupDB.Stats().WaitCount > 0 })
 				done := make(chan struct{})
-				go func() { cons.shutdown(); close(done) }()
+				go func() { assert.NoError(t, cons.shutdown(t.Context())); close(done) }()
 				select {
 				case <-done:
 				case <-time.After(5 * time.Second):
@@ -258,10 +259,7 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	_, other := f.open(t)
 	results := make(chan error, 2)
 	for _, caller := range []driver{d, other} {
-		go func() {
-			_, requeueErr := caller.requeueDeadLetterJob(ctx, jobs[0].ID)
-			results <- requeueErr
-		}()
+		go func() { results <- caller.requeueDeadLetterJob(ctx, jobs[0].ID) }()
 	}
 	awaitReadiness(t, "both requeue transactions blocked", func() bool {
 		return countReadiness(t, db, `SELECT count(*) FROM pg_stat_activity WHERE application_name='`+f.schema+`' AND wait_event_type='Lock'`) == 2
@@ -294,8 +292,7 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	require.NoError(t, d.moveToDeadLetterQueue(ctx, replacements[0].ID, replacements[0].ClaimToken, "test", nil))
 	require.NoError(t, execSQL(ctx, db, `CREATE OR REPLACE FUNCTION gate_requeue() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN RAISE EXCEPTION 'injected replacement failure'; END $$`))
-	_, err = d.requeueDeadLetterJob(ctx, replacements[0].ID)
-	require.ErrorContains(t, err, "injected replacement failure")
+	require.ErrorContains(t, d.requeueDeadLetterJob(ctx, replacements[0].ID), "injected replacement failure")
 	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
 }
@@ -333,7 +330,7 @@ func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) 
 				return countReadiness(t, db, `SELECT count(*) FROM pg_stat_activity WHERE application_name='`+f.schema+`' AND wait_event_type='Lock'`) > 0
 			})
 			done := make(chan struct{})
-			go func() { cons.shutdown(); close(done) }()
+			go func() { assert.NoError(t, cons.shutdown(t.Context())); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):

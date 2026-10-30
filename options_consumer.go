@@ -21,7 +21,7 @@ func WithConsumerConcurrency(concurrency uint16) ConsumerOption {
 }
 
 // WithConsumerCleanupBatch sets the number of jobs to delete in a single cleanup batch for this consumer.
-// Default is 1000.
+// Default is 500.
 func WithConsumerCleanupBatch(batchSize uint16) ConsumerOption {
 	return func(o *consumer) {
 		if batchSize > 0 {
@@ -54,6 +54,7 @@ func WithConsumerPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Durati
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
 // The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
+// Consume returns ErrNilBackoffFunc if fn is nil.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
 func WithConsumerBackoffFunc(fn func(retryNum uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {

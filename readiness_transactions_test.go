@@ -110,7 +110,7 @@ func testCommitAmbiguity(t *testing.T, f readinessFixture, db *sql.DB, reset fun
 				workerDB, d, arm, fired := readinessBoundaryDB(t, f)
 				q, err := New(workerDB, f.kind)
 				require.NoError(t, err)
-				defer q.Shutdown()
+				defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 				require.NoError(t, q.Publish(t.Context(), "claims", "parent"))
 				attempts := 0
 				cons := testClaimConsumer(t.Context(), workerDB, d, func(ctx context.Context, tx *sql.Tx, _ []byte) error {

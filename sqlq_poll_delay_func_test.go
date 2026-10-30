@@ -43,8 +43,8 @@ func TestPollDelayFuncHelper(t *testing.T) { //nolint:paralleltest // A subproce
 	defer func() { require.NoError(t, db.Close()) }()
 	q, err := sqlq.New(db, sqlq.DBTypeSQLite, sqlq.WithDefaultPollDelayFunc(pollDelayFunc))
 	require.NoError(t, err)
-	require.NoError(t, q.Run())
-	defer q.Shutdown()
+	require.NoError(t, q.Run(t.Context()))
+	defer func() { require.NoError(t, q.Shutdown(t.Context())) }()
 	processed := make(chan struct{})
 	require.NoError(t, q.Consume(t.Context(), "poll", func(context.Context, *sql.Tx, []byte) error {
 		close(processed)

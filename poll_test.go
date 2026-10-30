@@ -3,12 +3,12 @@ package sqlq
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -67,21 +67,19 @@ func (d *emptyPollsDriver) getJobsForConsumer(ctx context.Context, _ string, _ u
 func TestFetchLoopCountsEmptyPolls(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
-	metrics, err := newMetrics(metricnoop.NewMeterProvider().Meter("poll-test"))
-	require.NoError(t, err)
 	d := &emptyPollsDriver{ //nolint:exhaustruct
 		withJobs: map[int]bool{3: true}, failures: map[int]bool{5: true},
 		done: make(chan struct{}), lastCall: 7,
 	}
 	emptyPolls := make(chan uint16, 100)
 	cons := &consumer{ //nolint:exhaustruct // The test uses only the polling loop.
-		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("poll-test"), metrics: metrics,
+		ctx: ctx, driver: d, tracer: noop.NewTracerProvider().Tracer("poll-test"), logger: slog.New(slog.DiscardHandler),
 		pollDelayFunc: func(n uint16) time.Duration {
 			emptyPolls <- n
 			return time.Millisecond
 		},
 		prefetchCount: 1, concurrency: 1, jobsChan: make(chan job, 10),
-		claims: make(map[string]job),
+		claims: make(map[string]heldClaim),
 	}
 	done := make(chan struct{})
 	go func() { defer close(done); cons.fetchJobsLoop() }()
@@ -109,7 +107,7 @@ func TestFetchJobsWithoutCapacityCountsAsFoundJobs(t *testing.T) {
 	t.Parallel()
 	cons := &consumer{ //nolint:exhaustruct // The test uses only the capacity check.
 		prefetchCount: 1, concurrency: 1,
-		claims: map[string]job{"1/a": {}, "2/b": {}}, //nolint:exhaustruct
+		claims: map[string]heldClaim{"1/a": {}, "2/b": {}}, //nolint:exhaustruct
 	}
 	foundJobs, err := cons.fetchJobs(t.Context())
 	require.NoError(t, err)

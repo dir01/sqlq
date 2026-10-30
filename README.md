@@ -7,7 +7,7 @@ type, and let background workers fetch and process them.
 It supports delayed jobs, configurable worker concurrency, retries with backoff,
 handler timeouts, panic recovery, a dead-letter queue (DLQ), transactional
 dead-letter hooks, expiring claims with worker-loss recovery, automatic cleanup,
-and OpenTelemetry tracing.
+and OpenTelemetry tracing and metrics.
 
 See [Current behavior and limitations](#current-behavior-and-limitations) for
 claim ownership, transactional completion, and at-least-once execution semantics.
@@ -29,12 +29,14 @@ go get github.com/jackc/pgx/v5/stdlib
 ## How the queue runs
 
 1. Your application opens a `*sql.DB` and passes it to `sqlq.New`.
-2. `Run` creates or migrates the queue tables and indexes. It does not start workers.
+2. `Run` creates or migrates the queue tables and indexes, and returns an error
+   if it cannot. It does not start workers.
 3. `Consume` registers a handler and immediately starts workers for its job type.
 4. `Publish` JSON-encodes a payload and inserts a job. Publishing does not wait
    for the handler to finish.
-5. `Shutdown` cancels consumers and waits for their goroutines. Your application
-   closes the database afterward. From the moment it is called, `Consume` returns
+5. `Shutdown` cancels consumers and waits for their goroutines, until its context
+   ends. Your application closes the database afterward. From the moment it is
+   called, `Consume` returns
    `ErrShutDown`, so a consumer registered concurrently, say during startup when a
    signal comes, cannot outlive it.
 
@@ -75,15 +77,16 @@ the database.
 
 ```go
 q, _ := sqlq.New(db, sqlq.DBTypeSQLite)
-_ = q.Run() // Returns schema setup errors
+if err := q.Run(ctx); err != nil {
+    log.Fatal(err) // The queue cannot work without its tables.
+}
 q.Consume(ctx, "greeting", handleGreeting)
 q.Publish(ctx, "greeting", "hello")
-// On shutdown: q.Shutdown(), then db.Close()
+// On shutdown: q.Shutdown(shutdownCtx), then db.Close()
 ```
 
 Handlers receive JSON bytes. Return `nil` for success or an error for retry/DLQ
-handling. `Run` creates the schema and returns an error if that fails.
-[Full SQLite demo](demo/basic-sqlite/README.md).
+handling. [Full SQLite demo](demo/basic-sqlite/README.md).
 
 ## 2. Use PostgreSQL
 
@@ -196,9 +199,24 @@ invalidates the previous attempt. Completion can still succeed after expiry if
 no other consumer has replaced the token. SQLite's write transaction prevents
 competing claim updates while its write protection is held.
 
-Shutdown cancels active handlers, waits for their transactions, and attempts to
-release all outstanding claims with a five-second cleanup budget. Expiry is the
-fallback after process loss or a failed release. Cancellation remains cooperative.
+`Shutdown(ctx)` cancels active handlers. When the poller stops, it releases the
+claims of prefetched jobs that no worker started. Then it waits for the handlers'
+transactions and releases the claims that are left. Each of the two releases has a
+budget of five seconds. If `ctx` ends first, `Shutdown` returns `ctx.Err()`: a
+handler that ignores its context keeps running, and its claim expires. Call
+`Shutdown` again to wait more. Expiry is the fallback after process loss or a failed
+release. Cancellation remains cooperative.
+
+```go
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := q.Shutdown(shutdownCtx); err != nil {
+    log.Printf("queue did not stop in time: %v", err)
+}
+```
+
+Do not give `Shutdown` a context that is already done, such as the one that a
+shutdown signal canceled: it then cancels the consumers but does not wait.
 
 ## 7. Stop work at its deadline
 
@@ -323,22 +341,54 @@ the library defaults are:
 | Cleanup batch | 500 | `WithDefaultCleanupBatch` | `WithConsumerCleanupBatch` |
 
 Consumer-only options include `WithConsumerOnDeadLetter`, `WithAsyncPush`, and
-`WithAsyncPushRateLimit`. `WithTracer` is a queue option. Configure a global
-OpenTelemetry tracer provider and text-map propagator to export traces and
-carry publisher context into handlers; driver tracers use the global provider.
-See `./sqlq_testutils_otel_test.go:17` for tracing setup used by the tests.
+`WithAsyncPushRateLimit`. `WithTracer`, `WithMeterProvider`, and `WithLogger` are
+queue options. Configure a global OpenTelemetry tracer provider and text-map
+propagator to export traces and carry publisher context into handlers; driver
+tracers use the global provider. See `./sqlq_testutils_otel_test.go:17` for
+tracing setup used by the tests.
 
-The queue also records OpenTelemetry metrics, tagged with `sqlq.job_type`:
-published, fetched, consumed, retried, dead-lettered, requeued, and cleaned-up
-job counts, handler duration, and the number of jobs in progress. Failed
-attempts carry a `sqlq.failure_reason`. Two counters show if the prefetch count
-is too high for the handler time: `sqlq.jobs.claim.extended.count` (a job waited
-in the buffer so long that its claim was too short for the handler) and
-`sqlq.jobs.claim.expired.count` (the claim expired in the buffer, and the job
-went back to the queue). `sqlq.jobs.claim.lost.count` counts results that the
-worker could not write, because a different consumer took the job after the claim
-expired. If it increases, set a longer job timeout. Metrics go to the global meter provider
-unless `WithMeterProvider` sets another. Instruments: `./metrics.go:13`.
+`Consume` returns `ErrNilHandler` for a nil handler, and `ErrNilBackoffFunc` when
+`WithConsumerBackoffFunc` or `WithDefaultBackoffFunc` gives a nil function.
+
+## Logs and metrics
+
+The queue logs the errors of its background work with `log/slog`: failed polls,
+claim releases and extensions, writes of a failed job's next state, and cleanups.
+It does not log handler errors; they go to traces and metrics. The default logger
+is `slog.Default()` at the time `New` is called. Use `WithLogger` to change it, and
+`slog.New(slog.DiscardHandler)` to discard the logs. A failed poll is logged each
+time the poller retries, and the retry delay grows to 30 seconds.
+
+The queue records OpenTelemetry metrics with the global meter provider, or the
+one given by `WithMeterProvider`. Each has the attribute `sqlq.job_type`.
+
+| Metric | Type | Unit | Meaning |
+| --- | --- | --- | --- |
+| `sqlq.jobs.published` | Counter | `{job}` | Jobs inserted by `Publish` and `PublishTx`, also those whose transaction rolls back later. |
+| `sqlq.job.attempts` | Counter | `{attempt}` | Handler attempts, by `sqlq.result`. |
+| `sqlq.job.duration` | Histogram | `s` | Time from the start of a handler until the job's next state is written, by `sqlq.result`. |
+| `sqlq.job.lag` | Histogram | `s` | Time from when a job became due until its handler started. |
+| `sqlq.queue.depth` | Gauge | `{job}` | Jobs that are due and not claimed. |
+| `sqlq.queue.lag` | Gauge | `s` | How long the oldest of those jobs has been due. Zero when there are none. |
+| `sqlq.claim.extended` | Counter | `{claim}` | Claims extended before the handler started, because the job waited in the buffer for a long time. |
+| `sqlq.claim.expired` | Counter | `{claim}` | Claims that expired in the buffer, before the handler started. The job went back to the queue. |
+
+`sqlq.result` is `success`, `retry`, `dead_letter`, `claim_lost` (another attempt
+took the job), `canceled` (shutdown stopped the attempt), or `error` (the queue
+could not write the job's next state; the job is released or its claim expires).
+
+The two gauges come from a query for each consumed job type, each time the meter
+provider collects metrics. Each queue that consumes a job type reports the same
+values. `Shutdown` stops these queries.
+
+The claim counters show if the prefetch count is too high for the handler time.
+If `sqlq.claim.extended` or `sqlq.claim.expired` increases, set a lower prefetch
+count. If the `claim_lost` result increases, set a longer job timeout.
+
+When the worker process stops during a handler, that attempt writes no result.
+If the job has no attempts left after it, the next worker moves the job to the
+dead letter queue without a handler call. `sqlq.job.attempts` then counts that
+attempt with its result, and `sqlq.job.duration` does not record it.
 
 ## Storage
 
@@ -381,12 +431,15 @@ These details describe the implementation in this checkout:
   check fails. External effects need idempotency: local deadline checks cannot
   prevent a paused process from resuming after another worker has taken over.
 - **Cancellation is cooperative.** Handler and DLQ hook contexts inherit shutdown
-  cancellation. A callback that ignores its context can keep shutdown waiting.
+  cancellation. A callback that ignores its context can keep `Shutdown` waiting
+  until the context given to `Shutdown` ends.
 
 ## Development
 
 CI builds, lints, and tests on the latest patch releases of Go 1.26 and 1.27.
-`make lint` uses the golangci-lint version recorded in `go.mod`.
+`make lint` uses the golangci-lint version recorded in `tools/go.mod`. The linter
+has a module file of its own, so that its dependencies stay out of the library's
+`go.mod` and out of the module graphs of its users.
 
 `TestClaimsPostgres` runs the recovery/ownership suite in an isolated PostgreSQL
 schema. It starts a Docker container by default, or can use an existing test server:
@@ -398,20 +451,20 @@ SQLQ_TEST_POSTGRES_DSN='postgres://user:password@localhost/testdb?sslmode=disabl
 
 The shared behavior tests run against SQLite and PostgreSQL. The PostgreSQL
 suite starts a database through Testcontainers and requires Docker. Integration
-tests export traces only when `OTLP_ENDPOINT` is set; the Makefile provides a
-Jaeger command and a target that sends test traces to it.
+tests export traces only when `OTLP_ENDPOINT` is set; `make test-short-otel`
+sets it to localhost:4318, and the Makefile provides a Jaeger command.
 
 ```sh
 make build
+make test-short       # Race detector; skips PostgreSQL.
+make test             # Race detector; includes PostgreSQL via Docker.
 make start-jaeger
-make test-short  # Race detector; skips PostgreSQL.
-make test-short-otel  # Same, exporting traces to Jaeger.
-make test        # Race detector; includes PostgreSQL via Docker.
+make test-short-otel  # As test-short, and exports traces to Jaeger.
 make lint
 ```
 
-Public API: `./sqlq.go:23`. Consumer runtime: `./consumer.go:49`.
-Dead-letter hook contract: `./options_consumer.go:149`.
+Public API: `./sqlq.go:27`. Consumer runtime: `./consumer.go:21`.
+Dead-letter hook contract: `./options_consumer.go:174`.
 Shared DLQ examples and tests: `./sqlq_testcase_dlq_test.go:287`.
 
 ## License
