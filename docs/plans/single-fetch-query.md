@@ -31,17 +31,17 @@ Use `LATERAL`. Each job type has its own limit, and `SKIP LOCKED` continues to w
 
 ```sql
 WITH wanted(job_type, n, claim_timeout) AS (VALUES ...)
-UPDATE jobs SET ...
+UPDATE sqlq_jobs SET ...
 FROM (
   SELECT j.id, wanted.claim_timeout
   FROM wanted CROSS JOIN LATERAL (
-    SELECT id FROM jobs
+    SELECT id FROM sqlq_jobs
     WHERE job_type = wanted.job_type AND <ready>
     ORDER BY ... LIMIT wanted.n
     FOR UPDATE SKIP LOCKED
   ) j
 ) claimed
-WHERE jobs.id = claimed.id
+WHERE sqlq_jobs.id = claimed.id
 RETURNING ...
 ```
 
@@ -50,13 +50,13 @@ RETURNING ...
 SQLite has no `LATERAL`. Use one subquery for each job type, with `UNION ALL`:
 
 ```sql
-UPDATE jobs
+UPDATE sqlq_jobs
 SET consumed_at = ..., claim_token = ...,
     claim_expires_at = now + CASE job_type WHEN ? THEN ? WHEN ? THEN ? END
 WHERE id IN (
-  SELECT id FROM (SELECT id FROM jobs WHERE job_type = ? AND <ready> ORDER BY ... LIMIT ?)
+  SELECT id FROM (SELECT id FROM sqlq_jobs WHERE job_type = ? AND <ready> ORDER BY ... LIMIT ?)
   UNION ALL
-  SELECT id FROM (SELECT id FROM jobs WHERE job_type = ? AND <ready> ORDER BY ... LIMIT ?)
+  SELECT id FROM (SELECT id FROM sqlq_jobs WHERE job_type = ? AND <ready> ORDER BY ... LIMIT ?)
 )
 RETURNING ...
 ```

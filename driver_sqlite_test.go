@@ -44,7 +44,7 @@ func TestDriverSQLite(t *testing.T) {
 
 		err = db.QueryRowContext(t.Context(), `
 		SELECT id, job_type, payload, created_at, scheduled_at
-		FROM jobs WHERE job_type = ? LIMIT 1
+		FROM sqlq_jobs WHERE job_type = ? LIMIT 1
 	`, jobType).Scan(&job.ID, &job.JobType, &job.Payload, &job.CreatedAt, &job.ScheduledAt)
 		require.NoError(t, err)
 
@@ -104,7 +104,7 @@ func TestDriverSQLite(t *testing.T) {
 		// Directly check the database to verify timestamps are stored as milliseconds
 		var createdAt, scheduledAt int64
 		err = db.QueryRowContext(t.Context(),
-			"SELECT created_at, scheduled_at FROM jobs WHERE job_type = ? LIMIT 1",
+			"SELECT created_at, scheduled_at FROM sqlq_jobs WHERE job_type = ? LIMIT 1",
 			jobType).Scan(&createdAt, &scheduledAt)
 		require.NoError(t, err)
 
@@ -140,7 +140,7 @@ func TestDriverSQLite(t *testing.T) {
 
 		// Query the jobs and verify they have different timestamps
 		rows, err := db.QueryContext(t.Context(),
-			"SELECT created_at FROM jobs WHERE job_type = 'precision_test' ORDER BY created_at")
+			"SELECT created_at FROM sqlq_jobs WHERE job_type = 'precision_test' ORDER BY created_at")
 		require.NoError(t, err)
 		// Defer close and check error
 		defer func() {
@@ -244,7 +244,7 @@ func TestDriverSQLiteWaitsForOtherWriters(t *testing.T) {
 
 		writer, err := db.BeginTx(t.Context(), nil)
 		require.NoError(t, err)
-		_, err = writer.ExecContext(t.Context(), `INSERT INTO jobs (job_type, created_at, scheduled_at) VALUES ('other_writer', 0, 0)`)
+		_, err = writer.ExecContext(t.Context(), `INSERT INTO sqlq_jobs (job_type, created_at, scheduled_at) VALUES ('other_writer', 0, 0)`)
 		require.NoError(t, err)
 
 		opErr := make(chan error, 1)

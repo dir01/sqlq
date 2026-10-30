@@ -209,7 +209,7 @@ func (tc *TestCase) TestNullCreatedAt(ctx context.Context, t *testing.T) {
 	t.Helper()
 
 	_, err := tc.DB.ExecContext(ctx,
-		"INSERT INTO jobs (job_type, payload, created_at) VALUES ($1, $2, NULL)",
+		"INSERT INTO sqlq_jobs (job_type, payload, created_at) VALUES ($1, $2, NULL)",
 		"null_created_at_test", []byte(`{"message":"null created_at"}`),
 	)
 	require.ErrorContains(t, err, "violates not-null constraint")

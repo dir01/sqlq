@@ -90,7 +90,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 	}
 	reset := func(t *testing.T) {
 		t.Helper()
-		for _, table := range []string{"jobs", "dead_letter_queue", "readiness_effects"} {
+		for _, table := range []string{"sqlq_jobs", "sqlq_dead_letter_queue", "readiness_effects"} {
 			require.NoError(t, execSQL(t.Context(), db, `DELETE FROM `+table))
 		}
 	}
@@ -99,7 +99,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 			t.Run(fmt.Sprint(initial), func(t *testing.T) {
 				reset(t)
 				require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("retry"), 0, nil))
-				require.NoError(t, execSQL(t.Context(), db, fmt.Sprintf(`UPDATE jobs SET retry_count=%d`, initial)))
+				require.NoError(t, execSQL(t.Context(), db, fmt.Sprintf(`UPDATE sqlq_jobs SET retry_count=%d`, initial)))
 				require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("healthy"), 0, nil))
 				var retries []uint32
 				var backoffs []uint16
@@ -136,7 +136,7 @@ func testReadiness(t *testing.T, f readinessFixture) {
 		t.Run("finite-limit-above-uint16", func(t *testing.T) {
 			reset(t)
 			require.NoError(t, d.insertJob(t.Context(), nil, "claims", []byte("retry"), 0, nil))
-			require.NoError(t, execSQL(t.Context(), db, `UPDATE jobs SET retry_count=65535`))
+			require.NoError(t, execSQL(t.Context(), db, `UPDATE sqlq_jobs SET retry_count=65535`))
 			cons := testClaimConsumer(t.Context(), db, d, func(context.Context, *sql.Tx, []byte) error { return errors.New("fail") })
 			defer cons.cancel()
 			cons.maxRetries = 65536
@@ -240,9 +240,9 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	// callers read the row and stop here. In the new code, one caller stops at DELETE.
 	require.NoError(t, execSQL(ctx, db, `CREATE FUNCTION gate_requeue() RETURNS trigger LANGUAGE plpgsql AS $$
 	BEGIN PERFORM pg_advisory_xact_lock(hashtext(TG_TABLE_SCHEMA), 17); RETURN NEW; END $$`))
-	require.NoError(t, execSQL(ctx, db, `CREATE TRIGGER gate_requeue BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION gate_requeue()`))
+	require.NoError(t, execSQL(ctx, db, `CREATE TRIGGER gate_requeue BEFORE INSERT ON sqlq_jobs FOR EACH ROW EXECUTE FUNCTION gate_requeue()`))
 	defer func() {
-		require.NoError(t, execSQL(context.Background(), db, `DROP TRIGGER gate_requeue ON jobs; DROP FUNCTION gate_requeue()`))
+		require.NoError(t, execSQL(context.Background(), db, `DROP TRIGGER gate_requeue ON sqlq_jobs; DROP FUNCTION gate_requeue()`))
 	}()
 	gate, err := db.Conn(ctx)
 	require.NoError(t, err)
@@ -285,8 +285,8 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	}
 	require.Equal(t, 1, successes)
 	require.Equal(t, 1, missing)
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM jobs`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
 	// If the replacement INSERT fails, the DELETE of the row must also roll back.
 	replacements, err := d.getJobsForConsumer(ctx, "requeue", 1, time.Minute)
 	require.NoError(t, err)
@@ -296,8 +296,8 @@ func testConcurrentRequeue(t *testing.T, f readinessFixture, db *sql.DB, d drive
 	BEGIN RAISE EXCEPTION 'injected replacement failure'; END $$`))
 	_, err = d.requeueDeadLetterJob(ctx, replacements[0].ID)
 	require.ErrorContains(t, err, "injected replacement failure")
-	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM dead_letter_queue`))
-	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM jobs`))
+	require.Equal(t, 1, countReadiness(t, db, `SELECT count(*) FROM sqlq_dead_letter_queue`))
+	require.Zero(t, countReadiness(t, db, `SELECT count(*) FROM sqlq_jobs`))
 }
 
 func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) {
@@ -308,12 +308,12 @@ func testCleanupRowLock(t *testing.T, f readinessFixture, db *sql.DB, d driver) 
 			jobs, err := d.getJobsForConsumer(t.Context(), "claims", 1, time.Minute)
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
-			table := "jobs"
+			table := "sqlq_jobs"
 			if dlq {
 				require.NoError(t, d.moveToDeadLetterQueue(t.Context(), jobs[0].ID, jobs[0].ClaimToken, "test", nil))
-				table = "dead_letter_queue"
+				table = "sqlq_dead_letter_queue"
 			} else {
-				require.NoError(t, execSQL(t.Context(), db, `UPDATE jobs SET processed_at=clock_timestamp()-interval '1 day'`))
+				require.NoError(t, execSQL(t.Context(), db, `UPDATE sqlq_jobs SET processed_at=clock_timestamp()-interval '1 day'`))
 			}
 			lock, err := db.BeginTx(t.Context(), nil)
 			require.NoError(t, err)

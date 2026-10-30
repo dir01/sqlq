@@ -46,7 +46,7 @@ func (tc *TestCase) TestSubMillisecondBackoffRetryLimit(ctx context.Context, t *
 	}, 5*time.Second, 20*time.Millisecond)
 
 	var retryCount int
-	if scanErr := tc.DB.QueryRowContext(ctx, "SELECT retry_count FROM jobs WHERE job_type = $1", jobType).Scan(&retryCount); scanErr == nil {
+	if scanErr := tc.DB.QueryRowContext(ctx, "SELECT retry_count FROM sqlq_jobs WHERE job_type = $1", jobType).Scan(&retryCount); scanErr == nil {
 		t.Logf("job still in jobs table with retry_count=%d after %d handler calls", retryCount, calls.Load())
 	}
 
@@ -86,7 +86,7 @@ func (tc *TestCase) TestPublishTxDelayFromPublishTime(ctx context.Context, t *te
 	// Use the clock of the database. Thus, a clock difference between host and container has no effect.
 	var remainingMs float64
 	err = tx.QueryRowContext(ctx,
-		"SELECT EXTRACT(EPOCH FROM (scheduled_at - clock_timestamp())) * 1000 FROM jobs WHERE job_type = $1",
+		"SELECT EXTRACT(EPOCH FROM (scheduled_at - clock_timestamp())) * 1000 FROM sqlq_jobs WHERE job_type = $1",
 		jobType,
 	).Scan(&remainingMs)
 	require.NoError(t, err)
@@ -135,7 +135,7 @@ func (tc *TestCase) TestMarkProcessedOutlastsTransientRowLock(ctx context.Contex
 					return beginErr
 				}
 				defer func() { _ = blocker.Rollback() }()
-				_, lockErr := blocker.ExecContext(blockerCtx, "SELECT id FROM jobs WHERE id = $1 FOR UPDATE", info.ID)
+				_, lockErr := blocker.ExecContext(blockerCtx, "SELECT id FROM sqlq_jobs WHERE id = $1 FOR UPDATE", info.ID)
 				close(locked)
 				if lockErr != nil {
 					return lockErr
@@ -156,7 +156,7 @@ func (tc *TestCase) TestMarkProcessedOutlastsTransientRowLock(ctx context.Contex
 	require.Eventually(t, func() bool {
 		var processed bool
 		scanErr := tc.DB.QueryRowContext(ctx,
-			"SELECT processed_at IS NOT NULL, retry_count, last_error FROM jobs WHERE job_type = $1", jobType,
+			"SELECT processed_at IS NOT NULL, retry_count, last_error FROM sqlq_jobs WHERE job_type = $1", jobType,
 		).Scan(&processed, &retryCount, &lastError)
 		return scanErr == nil && processed
 	}, 5*time.Second, 20*time.Millisecond)

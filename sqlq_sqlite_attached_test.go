@@ -72,7 +72,7 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 	err = q.Consume(ctx, jobType, func(ctx context.Context, tx *sql.Tx, _ []byte) error {
 		call := calls.Add(1)
 		var n int
-		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs").Scan(&n); readErr != nil {
+		if readErr := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlq_jobs").Scan(&n); readErr != nil {
 			return readErr
 		}
 		if _, writeErr := tx.ExecContext(ctx, "INSERT INTO effects VALUES (1)"); writeErr != nil {
@@ -92,7 +92,7 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 
 	require.Eventually(t, func() bool {
 		var processedAt sql.NullInt64
-		scanErr := db.QueryRowContext(ctx, "SELECT processed_at FROM jobs WHERE job_type = ?", jobType).Scan(&processedAt)
+		scanErr := db.QueryRowContext(ctx, "SELECT processed_at FROM sqlq_jobs WHERE job_type = ?", jobType).Scan(&processedAt)
 		return scanErr == nil && processedAt.Valid
 	}, 5*time.Second, 20*time.Millisecond, "job was not marked processed")
 
