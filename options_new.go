@@ -59,6 +59,8 @@ func WithDefaultPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duratio
 
 // WithDefaultBackoffFunc allows to configure default backoff function.
 // The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
+// If backoffFunc panics, the queue logs the panic, and the retry uses the default exponential
+// backoff with jitter, to a maximum of 24 hours.
 // Consume returns ErrNilBackoffFunc if backoffFunc is nil and the consumer does not set its own.
 // This value may be overridden per individual consumer, see WithConsumerBackoffFunc.
 func WithDefaultBackoffFunc(backoffFunc func(retryNum uint16) time.Duration) NewOption {

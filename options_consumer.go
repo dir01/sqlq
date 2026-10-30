@@ -54,6 +54,8 @@ func WithConsumerPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Durati
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
 // The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
+// If fn panics, the queue logs the panic, and the retry uses the default exponential backoff
+// with jitter, to a maximum of 24 hours.
 // Consume returns ErrNilBackoffFunc if fn is nil.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
 func WithConsumerBackoffFunc(fn func(retryNum uint16) time.Duration) ConsumerOption {
