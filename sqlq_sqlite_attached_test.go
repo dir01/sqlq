@@ -14,11 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSQLiteHandlerAttachedWriteKeptWithMark checks that a handler's write to a database other than
-// main, attached or temp, is committed with the processed mark. The handler reads the main database,
-// which pins its snapshot, and then writes the other one. Once another connection commits to the main
-// database, the mark fails with SQLITE_BUSY_SNAPSHOT although the transaction did write, so it must
-// not be dropped in favor of a mark in a fresh transaction.
+// TestSQLiteHandlerAttachedWriteKeptWithMark makes sure that a handler write to an attached or temp
+// database commits with the processed mark. The handler reads main, which sets its snapshot. Then
+// it writes the other database. After a different connection commits to main, the mark fails with
+// SQLITE_BUSY_SNAPSHOT, but the transaction has a write. Thus, the queue must not discard the
+// transaction and mark the job in a new transaction.
 func TestSQLiteHandlerAttachedWriteKeptWithMark(t *testing.T) {
 	t.Parallel()
 	for name, setup := range map[string][]string{
@@ -41,21 +41,21 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 	dsn := "file:" + filepath.Join(dir, "main.db") + "?_journal_mode=WAL&_busy_timeout=1000"
 	db, err := sql.Open("sqlite3", dsn)
 	require.NoError(t, err)
-	// One connection, so the setup below applies to every transaction.
+	// One connection. Thus, the setup below applies to all transactions.
 	db.SetMaxOpenConns(1)
 	for _, statement := range setup {
 		statement = strings.ReplaceAll(statement, "file:side.db", "file:"+filepath.Join(dir, "side.db"))
 		_, err = db.ExecContext(ctx, statement)
 		require.NoError(t, err)
 	}
-	// Another process sharing the main database file.
+	// A different process that uses the same main database file.
 	other, err := sql.Open("sqlite3", dsn)
 	require.NoError(t, err)
 
 	q, err := sqlq.New(
 		db, sqlq.DBTypeSQLite,
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }),
-		sqlq.WithDefaultPollInterval(25*time.Millisecond),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(25*time.Millisecond)),
 	)
 	require.NoError(t, err)
 	require.NoError(t, q.Run())
@@ -79,7 +79,7 @@ func testHandlerOtherDatabaseWrite(t *testing.T, setup []string) {
 			return writeErr
 		}
 		if call == 1 {
-			// Another connection commits to the main database before the mark.
+			// A different connection commits to main before the mark.
 			if _, writeErr := other.ExecContext(ctx, "INSERT INTO other_writes VALUES (1)"); writeErr != nil {
 				return writeErr
 			}

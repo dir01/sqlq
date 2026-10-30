@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSubMillisecondBackoffRetryLimit checks that retries stay within maxRetries when the backoff
-// is a duration whose Go string form ("1µs") PostgreSQL does not parse as an interval.
-// If rescheduling fails, retry_count is never incremented and the job runs forever.
+// TestSubMillisecondBackoffRetryLimit makes sure that retries stay in maxRetries if the Go text of the
+// backoff ("1µs") is not a valid PostgreSQL interval. If the reschedule fails, retry_count does not
+// increase, and the job runs forever.
 func (tc *TestCase) TestSubMillisecondBackoffRetryLimit(ctx context.Context, t *testing.T) {
 	t.Helper()
 
@@ -36,7 +36,7 @@ func (tc *TestCase) TestSubMillisecondBackoffRetryLimit(ctx context.Context, t *
 
 	require.NoError(t, tc.Q.Publish(ctx, jobType, TestPayload{Message: "always fails"}))
 
-	// Settles once dead-lettered, or once the handler has clearly exceeded its attempt budget.
+	// Stop when the job goes to the DLQ, or when the handler has too many attempts.
 	require.Eventually(t, func() bool {
 		if calls.Load() >= 5 {
 			return true
@@ -56,9 +56,9 @@ func (tc *TestCase) TestSubMillisecondBackoffRetryLimit(ctx context.Context, t *
 	require.Equal(t, int32(2), calls.Load(), "handler ran more than maxRetries+1 times")
 }
 
-// TestPublishTxDelayFromPublishTime checks that a delayed job published inside a long-running
-// transaction is delayed from the moment of publishing. NOW() is fixed at transaction start,
-// so computing scheduled_at from it subtracts the transaction's age from the delay.
+// TestPublishTxDelayFromPublishTime makes sure that the delay of a job starts when it is published,
+// also in a long transaction. NOW() is the start time of the transaction. If scheduled_at
+// comes from NOW(), the delay is shorter by the age of the transaction.
 func (tc *TestCase) TestPublishTxDelayFromPublishTime(ctx context.Context, t *testing.T) {
 	t.Helper()
 
@@ -75,7 +75,7 @@ func (tc *TestCase) TestPublishTxDelayFromPublishTime(ctx context.Context, t *te
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback() }()
 
-	// Fix the transaction's NOW(), then let it age.
+	// Set NOW() of the transaction. Then wait, to make the transaction older.
 	_, err = tx.ExecContext(ctx, "SELECT NOW()")
 	require.NoError(t, err)
 	_, err = tx.ExecContext(ctx, "SELECT pg_sleep($1)", txAge.Seconds())
@@ -83,7 +83,7 @@ func (tc *TestCase) TestPublishTxDelayFromPublishTime(ctx context.Context, t *te
 
 	require.NoError(t, tc.Q.PublishTx(ctx, tx, jobType, TestPayload{Message: "delayed"}, sqlq.WithDelay(delay)))
 
-	// Measured by the database's own clock, so host/container clock skew doesn't matter.
+	// Use the clock of the database. Thus, a clock difference between host and container has no effect.
 	var remainingMs float64
 	err = tx.QueryRowContext(ctx,
 		"SELECT EXTRACT(EPOCH FROM (scheduled_at - clock_timestamp())) * 1000 FROM jobs WHERE job_type = $1",
@@ -97,10 +97,10 @@ func (tc *TestCase) TestPublishTxDelayFromPublishTime(ctx context.Context, t *te
 		"delay was measured from transaction start instead of publish time")
 }
 
-// TestMarkProcessedOutlastsTransientRowLock checks that a brief lock on a job's row doesn't fail a
-// successful handler. A competing claim query can lock a row it then rejects: its FOR UPDATE rechecks
-// the row's newer, claimed version and keeps the lock until it commits. With a short lock_timeout,
-// marking the job processed could time out, charging a retry to a handler that succeeded.
+// TestMarkProcessedOutlastsTransientRowLock makes sure that a short lock on the row of a job does not
+// make a successful handler fail. A different claim query can lock a row, but not claim it. Its FOR UPDATE
+// examines the new claimed version of the row again, and keeps the lock until it commits. With a
+// short lock_timeout, the mark can time out, and the queue counts a retry for a successful handler.
 func (tc *TestCase) TestMarkProcessedOutlastsTransientRowLock(ctx context.Context, t *testing.T) {
 	t.Helper()
 
@@ -110,7 +110,7 @@ func (tc *TestCase) TestMarkProcessedOutlastsTransientRowLock(ctx context.Contex
 	const (
 		jobType     = "mark_processed_transient_row_lock"
 		lockTimeout = 50 * time.Millisecond
-		lockHeld    = 80 * time.Millisecond // Longer than one lock wait, shorter than two.
+		lockHeld    = 80 * time.Millisecond // Longer than one lock wait, and shorter than two.
 	)
 	var calls atomic.Int32
 	blockerErrs := make(chan error, 1)
@@ -120,12 +120,12 @@ func (tc *TestCase) TestMarkProcessedOutlastsTransientRowLock(ctx context.Contex
 			return nil
 		}
 		info, _ := sqlq.JobInfoFromContext(ctx)
-		// Applies to the rest of this transaction, including marking the job processed.
+		// This applies to the remaining part of this transaction, also to the mark.
 		if _, execErr := tx.ExecContext(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", lockTimeout.Milliseconds())); execErr != nil {
 			return execErr
 		}
 		locked := make(chan struct{})
-		// Outlives the handler, whose context ends when it returns.
+		// This context continues after the handler. The handler context ends when the handler returns.
 		blockerCtx := context.WithoutCancel(ctx)
 		go func() {
 			blockerErrs <- func() error {

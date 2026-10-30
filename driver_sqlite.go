@@ -29,9 +29,9 @@ const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 // (unixepoch('now','subsec') is simpler, but needs SQLite 3.42). ROUND fixes float error
 // that would otherwise make CAST cut the value down by one millisecond.
 //
-// We use it instead of passing time.Now(), because SQLite reads 'now' when the statement
-// runs, after any wait for dbLock or the write lock. A time.Now() value would be old by then.
-// 'now' also stays the same for the whole statement, so one UPDATE uses one time everywhere.
+// Use it, not time.Now(). SQLite reads 'now' when the statement runs, after all waits
+// for dbLock or for the write lock. At that time, a time.Now() value is old.
+// 'now' is also the same for all of the statement. Thus, one UPDATE uses one time.
 //
 // localClaimDeadline uses the time before the request on purpose: waiting must not add
 // to the worker's time.
@@ -42,7 +42,7 @@ type SQLiteDriver struct {
 	db         *sql.DB
 	tracer     trace.Tracer
 	notif      map[string]*sqliteNotificationSubscription
-	dbLock     chan struct{} // One slot: serializes queue writes in this process; see lock
+	dbLock     chan struct{} // One slot: queue writes in this process occur one at a time. See lock
 	notifMutex sync.RWMutex
 }
 
@@ -64,9 +64,9 @@ func newSQLiteDriver(db *sql.DB) *SQLiteDriver {
 	}
 }
 
-// lock takes dbLock, or returns ctx's error if ctx ends first. A holder may be waiting
-// for a pool connection on behalf of an unrelated caller, and a sync.Mutex wait would
-// keep a cancelled consumer, and so Shutdown, waiting for that caller.
+// lock takes dbLock, or returns the error of ctx if ctx ends first. The holder can wait for a
+// pool connection for a different caller. A sync.Mutex cannot stop its wait. Then a canceled
+// consumer, and thus Shutdown, waits for that caller.
 func (d *SQLiteDriver) lock(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -118,8 +118,8 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 
 	for {
 		var batchDeleted int64
-		// The database serializes writers. Avoid an uncancellable Go mutex
-		// wait here: shutdown must be able to cancel cleanup's pool/SQL wait.
+		// The database lets writers write one at a time. Do not use a Go mutex here, because its wait
+		// cannot stop. Shutdown must be able to stop the cleanup wait for the pool or for SQL.
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			res, err := tx.ExecContext(ctx, `
@@ -224,7 +224,7 @@ func (d *SQLiteDriver) insertJob(
 	var executor sqlExecutor = d.db
 	if tx != nil {
 		// A caller-owned transaction may already hold SQLite's write lock.
-		// Taking dbLock here could deadlock with a queue operation waiting on it.
+		// Do not take dbLock here. A deadlock can occur with a queue operation that waits for it.
 		executor = tx
 	} else {
 		if err := d.lock(ctx); err != nil {
@@ -331,7 +331,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 				ORDER BY id
 				LIMIT ?
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+			RETURNING id, payload, retry_count, trace_context, created_at, claim_token, last_error
 		`, claimToken, claimTimeout.Milliseconds(), jobType, prefetchCount)
 		if err != nil {
 			return fmt.Errorf("failed to claim jobs: %w", err)
@@ -345,11 +345,13 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 			var j job
 			var traceContextJSON sql.NullString
 			var createdAtMs int64
+			var lastError sql.NullString
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken, &lastError); err != nil {
 				return fmt.Errorf("failed to scan claimed job: %w", err) // Return error to rollback
 			}
 			j.CreatedAt = time.UnixMilli(createdAtMs)
+			j.LastError = lastError.String
 			j.ClaimExpiresAt = deadline
 
 			// Deserialize trace context
@@ -379,23 +381,24 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	return jobsToReturn, nil
 }
 
-func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
 	deadline := localClaimDeadline(timeout)
 	if err := d.lock(ctx); err != nil {
 		return deadline, err
 	}
 	defer d.unlock()
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?,
+			retry_count = CASE WHEN ? AND retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL AND claim_expires_at > `+sqliteNow,
-		timeout.Milliseconds(), j.ID, j.ClaimToken)
+		timeout.Milliseconds(), startAttempt, j.ID, j.ClaimToken)
 	return deadline, checkClaimResult(result, err)
 }
 
 func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
-	// Do not take dbLock here. A dead-letter hook can hold it for a long time, and
-	// shutdown's short release budget would run out waiting. SQLite's own lock is enough.
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
-		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	// Do not take dbLock here. A dead-letter hook can hold it for a long time. Shutdown has
+	// a short time for the release, and the wait can use all of it. The SQLite lock is sufficient.
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = ?
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, int64(j.RetryCount), j.ID, j.ClaimToken)
 	return checkClaimResult(result, err)
 }
 
@@ -417,13 +420,13 @@ func (d *SQLiteDriver) subscribeForConsumer(_ context.Context, jobType string, t
 	return ch, nil
 }
 
-// isSQLiteBusy reports whether err is SQLITE_BUSY, including SQLITE_BUSY_SNAPSHOT. It goes by the
-// result code where the driver gives one (see sqliteResultCode): a message can say anything, such as
-// a trigger's RAISE, and a busy error lets markJobProcessed drop the handler's transaction. For other
-// drivers it falls back on SQLite's own message.
+// isSQLiteBusy reports whether err is SQLITE_BUSY, also SQLITE_BUSY_SNAPSHOT. If the driver gives
+// a result code, the function uses it (see sqliteResultCode). A message can contain all text, for
+// example from RAISE in a trigger. A busy error lets markJobProcessed discard the handler transaction.
+// For other drivers, the function uses the SQLite message.
 func isSQLiteBusy(err error) bool {
 	if code, ok := sqliteResultCode(err); ok {
-		return code&0xff == sqliteBusy // The primary code, of an extended one too.
+		return code&0xff == sqliteBusy // The primary code, also of an extended code.
 	}
 	return strings.Contains(err.Error(), "database is locked")
 }
@@ -431,9 +434,10 @@ func isSQLiteBusy(err error) bool {
 // sqliteBusy is SQLITE_BUSY, the primary result code.
 const sqliteBusy = 5
 
-// sqliteResultCode returns the SQLite result code in err's chain, without depending on a driver:
-// modernc.org/sqlite's errors have a Code method, and mattn/go-sqlite3's a Code field, which is
-// read only from types of a package whose path names sqlite. It reports false if neither is found.
+// sqliteResultCode returns the SQLite result code in the chain of err. It does not import a driver.
+// The errors of modernc.org/sqlite have a Code method. The errors of mattn/go-sqlite3 have a Code
+// field. The function reads the field only from types in a package with sqlite in its path.
+// If it finds neither, it returns false.
 func sqliteResultCode(err error) (int, bool) {
 	var coder interface{ Code() int }
 	if errors.As(err, &coder) {
@@ -454,17 +458,17 @@ func sqliteResultCode(err error) (int, bool) {
 	return 0, false
 }
 
-// wroteNothing reports whether a busy error on writing the main database proves that tx wrote nothing.
-// It holds when main uses write-ahead logging, where a transaction that wrote main holds its write lock,
-// and when the connection uses no other database, attached or temp, whose writes main's lock says nothing
-// about. It is queried only on the busy path, through tx: the pool may have no other connection while
-// tx holds one.
+// wroteNothing reports whether a busy error on a write to main shows that tx did not write.
+// This is true if main uses write-ahead logging. Then a transaction that wrote main holds its write lock.
+// The connection must also use no other database, attached or temp. The lock of main tells nothing
+// about writes to those. The function runs only after a busy error, and only through tx.
+// While tx holds a connection, the pool can have no other connection.
 func wroteNothing(ctx context.Context, tx *sql.Tx) bool {
 	var mode string
 	if err := tx.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil || !strings.EqualFold(mode, "wal") {
 		return false
 	}
-	// The temp database is listed once the connection has used it.
+	// The list contains the temp database after the connection uses it.
 	var others int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_database_list WHERE name <> 'main'`).Scan(&others); err != nil {
 		return false
@@ -483,19 +487,21 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 
 	nowMs := time.Now().UnixMilli()
 
+	// The start of the attempt incremented retry_count (see extendClaim). A success is not a retry.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = ? WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
+		`UPDATE jobs SET processed_at = ?, retry_count = MAX(retry_count - 1, 0)
+			WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
 		nowMs, jobID, claimToken,
 	)
 	if err != nil {
-		// A handler that only read leaves tx a deferred read transaction, pinned to the snapshot of its
-		// first read. Once another connection commits, it can't become a writer: SQLite fails this
-		// update at once with SQLITE_BUSY_SNAPSHOT, which busy_timeout doesn't wait out.
-		// In WAL mode, a transaction that has written main holds its write lock, so a busy error
-		// here means the handler wrote nothing, unless it could write another database (see wroteNothing).
-		// Rollback-journal mode gives no such guarantee.
+		// If a handler only read, tx is a deferred read transaction on the snapshot of its first read.
+		// After a different connection commits, tx cannot become a writer. SQLite then fails this
+		// update immediately with SQLITE_BUSY_SNAPSHOT, and busy_timeout does not wait.
+		// In WAL mode, a transaction that wrote main holds its write lock. Thus, a busy error here
+		// shows that the handler did not write, if it cannot write a different database (see wroteNothing).
+		// Rollback-journal mode does not give this guarantee.
 		if isSQLiteBusy(err) && wroteNothing(ctx, tx) {
-			err = fmt.Errorf("%w: %w", errMarkInFreshTx, err)
+			err = fmt.Errorf("%w: %w", errStaleReadTx, err)
 		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to mark job as processed")
@@ -556,10 +562,10 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	nowMs := time.Now().UnixMilli()
 	scheduledMs := nowMs + backoffDuration.Milliseconds()
 
-	// Update the job: increment retry, set error, schedule, clear consumption/processing state
+	// Set the error and the schedule, and clear the claim. The start of the attempt already
+	// incremented retry_count (see extendClaim).
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET 
-			retry_count = CASE WHEN retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END,
 			last_error = ?, 
 			scheduled_at = ?,
 			consumed_at = NULL, 
@@ -585,7 +591,7 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
-// inTx runs while dbLock is held, so it must not call driver methods that take it.
+// inTx runs while dbLock is locked. Thus, it must not call driver methods that take dbLock.
 func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -615,14 +621,14 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	// Copy the job in one statement, so the transaction starts with a write. A SELECT first would
-	// pin a read snapshot, and once another process committed, the INSERT after it would fail at
-	// once with SQLITE_BUSY_SNAPSHOT. dbLock only serializes this process. A first write waits for
-	// the lock instead.
+	// Copy the job in one statement. Thus, the transaction starts with a write. A first SELECT
+	// keeps a read snapshot. After a different process commits, the next INSERT then fails immediately
+	// with SQLITE_BUSY_SNAPSHOT. dbLock applies only to this process. A first write waits
+	// for the lock, and does not fail.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		SELECT id, job_type, payload, created_at, ?, retry_count, ?
+		SELECT id, job_type, payload, created_at, ?, MAX(retry_count - 1, 0), ?
 		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
 	`, nowMs, reason, jobID, claimToken)
 	if err = checkClaimResult(res, err); err != nil {
@@ -774,8 +780,8 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	// reset retry count and scheduled_at = now. One statement, so the transaction starts with a
-	// write, for the reason given in moveToDeadLetterQueue.
+	// Set retry count to zero and scheduled_at to now. Use one statement, thus the transaction
+	// starts with a write. For the reason, see moveToDeadLetterQueue.
 	var jobType string
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)

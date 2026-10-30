@@ -203,8 +203,8 @@ func TestPostgreSQL(t *testing.T) {
 	})
 }
 
-// TestNullCreatedAt checks that a job cannot be stored without created_at. The column was once
-// nullable, and a job without one could never be dead-lettered.
+// TestNullCreatedAt makes sure that the queue cannot store a job without created_at. Before, the
+// column could be NULL, and a job without created_at did not go to the DLQ.
 func (tc *TestCase) TestNullCreatedAt(ctx context.Context, t *testing.T) {
 	t.Helper()
 
@@ -271,7 +271,7 @@ func setupPostgresTestCase(t *testing.T) (*TestCase, trace.Tracer, func()) {
 	q, err := sqlq.New(
 		db,
 		sqlq.DBTypePostgres,
-		sqlq.WithDefaultPollInterval(50*time.Millisecond),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(50*time.Millisecond)),
 		sqlq.WithDefaultBackoffFunc(func(_ uint16) time.Duration { return 0 }), // Rename unused 'i' to '_'
 		sqlq.WithTracer(tracer),
 		sqlq.WithMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(metrics))),

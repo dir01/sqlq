@@ -7,65 +7,83 @@ import (
 	"time"
 )
 
-// A claim lets one consumer work on one job for a limited time.
-// The jobs table stores the claim token and the expiry time.
-// Every later write for the job must give the same token, or it fails with ErrClaimLost.
-// After a claim expires, another consumer can claim the job with a new token.
-// This lets another worker finish jobs that a stopped worker left behind.
+// A claim gives one consumer the right to process one job for a limited time.
+// The jobs table stores the claim token and the expiry time of each claim.
+// Each write for the job must give the token. If the token is different, the write fails with ErrClaimLost.
+// When a claim expires, a different consumer can claim the job with a new token.
+// Thus, the jobs of a worker that stopped are processed again.
+//
+// A claim lasts the job timeout plus the claim overhead. The overhead is the time for
+// the work that the claim must cover, apart from the handler. It has two halves:
+//
+//	| before the handler | job timeout | after the job timeout |
+//	                     ^ the handler starts
+//
+// Before the handler, the worker:
+//   - waits for a database connection for the handler's transaction.
+//   - if necessary, extends the claim. That is one more round trip to the database.
+//
+// After the job timeout:
+//   - the handler returns. It can return a short time after its context is canceled.
+//   - the worker commits or rolls back the handler's transaction.
+//   - the worker writes the result: it marks the job processed, or writes a retry,
+//     or locks the job row to move it to the dead letter queue.
+//
+// The claim does not cover these times:
+//   - The time in the buffer. When the job leaves the buffer, the worker extends the claim if necessary.
+//   - The dead letter hook. It runs while the job row is locked, so no other consumer can claim the job.
+//
+// Both halves also absorb small differences between the local deadline and the expiry
+// in the database, for example the rounding to whole milliseconds.
 
-// claimKey returns the key for a claim in consumer.claims. The consumer uses that map
-// to limit how many jobs it holds, and to release them at shutdown.
-// The key includes the token, because the consumer can claim the same job again
-// after its old claim expires.
+// minJobTimeout is the shortest job timeout. The job timeout options increase a shorter value to it.
+// It keeps a small safety margin in the claim overhead, also when a user sets a very short job timeout.
+const minJobTimeout = 50 * time.Millisecond
+
+// claimOverhead returns the claim time in addition to the job timeout:
+// half the job timeout, but not more than 10 seconds.
+func claimOverhead(jobTimeout time.Duration) time.Duration {
+	return min(10*time.Second, jobTimeout/2)
+}
+
+// claimLength returns the length of each new claim and of each extension.
+func claimLength(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + claimOverhead(jobTimeout)
+}
+
+// minClaimLeftAtStart returns the minimum claim time that must be left when the handler starts:
+// the job timeout and the half of the overhead after it.
+// If less time is left, processJob extends the claim before the handler starts.
+func minClaimLeftAtStart(jobTimeout time.Duration) time.Duration {
+	return jobTimeout + claimOverhead(jobTimeout)/2
+}
+
+// localClaimDeadline returns the time at which the worker must think that a claim expires.
+// The drivers call it before they send the claim UPDATE. Thus, the round trip and the waits
+// for locks make the deadline earlier than the expiry that the database stores. The worker
+// compares the deadline with its own clock, so it does not need a query for each check.
+func localClaimDeadline(timeout time.Duration) time.Time {
+	return time.Now().Add(timeout)
+}
+
+// claimKey returns the key of a claim in consumer.claims. The consumer uses that map to count
+// the jobs that it holds, and to release them at shutdown. The key includes the token, because
+// the consumer can claim the same job again after its old claim expires.
 func claimKey(j job) string {
 	return fmt.Sprintf("%d/%s", j.ID, j.ClaimToken)
 }
 
-// claimBudget returns how long a worker can count on a claim, from the time it asked for it.
-// It drops any part of a millisecond, because the database gets the timeout in whole milliseconds.
-// It takes off 1ms more, because SQLite reads the clock in whole milliseconds and drops the rest,
-// so the claim start it stores can be up to 1ms before the real time.
-// WithConsumerClaimTimeout and WithDefaultClaimTimeout ignore a timeout when this returns zero or less.
-func claimBudget(timeout time.Duration) time.Duration {
-	return timeout.Truncate(time.Millisecond) - time.Millisecond
-}
-
-// localClaimDeadline returns the last time a worker can start a job without asking the database.
-// getJobsForConsumer and extendClaim in each driver call it before they send their UPDATE,
-// so it is never later than the expiry the database stores. processJob compares it with
-// the current time before it runs the handler (see claimTimeNeeded).
-func localClaimDeadline(timeout time.Duration) time.Time {
-	return time.Now().Add(claimBudget(timeout))
-}
-
-// claimTimeNeeded returns how much claim time must be left before a worker starts a handler:
-// the job timeout, plus time for the handler to return and its result to be written.
-// That extra time is half the job timeout, but at most one minute.
-// processJob extends the claim first when less time is left.
-func claimTimeNeeded(jobTimeout time.Duration) time.Duration {
-	return jobTimeout + min(time.Minute, jobTimeout/2)
-}
-
-// minClaimTimeout returns the shortest claim timeout a consumer accepts for jobTimeout:
-// a claim just extended must still have claimTimeNeeded left once the extension's round trip
-// and the wait for a connection are over. A quarter of the job timeout, at most one second,
-// is left for those, and 2ms more for claimBudget's rounding. With less, a worker would extend
-// the claim again and again and never start the handler.
-func minClaimTimeout(jobTimeout time.Duration) time.Duration {
-	return claimTimeNeeded(jobTimeout) + min(time.Second, jobTimeout/4) + 2*time.Millisecond
-}
-
-// newClaimToken returns a random string for one claim request (128 random bits, base32).
-// The drivers add ":<job ID>", so each job in a batch gets its own token.
-// It is random so that consumers in different processes never make the same token.
+// newClaimToken returns a random token for one claim query: 128 random bits in base32.
+// The drivers add ":<job ID>", so each job in the batch gets a different token.
+// The token is random, so consumers in different processes do not make the same token.
 func newClaimToken() string {
 	return rand.Text()
 }
 
-// checkClaimResult checks a write that filters on the claim token and must change one row.
-// If it did not change one row, it returns ErrClaimLost. That happens when another consumer
-// took the job, the claim was released, or the job is already done.
-// If the write itself failed, it returns that error.
+// checkClaimResult examines the result of a write that has a filter on the claim token.
+// The write must change one row. If it changed no row, the function returns ErrClaimLost:
+// a different consumer has the job, the claim was released, or the job is complete.
+// If the write failed, the function returns its error.
 func checkClaimResult(result sql.Result, err error) error {
 	if err != nil {
 		return err
