@@ -23,7 +23,7 @@ func (tc *TestCase) TestPanic(ctx context.Context, t *testing.T) {
 			panic(panicMessage)
 		},
 		sqlq.WithConsumerMaxRetries(0), // Move to DLQ immediately
-		sqlq.WithConsumerPollInteval(10*time.Millisecond),
+		sqlq.WithConsumerPollDelayFunc(pollEvery(10*time.Millisecond)),
 		sqlq.WithConsumerJobTimeout(1*time.Second),
 	)
 	require.NoError(t, err, "Failed to register consumer")

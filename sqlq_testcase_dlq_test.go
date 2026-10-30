@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -52,13 +53,13 @@ func (tc *TestCase) TestDLQBasic(ctx context.Context, t *testing.T) {
 		require.NoError(t, err, "Failed to get DLQ jobs")
 
 		return len(dlqJobs) > 0
-	// Increase timeout for checking DLQ
+		// Increase the timeout for the DLQ check
 	}, 5*time.Second, 10*time.Millisecond)
 
 	require.Equal(t, 1, len(dlqJobs))
 
 	j := dlqJobs[0]
-	require.Equal(t, uint16(maxRetries), j.RetryCount)
+	require.Equal(t, uint32(maxRetries), j.RetryCount)
 	require.NotZero(t, j.OriginalID, "OriginalID should not be zero in DLQ job")
 }
 
@@ -356,7 +357,7 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 	require.Equal(t, jobType, call.info.JobType)
 	require.NotZero(t, call.info.ID)
 	require.Equal(t, maxRetries, call.info.MaxRetries)
-	require.Equal(t, uint16(maxRetries), call.info.RetryCount)
+	require.Equal(t, uint32(maxRetries), call.info.RetryCount)
 	// Generous, since the database server's clock sets created_at on some drivers
 	require.WithinDuration(t, publishedAt, call.info.CreatedAt, time.Minute)
 	require.True(t, call.info.IsFinalAttempt())
@@ -386,7 +387,7 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 		require.True(t, handlerCall.ok, "job info should be in handler context")
 		require.Equal(t, call.info.ID, handlerCall.info.ID)
 		require.Equal(t, call.info.CreatedAt, handlerCall.info.CreatedAt)
-		require.Equal(t, uint16(i), handlerCall.info.RetryCount)
+		require.Equal(t, uint32(i), handlerCall.info.RetryCount)
 		require.Equal(t, i == int(maxRetries), handlerCall.info.IsFinalAttempt())
 	}
 
@@ -398,7 +399,9 @@ func (tc *TestCase) TestDLQHook(ctx context.Context, t *testing.T) {
 }
 
 // TestDLQHookFailure checks that when the dead letter hook fails, times out or panics,
-// both its writes and the move to the dead letter queue are rolled back, and the job is retried.
+// both its writes and the move to the dead letter queue are rolled back, and the move is tried again.
+// The job has no attempts left, so the handler does not run again. The first hook call gets the handler error.
+// The later calls get a "no attempts left" error that contains the text of the handler error.
 func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 	t.Helper()
 
@@ -418,6 +421,7 @@ func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 	var handlerCalls atomic.Int32
 	var hookCalls atomic.Int32
 	var jobID atomic.Int64
+	hookErrs := make(chan error, 10)
 
 	err := tc.Q.Consume(ctx, jobType, func(_ context.Context, _ *sql.Tx, _ []byte) error {
 		handlerCalls.Add(1)
@@ -425,8 +429,11 @@ func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 	},
 		sqlq.WithConsumerMaxRetries(0),
 		sqlq.WithConsumerJobTimeout(200*time.Millisecond),
-		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo, _ []byte, _ error) error {
+		sqlq.WithConsumerOnDeadLetter(func(ctx context.Context, tx *sql.Tx, info sqlq.JobInfo, _ []byte, handlerErr error) error {
 			attempt := hookCalls.Add(1)
+			if !strings.Contains(handlerErr.Error(), "always fails") {
+				hookErrs <- handlerErr
+			}
 			jobID.Store(info.ID)
 
 			// Every call writes, but only the write of the call that succeeds should be committed.
@@ -467,8 +474,9 @@ func (tc *TestCase) TestDLQHookFailure(ctx context.Context, t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "job should eventually be in the dead letter queue")
 
 	require.Equal(t, int32(4), hookCalls.Load())
-	require.Equal(t, int32(4), handlerCalls.Load(), "the handler should run again after each failed hook")
-	require.Equal(t, uint16(3), dlqJob.RetryCount, "each failed hook should count as a failed attempt")
+	require.Equal(t, int32(1), handlerCalls.Load(), "after the final attempt, the handler must not run again")
+	require.Empty(t, hookErrs, "each hook call must get the text of the handler error")
+	require.Equal(t, uint32(3), dlqJob.RetryCount, "each failed hook should count as a failed attempt")
 
 	rows, err := tc.DB.QueryContext(ctx, "SELECT attempt FROM dlq_hook_failure_attempts")
 	require.NoError(t, err)

@@ -4,6 +4,7 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -21,7 +22,7 @@ type driver interface {
 			TraceContext map[string]string
 			Payload      []byte
 			ID           int64
-			RetryCount   uint16
+			RetryCount   uint32
 		}
 	*/
 
@@ -32,7 +33,12 @@ type driver interface {
 	// getJobsForConsumer executes the query for finding jobs for a consumer
 	// Unprocessed jobs can be returned again after their claim expires.
 	getJobsForConsumer(ctx context.Context, jobType string, prefetchCount uint16, claimTimeout time.Duration) ([]job, error)
-	extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error)
+	// extendClaim gives the claim on j a new length of timeout, if the claim is still valid.
+	// If startAttempt is true, it also increments retry_count. Thus, the attempt counts also if the
+	// worker process stops before it writes a result. It returns the new local deadline.
+	extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error)
+	// releaseClaim makes j available again, and sets retry_count back to j.RetryCount. Thus, an
+	// attempt that the worker stopped on purpose, for example at shutdown, does not count.
 	releaseClaim(ctx context.Context, j job) error
 
 	// subscribeForConsumer will post new jobs to a channel according to tokenBucket
@@ -40,6 +46,8 @@ type driver interface {
 
 	// markJobProcessed marks a claimed job as processed within the handler's transaction.
 	// Processed jobs are not returned to consumers and are eligible for cleanup
+	// If tx did not write and cannot become a writer, it returns errStaleReadTx.
+	// The caller can then roll back tx and mark the job in a new transaction.
 	markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error
 
 	// markJobFailedAndReschedule combines marking a job as failed and rescheduling it
@@ -65,6 +73,11 @@ type driver interface {
 	// It deletes DLQ jobs of type jobType older than maxAge, in batches of batchSize.
 	cleanupDeadLetterQueueJobs(ctx context.Context, jobType string, maxAge time.Duration, batchSize uint16) (deletedCount int64, err error)
 }
+
+// markJobProcessed returns errStaleReadTx if the handler transaction only read, and a different
+// connection committed after that. Then the transaction cannot write.
+// The handler did not write. Thus, a mark in a new transaction does not lose data.
+var errStaleReadTx = errors.New("handler transaction only read, and its snapshot is stale, so it can't write")
 
 // sqlExecutor is implemented by both *sql.DB and *sql.Tx.
 type sqlExecutor interface {

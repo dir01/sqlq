@@ -3,25 +3,12 @@ package sqlq
 import (
 	"context"
 	"database/sql"
+	"math"
 	"time"
 )
 
 // ConsumerOption defines functional options for Subscribe
 type ConsumerOption func(*consumer)
-
-// WithConsumerClaimTimeout sets how long a consumer holds a fetched job before other
-// consumers can take it. Default is twice the job timeout (30 minutes with defaults).
-// The time starts at fetch, so time in the buffer counts. Before a worker starts a handler,
-// it extends the claim if less than the job timeout plus a margin is left. Claims are not
-// renewed while the handler runs. Consume returns ErrClaimTimeoutTooShort if the claim
-// timeout is not longer than the job timeout. Values under 2ms are ignored.
-func WithConsumerClaimTimeout(timeout time.Duration) ConsumerOption {
-	return func(c *consumer) {
-		if claimBudget(timeout) > 0 {
-			c.claimTimeout = timeout
-		}
-	}
-}
 
 // WithConsumerConcurrency sets the number of concurrent workers for a given consumer
 // You may also configure default value for all consumers, see WithDefaultConcurrency.
@@ -54,19 +41,21 @@ func WithConsumerPrefetchCount(prefetchCount uint16) ConsumerOption {
 	}
 }
 
-// WithConsumerPollInteval sets how frequently to check for new jobs for a given consumer
-// You may also configure default value for all consumers, see WithDefaultPollInterval.
-func WithConsumerPollInteval(interval time.Duration) ConsumerOption {
+// WithConsumerPollDelayFunc sets the function that calculates the delay to the next poll for a given consumer.
+// See WithDefaultPollDelayFunc for the argument and the default. The option ignores nil.
+// You may also configure default value for all consumers, see WithDefaultPollDelayFunc.
+func WithConsumerPollDelayFunc(pollDelayFunc func(emptyPolls uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		if interval > 0 {
-			o.pollInterval = interval
+		if pollDelayFunc != nil {
+			o.pollDelayFunc = pollDelayFunc
 		}
 	}
 }
 
 // WithConsumerBackoffFunc sets a function to calculate backoff for a given consumer
+// The retry argument stops at 65535. JobInfo.RetryCount keeps the full count.
 // You may also configure default value for all consumers, see WithDefaultBackoffFunc.
-func WithConsumerBackoffFunc(fn func(uint16) time.Duration) ConsumerOption {
+func WithConsumerBackoffFunc(fn func(retryNum uint16) time.Duration) ConsumerOption {
 	return func(o *consumer) {
 		o.backoffFunc = fn
 	}
@@ -86,11 +75,15 @@ func WithConsumerMaxRetries(maxRetries int32) ConsumerOption {
 // WithConsumerJobTimeout sets a maximum execution duration for a single job handler invocation.
 // If the handler exceeds this duration, its context will be canceled.
 // A timeout is treated as a job failure.
+// The job timeout also sets the claim: other consumers can take a fetched job after the job
+// timeout plus half of it (at most 10 seconds more). Before a handler starts, the worker
+// extends the claim if necessary.
+// The option ignores a zero or negative timeout, and increases a timeout shorter than 50ms to 50ms.
 // You may also configure default value for all consumers, see WithDefaultJobTimeout.
 func WithConsumerJobTimeout(timeout time.Duration) ConsumerOption {
 	return func(o *consumer) {
-		if timeout > 0 { // Only set positive timeouts
-			o.jobTimeout = timeout
+		if timeout > 0 {
+			o.jobTimeout = max(timeout, minJobTimeout)
 		}
 	}
 }
@@ -141,22 +134,27 @@ func WithAsyncPush() ConsumerOption {
 	}
 }
 
-// WithAsyncPushRateLimit says how many times per minute should async notifications
-// from a publisher be delivered, at most
+// WithAsyncPushRateLimit sets the maximum number of async notifications from a publisher
+// in one minute. Zero or less means no limit. A value above 65535 becomes 65535.
 func WithAsyncPushRateLimit(rpm int) ConsumerOption {
 	return func(o *consumer) {
-		o.asyncPushMaxRPM = uint16(rpm)
+		o.asyncPushMaxRPM = uint16(min(max(rpm, 0), math.MaxUint16))
 	}
 }
 
 // DeadLetterHook is called when a job has exhausted its retries, inside the transaction that moves
 // the job to the dead letter queue. handlerErr is the error returned by the final attempt.
+// If the final attempt did not write a result, for example because the worker process stopped,
+// or if this is a new try after a failed hook, handlerErr starts with "no attempts left".
+// It then includes only the text of the last recorded error, so errors.Is and errors.As do not
+// find the original error.
 //
 // The move and the hook's writes through tx are committed together, and only if the hook returns nil.
 // The queue owns tx: hooks must not call Commit or Rollback, including in a defer.
 // Return an error to abort the transaction; return nil to allow the queue to commit.
-// If the hook returns an error or panics, the move is rolled back and the job is rescheduled
-// like a failed attempt: its handler runs again and, if it fails again, the hook is called again.
+// If the hook returns an error or panics, the move is rolled back and the job is rescheduled.
+// The job has no attempts left, so its handler does not run again: the next attempt only
+// tries the move again, and calls the hook again.
 //
 // ctx is canceled at shutdown and after the consumer's job timeout. A hook whose ctx was canceled
 // counts as failed even if it returns nil.

@@ -4,9 +4,12 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	sqldriver "database/sql/driver"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,9 +29,9 @@ const sqliteTracerName = "github.com/dir01/sqlq/driver_sqlite"
 // (unixepoch('now','subsec') is simpler, but needs SQLite 3.42). ROUND fixes float error
 // that would otherwise make CAST cut the value down by one millisecond.
 //
-// We use it instead of passing time.Now(), because SQLite reads 'now' when the statement
-// runs, after any wait for dbMutex or the write lock. A time.Now() value would be old by then.
-// 'now' also stays the same for the whole statement, so one UPDATE uses one time everywhere.
+// Use it, not time.Now(). SQLite reads 'now' when the statement runs, after all waits
+// for dbLock or for the write lock. At that time, a time.Now() value is old.
+// 'now' is also the same for all of the statement. Thus, one UPDATE uses one time.
 //
 // localClaimDeadline uses the time before the request on purpose: waiting must not add
 // to the worker's time.
@@ -39,7 +42,7 @@ type SQLiteDriver struct {
 	db         *sql.DB
 	tracer     trace.Tracer
 	notif      map[string]*sqliteNotificationSubscription
-	dbMutex    sync.Mutex
+	dbLock     chan struct{} // One slot: queue writes in this process occur one at a time. See lock
 	notifMutex sync.RWMutex
 }
 
@@ -54,11 +57,183 @@ type sqliteNotificationSubscription struct {
 func newSQLiteDriver(db *sql.DB) *SQLiteDriver {
 	return &SQLiteDriver{
 		db:         db,
-		dbMutex:    sync.Mutex{},
+		dbLock:     make(chan struct{}, 1),
 		notif:      make(map[string]*sqliteNotificationSubscription),
 		notifMutex: sync.RWMutex{},
 		tracer:     otel.Tracer(sqliteTracerName),
 	}
+}
+
+// lock takes dbLock, or returns the error of ctx if ctx ends first. The holder can wait for a
+// pool connection for a different caller. A sync.Mutex cannot stop its wait. Then a canceled
+// consumer, and thus Shutdown, waits for that caller.
+func (d *SQLiteDriver) lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case d.dbLock <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *SQLiteDriver) unlock() { <-d.dbLock }
+
+// sqliteTable is a table of the queue. It contains the column definitions, the columns to copy
+// from an old version of the table, and the fill value for each NOT NULL column that can contain
+// NULL in the old version (see sqliteRebuildNullable).
+type sqliteTable struct {
+	fill          map[string]string
+	name, columns string
+	copyColumns   []string
+}
+
+// sqliteRetryCount is the name of the retry count column in the two tables.
+const sqliteRetryCount = "retry_count"
+
+var sqliteJobsTable = sqliteTable{
+	name: "jobs",
+	columns: `id INTEGER PRIMARY KEY AUTOINCREMENT,
+		job_type TEXT NOT NULL,
+		payload BLOB,
+		created_at INTEGER NOT NULL, -- Milliseconds since epoch
+		scheduled_at INTEGER NOT NULL, -- Milliseconds since epoch
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT,
+		trace_context TEXT, -- Added for trace propagation
+		consumed_at INTEGER NULL, -- Milliseconds since epoch, indicates when the job was claimed
+		processed_at INTEGER NULL, -- Milliseconds since epoch, indicates successful processing
+		claim_token TEXT NULL,
+		claim_expires_at INTEGER NULL -- Milliseconds since epoch`,
+	copyColumns: []string{
+		"id", "job_type", "payload", "created_at", "scheduled_at", sqliteRetryCount, "last_error",
+		"trace_context", "consumed_at", "processed_at", "claim_token", "claim_expires_at",
+	},
+	fill: map[string]string{sqliteRetryCount: "0"},
+}
+
+var sqliteDLQTable = sqliteTable{
+	name: "dead_letter_queue",
+	columns: `original_job_id INTEGER PRIMARY KEY, -- Use original job ID as PK
+		job_type TEXT NOT NULL,
+		payload BLOB,
+		created_at INTEGER NOT NULL, -- Milliseconds since epoch
+		failed_at INTEGER NOT NULL, -- Milliseconds since epoch
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		failure_reason TEXT NOT NULL DEFAULT ''`,
+	copyColumns: []string{"original_job_id", "job_type", "payload", "created_at", "failed_at", sqliteRetryCount, "failure_reason"},
+	fill:        map[string]string{sqliteRetryCount: "0", "failure_reason": "''"},
+}
+
+// sqliteColumns returns the columns of table. For each column, it also tells if the column is NOT NULL.
+func sqliteColumns(ctx context.Context, tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name, "notnull" FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		var notNull bool
+		if err := rows.Scan(&name, &notNull); err != nil {
+			return nil, err
+		}
+		columns[name] = notNull
+	}
+	return columns, rows.Err()
+}
+
+// sqliteRebuildNullable makes table again with its current definition, if a column that it fills
+// can contain NULL. SQLite cannot add NOT NULL to a column. The copy fills the NULL values.
+// DROP TABLE also removes the indexes, and initSchema makes them again after this function.
+// DROP TABLE also removes the AUTOINCREMENT counter. The function copies the counter, because
+// DLQ rows keep their IDs, and the queue must never use an ID two times.
+func sqliteRebuildNullable(ctx context.Context, tx *sql.Tx, table sqliteTable) error {
+	columns, err := sqliteColumns(ctx, tx, table.name)
+	if err != nil {
+		return err
+	}
+	nullable := false
+	values := make([]string, len(table.copyColumns))
+	for i, column := range table.copyColumns {
+		values[i] = column
+		if fill, ok := table.fill[column]; ok {
+			values[i] = "COALESCE(" + column + ", " + fill + ")"
+			nullable = nullable || !columns[column]
+		}
+	}
+	if !nullable {
+		return nil
+	}
+	var seq sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = ?`, table.name).Scan(&seq)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) && !strings.Contains(err.Error(), "no such table") {
+		return err
+	}
+	rebuilt := table.name + "_rebuilt"
+	for _, statement := range []string{
+		`CREATE TABLE ` + rebuilt + ` (` + table.columns + "\n)",
+		`INSERT INTO ` + rebuilt + ` (` + strings.Join(table.copyColumns, ", ") + `) SELECT ` + strings.Join(values, ", ") + ` FROM ` + table.name,
+		`DROP TABLE ` + table.name,
+		`ALTER TABLE ` + rebuilt + ` RENAME TO ` + table.name,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("%s: %w", statement, err)
+		}
+	}
+	if seq.Valid {
+		// sqlite_sequence has no key on name. If the copy made a row, replace it.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = ?`, table.name); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)`, table.name, seq.Int64); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sqliteDisableForeignKeys sets foreign_keys off on conn, if it is on, and returns a function
+// that sets it on again. When foreign keys are on, the DROP TABLE in sqliteRebuildNullable
+// first deletes all rows. Thus, ON DELETE CASCADE in the tables of the application would delete
+// their rows, and other foreign keys would make the migration fail. The pragma has no effect
+// in a transaction, so call this function before BEGIN.
+func sqliteDisableForeignKeys(ctx context.Context, conn *sql.Conn) (func(), error) {
+	var enabled bool
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		return nil, fmt.Errorf("failed to read foreign_keys: %w", err)
+	}
+	if !enabled {
+		return func() {}, nil
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
+		return nil, fmt.Errorf("failed to set foreign_keys off: %w", err)
+	}
+	return func() {
+		// Also after a cancel: the connection goes back to the pool and must keep its settings.
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA foreign_keys = ON`); err != nil {
+			// Do not give the connection back to the pool without foreign keys.
+			_ = conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+		}
+	}, nil
+}
+
+// sqliteCheckForeignKeys returns an error if a row in a different table refers to a row of the
+// queue tables that does not exist.
+func sqliteCheckForeignKeys(ctx context.Context, tx *sql.Tx) error {
+	var table, parent string
+	err := tx.QueryRowContext(ctx, `SELECT "table", parent FROM pragma_foreign_key_check WHERE parent IN (?, ?) LIMIT 1`,
+		sqliteJobsTable.name, sqliteDLQTable.name).Scan(&table, &parent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check foreign keys: %w", err)
+	}
+	return fmt.Errorf("a row of %s refers to a row of %s that does not exist", table, parent)
 }
 
 // initSchema creates the necessary tables and indexes for SQLite if they don't exist.
@@ -69,41 +244,27 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
-
-	queries := []string{
-		`CREATE TABLE IF NOT EXISTS jobs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			job_type TEXT NOT NULL,
-			payload BLOB,
-			created_at INTEGER NOT NULL, -- Milliseconds since epoch
-			scheduled_at INTEGER NOT NULL, -- Milliseconds since epoch
-			retry_count INTEGER DEFAULT 0,
-			last_error TEXT,
-			trace_context TEXT, -- Added for trace propagation
-			consumed_at INTEGER NULL, -- Milliseconds since epoch, indicates when the job was claimed
-			processed_at INTEGER NULL -- Milliseconds since epoch, indicates successful processing
-		)`,
-
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,
-
-		`CREATE TABLE IF NOT EXISTS dead_letter_queue (
-			original_job_id INTEGER PRIMARY KEY, -- Use original job ID as PK
-			job_type TEXT NOT NULL,
-			payload BLOB,
-			created_at INTEGER NOT NULL, -- Milliseconds since epoch
-			failed_at INTEGER NOT NULL, -- Milliseconds since epoch
-			retry_count INTEGER,
-			failure_reason TEXT
-		)`,
-		// No separate ID index needed as original_job_id is PK
-		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`, // Index for filtering by type
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return err
 	}
+	defer d.unlock()
 
-	tx, err := d.db.BeginTx(ctx, nil)
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to get a connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	restoreForeignKeys, err := sqliteDisableForeignKeys(ctx, conn)
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
+	// This defer runs after the rollback below, because the pragma has no effect in a transaction.
+	defer restoreForeignKeys()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -115,35 +276,18 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 		}
 	}()
 
-	for _, query := range queries {
-		_, err = tx.ExecContext(ctx, query)
-		if err != nil {
+	for _, table := range []sqliteTable{sqliteJobsTable, sqliteDLQTable} {
+		if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+table.name+` (`+table.columns+"\n)"); err != nil {
 			span.RecordError(err)
-			return fmt.Errorf("failed to execute query (%s): %w", query, err)
+			return fmt.Errorf("failed to create table %s: %w", table.name, err)
 		}
 	}
 	// CREATE TABLE IF NOT EXISTS does not change an existing table, so add the new columns here.
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(jobs)`)
+	columns, err := sqliteColumns(ctx, tx, sqliteJobsTable.name)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close() }()
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue sql.NullString
-		if scanErr := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); scanErr != nil {
-			return scanErr
-		}
-		columns[name] = true
-	}
-	err = rows.Err()
-	_ = rows.Close()
-	if err != nil {
-		return err
-	}
-	if !columns["claim_token"] {
+	if _, ok := columns["claim_token"]; !ok {
 		// Old versions put failed jobs in the DLQ but did not delete them from jobs (they deleted
 		// id 0). Delete them now, or claim recovery would run them again. IDs are never reused
 		// (AUTOINCREMENT), so every jobs row with a DLQ ID is one of these.
@@ -154,14 +298,37 @@ func (d *SQLiteDriver) initSchema(ctx context.Context) error {
 	for _, column := range []struct{ name, definition string }{
 		{"claim_token", "TEXT NULL"}, {"claim_expires_at", "INTEGER NULL"},
 	} {
-		if !columns[column.name] {
+		if _, ok := columns[column.name]; !ok {
 			if _, alterErr := tx.ExecContext(ctx, `ALTER TABLE jobs ADD COLUMN `+column.name+` `+column.definition); alterErr != nil {
 				return alterErr
 			}
 		}
 	}
-	if _, indexErr := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`); indexErr != nil {
-		return indexErr
+	// Before, the columns that the queue reads could be NULL. Other writers could put NULL there,
+	// and a scan of NULL failed. A job without retry_count made all fetches of its type fail, and
+	// blocked the other jobs. A DLQ row without retry_count or a reason made all DLQ listings fail.
+	for _, table := range []sqliteTable{sqliteJobsTable, sqliteDLQTable} {
+		if err = sqliteRebuildNullable(ctx, tx, table); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to make the columns of %s NOT NULL: %w", table.name, err)
+		}
+	}
+	for _, index := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON jobs(job_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_at_consumed_at ON jobs(scheduled_at, consumed_at)`, // Index to find available jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_job_type_processed_at ON jobs(job_type, processed_at)`,       // Index to clean up processed jobs
+		`CREATE INDEX IF NOT EXISTS idx_jobs_available_claims ON jobs(job_type, scheduled_at, claim_expires_at) WHERE processed_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_dlq_job_type ON dead_letter_queue(job_type)`, // Index to filter by type
+	} {
+		if _, err = tx.ExecContext(ctx, index); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to execute query (%s): %w", index, err)
+		}
+	}
+	// The foreign keys were off during the rebuild. Do not commit a change that breaks them.
+	if err = sqliteCheckForeignKeys(ctx, tx); err != nil {
+		span.RecordError(err)
+		return err
 	}
 
 	err = tx.Commit()
@@ -187,7 +354,8 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 
 	for {
 		var batchDeleted int64
-		d.dbMutex.Lock()
+		// The database lets writers write one at a time. Do not use a Go mutex here, because its wait
+		// cannot stop. Shutdown must be able to stop the cleanup wait for the pool or for SQL.
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			res, err := tx.ExecContext(ctx, `
@@ -206,7 +374,6 @@ func (d *SQLiteDriver) cleanupJobs(ctx context.Context, jobType string, maxAge t
 			batchDeleted = count
 			return nil
 		})
-		d.dbMutex.Unlock()
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during processed job cleanup batch: %w", err))
 			return totalDeleted, err // Return partial counts and error
@@ -237,7 +404,6 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 
 	for {
 		var batchDeleted int64
-		d.dbMutex.Lock()
 		err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 			// Efficiently delete a batch using rowid in SQLite
 			resDLQ, err := tx.ExecContext(ctx, `
@@ -256,7 +422,6 @@ func (d *SQLiteDriver) cleanupDeadLetterQueueJobs(ctx context.Context, jobType s
 			batchDeleted = count
 			return nil
 		})
-		d.dbMutex.Unlock()
 		if err != nil {
 			span.RecordError(fmt.Errorf("error during DLQ cleanup batch: %w", err))
 			return totalDlqDeleted, err // Return partial counts and error
@@ -295,11 +460,14 @@ func (d *SQLiteDriver) insertJob(
 	var executor sqlExecutor = d.db
 	if tx != nil {
 		// A caller-owned transaction may already hold SQLite's write lock.
-		// Taking dbMutex here could deadlock with a queue operation waiting on it.
+		// Do not take dbLock here. A deadlock can occur with a queue operation that waits for it.
 		executor = tx
 	} else {
-		d.dbMutex.Lock()
-		defer d.dbMutex.Unlock()
+		if err := d.lock(ctx); err != nil {
+			span.RecordError(err)
+			return err
+		}
+		defer d.unlock()
 	}
 
 	traceContextJSON := []byte("")
@@ -380,7 +548,10 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	// Claim the jobs in one statement, so the transaction starts with a write. If it started
 	// with a SELECT, the UPDATE after it could fail at once with SQLITE_BUSY when another
 	// connection wrote in between. A first write waits for the lock instead.
-	d.dbMutex.Lock()
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
 	err := runInTx(ctx, d.db, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			UPDATE jobs
@@ -396,7 +567,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 				ORDER BY id
 				LIMIT ?
 			)
-			RETURNING id, payload, retry_count, trace_context, created_at, claim_token
+			RETURNING id, payload, retry_count, trace_context, created_at, claim_token, last_error
 		`, claimToken, claimTimeout.Milliseconds(), jobType, prefetchCount)
 		if err != nil {
 			return fmt.Errorf("failed to claim jobs: %w", err)
@@ -410,11 +581,13 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 			var j job
 			var traceContextJSON sql.NullString
 			var createdAtMs int64
+			var lastError sql.NullString
 			j.JobType = jobType
-			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken); err != nil {
+			if err = rows.Scan(&j.ID, &j.Payload, &j.RetryCount, &traceContextJSON, &createdAtMs, &j.ClaimToken, &lastError); err != nil {
 				return fmt.Errorf("failed to scan claimed job: %w", err) // Return error to rollback
 			}
 			j.CreatedAt = time.UnixMilli(createdAtMs)
+			j.LastError = lastError.String
 			j.ClaimExpiresAt = deadline
 
 			// Deserialize trace context
@@ -434,7 +607,7 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 		slices.SortFunc(jobsToReturn, func(a, b job) int { return cmp.Compare(a.ID, b.ID) })
 		return nil
 	})
-	d.dbMutex.Unlock()
+	d.unlock()
 	if err != nil {
 		span.RecordError(fmt.Errorf("transaction failed during getJobsForConsumer: %w", err))
 		return nil, err // Return nil slice and the error
@@ -444,21 +617,24 @@ func (d *SQLiteDriver) getJobsForConsumer(ctx context.Context, jobType string, p
 	return jobsToReturn, nil
 }
 
-func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration) (time.Time, error) {
+func (d *SQLiteDriver) extendClaim(ctx context.Context, j job, timeout time.Duration, startAttempt bool) (time.Time, error) {
 	deadline := localClaimDeadline(timeout)
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?
+	if err := d.lock(ctx); err != nil {
+		return deadline, err
+	}
+	defer d.unlock()
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET claim_expires_at = `+sqliteNow+` + ?,
+			retry_count = CASE WHEN ? AND retry_count < 2147483647 THEN retry_count + 1 ELSE retry_count END
 		WHERE id = ? AND claim_token = ? AND processed_at IS NULL AND claim_expires_at > `+sqliteNow,
-		timeout.Milliseconds(), j.ID, j.ClaimToken)
+		timeout.Milliseconds(), startAttempt, j.ID, j.ClaimToken)
 	return deadline, checkClaimResult(result, err)
 }
 
 func (d *SQLiteDriver) releaseClaim(ctx context.Context, j job) error {
-	// Do not take dbMutex here. A dead-letter hook can hold it for a long time, and a wait
-	// for a mutex ignores ctx. A wait for SQLite's lock stops when ctx ends.
-	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL
-		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, j.ID, j.ClaimToken)
+	// Do not take dbLock here. A dead-letter hook can hold it for a long time. Shutdown has
+	// a short time for the release, and the wait can use all of it. The SQLite lock is sufficient.
+	result, err := d.db.ExecContext(ctx, `UPDATE jobs SET consumed_at = NULL, claim_token = NULL, claim_expires_at = NULL, retry_count = ?
+		WHERE id = ? AND claim_token = ? AND processed_at IS NULL`, int64(j.RetryCount), j.ID, j.ClaimToken)
 	return checkClaimResult(result, err)
 }
 
@@ -480,6 +656,62 @@ func (d *SQLiteDriver) subscribeForConsumer(_ context.Context, jobType string, t
 	return ch, nil
 }
 
+// isSQLiteBusy reports whether err is SQLITE_BUSY, also SQLITE_BUSY_SNAPSHOT. If the driver gives
+// a result code, the function uses it (see sqliteResultCode). A message can contain all text, for
+// example from RAISE in a trigger. A busy error lets markJobProcessed discard the handler transaction.
+// For other drivers, the function uses the SQLite message.
+func isSQLiteBusy(err error) bool {
+	if code, ok := sqliteResultCode(err); ok {
+		return code&0xff == sqliteBusy // The primary code, also of an extended code.
+	}
+	return strings.Contains(err.Error(), "database is locked")
+}
+
+// sqliteBusy is SQLITE_BUSY, the primary result code.
+const sqliteBusy = 5
+
+// sqliteResultCode returns the SQLite result code in the chain of err. It does not import a driver.
+// The errors of modernc.org/sqlite have a Code method. The errors of mattn/go-sqlite3 have a Code
+// field. The function reads the field only from types in a package with sqlite in its path.
+// If it finds neither, it returns false.
+func sqliteResultCode(err error) (int, bool) {
+	var coder interface{ Code() int }
+	if errors.As(err, &coder) {
+		return coder.Code(), true
+	}
+	for ; err != nil; err = errors.Unwrap(err) {
+		v := reflect.ValueOf(err)
+		if v.Kind() == reflect.Pointer {
+			v = v.Elem()
+		}
+		if v.Kind() != reflect.Struct || !strings.Contains(v.Type().PkgPath(), "sqlite") {
+			continue
+		}
+		if field := v.FieldByName("Code"); field.IsValid() && field.CanInt() {
+			return int(field.Int()), true
+		}
+	}
+	return 0, false
+}
+
+// wroteNothing reports whether a busy error on a write to main shows that tx did not write.
+// This is true if main uses write-ahead logging. Then a transaction that wrote main holds its write lock.
+// The connection must also use no other database, attached or temp. The lock of main tells nothing
+// about writes to those. The function runs only after a busy error, and only through tx.
+// While tx holds a connection, the pool can have no other connection.
+func wroteNothing(ctx context.Context, tx *sql.Tx) bool {
+	var mode string
+	if err := tx.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil || !strings.EqualFold(mode, "wal") {
+		return false
+	}
+	// The list contains the temp database after the connection uses it.
+	var others int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_database_list WHERE name <> 'main'`).Scan(&others); err != nil {
+		return false
+	}
+	return others == 0
+}
+
 // markJobProcessed updates the jobs table to mark a job as successfully processed in SQLite.
 func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID int64, claimToken string) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.mark_job_processed", trace.WithAttributes(
@@ -491,11 +723,22 @@ func (d *SQLiteDriver) markJobProcessed(ctx context.Context, tx *sql.Tx, jobID i
 
 	nowMs := time.Now().UnixMilli()
 
+	// The start of the attempt incremented retry_count (see extendClaim). A success is not a retry.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET processed_at = ? WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
+		`UPDATE jobs SET processed_at = ?, retry_count = MAX(retry_count - 1, 0)
+			WHERE id = ? AND claim_token = ? AND processed_at IS NULL`,
 		nowMs, jobID, claimToken,
 	)
 	if err != nil {
+		// If a handler only read, tx is a deferred read transaction on the snapshot of its first read.
+		// After a different connection commits, tx cannot become a writer. SQLite then fails this
+		// update immediately with SQLITE_BUSY_SNAPSHOT, and busy_timeout does not wait.
+		// In WAL mode, a transaction that wrote main holds its write lock. Thus, a busy error here
+		// shows that the handler did not write, if it cannot write a different database (see wroteNothing).
+		// Rollback-journal mode does not give this guarantee.
+		if isSQLiteBusy(err) && wroteNothing(ctx, tx) {
+			err = fmt.Errorf("%w: %w", errStaleReadTx, err)
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to mark job as processed")
 		return err
@@ -533,8 +776,11 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	defer d.unlock()
 
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -552,10 +798,10 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 	nowMs := time.Now().UnixMilli()
 	scheduledMs := nowMs + backoffDuration.Milliseconds()
 
-	// Update the job: increment retry, set error, schedule, clear consumption/processing state
+	// Set the error and the schedule, and clear the claim. The start of the attempt already
+	// incremented retry_count (see extendClaim).
 	res, err := tx.ExecContext(ctx, `
 		UPDATE jobs SET 
-			retry_count = retry_count + 1, 
 			last_error = ?, 
 			scheduled_at = ?,
 			consumed_at = NULL, 
@@ -581,7 +827,7 @@ func (d *SQLiteDriver) markJobFailedAndReschedule(
 }
 
 // moveToDeadLetterQueue moves a failed job from the main jobs table to the dead_letter_queue table in SQLite, using the original job ID as the primary key.
-// inTx runs while dbMutex is held, so it must not call driver methods that take it.
+// inTx runs while dbLock is locked. Thus, it must not call driver methods that take dbLock.
 func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, claimToken string, reason string, inTx func(tx *sql.Tx) error) error {
 	ctx, span := d.tracer.Start(ctx, "sqlq.driver.sqlite.move_to_dlq", trace.WithAttributes(
 		semconv.DBSystemSqlite,
@@ -590,8 +836,11 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	defer d.unlock()
 
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -608,17 +857,17 @@ func (d *SQLiteDriver) moveToDeadLetterQueue(ctx context.Context, jobID int64, c
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	// Copy the job with a single INSERT ... SELECT rather than a SELECT and then an INSERT.
-	// A transaction that starts by reading can't wait for another connection's write lock:
-	// SQLite fails it with "database is locked" at once. One that starts by writing waits.
+	// Copy the job in one statement. Thus, the transaction starts with a write. A first SELECT
+	// keeps a read snapshot. After a different process commits, the next INSERT then fails immediately
+	// with SQLITE_BUSY_SNAPSHOT. dbLock applies only to this process. A first write waits
+	// for the lock, and does not fail.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO dead_letter_queue
 		(original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason)
-		SELECT id, job_type, payload, created_at, ?, retry_count, ?
+		SELECT id, job_type, payload, created_at, ?, MAX(retry_count - 1, 0), ?
 		FROM jobs WHERE id = ? AND claim_token = ? AND processed_at IS NULL
 	`, nowMs, reason, jobID, claimToken)
-	err = checkClaimResult(res, err)
-	if err != nil {
+	if err = checkClaimResult(res, err); err != nil {
 		span.RecordError(err)
 		return err // Rollback will happen
 	}
@@ -656,8 +905,11 @@ func (d *SQLiteDriver) getDeadLetterJobs(ctx context.Context, jobType string, li
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	defer d.unlock()
 
 	query := `
 		SELECT original_job_id, job_type, payload, created_at, failed_at, retry_count, failure_reason
@@ -739,8 +991,11 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 	))
 	defer span.End()
 
-	d.dbMutex.Lock()
-	defer d.dbMutex.Unlock()
+	if err := d.lock(ctx); err != nil {
+		span.RecordError(err)
+		return "", err
+	}
+	defer d.unlock()
 
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -761,8 +1016,8 @@ func (d *SQLiteDriver) requeueDeadLetterJob(ctx context.Context, originalJobID i
 	// Get current time in milliseconds with microsecond precision
 	nowMs := time.Now().UnixMicro() / 1000
 
-	// reset retry count and scheduled_at = now.
-	// A single INSERT ... SELECT, so the transaction starts by writing; see moveToDeadLetterQueue.
+	// Set retry count to zero and scheduled_at to now. Use one statement, thus the transaction
+	// starts with a write. For the reason, see moveToDeadLetterQueue.
 	var jobType string
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO jobs (job_type, payload, retry_count, created_at, scheduled_at)

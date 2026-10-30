@@ -22,6 +22,9 @@ type sqlqMetrics struct {
 	fetchedCounter        metric.Int64Counter
 	cleanupProcessedCount metric.Int64Counter
 	cleanupDLQCount       metric.Int64Counter
+	claimExpiredCounter   metric.Int64Counter
+	claimExtendedCounter  metric.Int64Counter
+	claimLostCounter      metric.Int64Counter
 	activeJobsUpDown      metric.Int64UpDownCounter
 }
 
@@ -52,6 +55,12 @@ func newMetrics(meter metric.Meter) (*sqlqMetrics, error) {
 	m.cleanupProcessedCount, err = meter.Int64Counter("sqlq.jobs.cleanup.processed.count", metric.WithDescription("Number of processed jobs cleaned up"), metric.WithUnit("{job}"))
 	errs = errors.Join(errs, err)
 	m.cleanupDLQCount, err = meter.Int64Counter("sqlq.jobs.cleanup.dlq.count", metric.WithDescription("Number of DLQ jobs cleaned up"), metric.WithUnit("{job}"))
+	errs = errors.Join(errs, err)
+	m.claimExpiredCounter, err = meter.Int64Counter("sqlq.jobs.claim.expired.count", metric.WithDescription("Number of jobs whose claim expired in the buffer, before the handler started"), metric.WithUnit("{job}"))
+	errs = errors.Join(errs, err)
+	m.claimExtendedCounter, err = meter.Int64Counter("sqlq.jobs.claim.extended.count", metric.WithDescription("Number of claims extended before the handler started"), metric.WithUnit("{job}"))
+	errs = errors.Join(errs, err)
+	m.claimLostCounter, err = meter.Int64Counter("sqlq.jobs.claim.lost.count", metric.WithDescription("Number of results not written, because a different consumer took the job after the claim expired"), metric.WithUnit("{job}"))
 	errs = errors.Join(errs, err)
 	m.activeJobsUpDown, err = meter.Int64UpDownCounter("sqlq.jobs.active.count", metric.WithDescription("Number of jobs currently being processed"), metric.WithUnit("{job}"))
 	errs = errors.Join(errs, err)
