@@ -31,7 +31,7 @@ func init() {
 }
 
 func expectedSnapshotConflict(query string) bool {
-	return strings.Contains(query, "chaos_") || strings.Contains(query, "UPDATE jobs SET processed_at = ?")
+	return strings.Contains(query, "chaos_") || strings.Contains(query, "UPDATE sqlq_jobs SET processed_at = ?")
 }
 
 func observeSnapshot(query string, err error) {

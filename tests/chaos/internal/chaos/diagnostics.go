@@ -102,6 +102,6 @@ func backlog(ctx context.Context, c Config, db *sql.DB) (string, error) {
 		COALESCE(SUM(CASE WHEN claim_expires_at > `+now+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN claim_expires_at <= `+now+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN scheduled_at <= `+now+` AND (claim_expires_at IS NULL OR claim_expires_at <= `+now+`) THEN 1 ELSE 0 END),0)
-		FROM jobs WHERE processed_at IS NULL`).Scan(&pending, &delayed, &claimed, &expired, &ready)
+		FROM sqlq_jobs WHERE processed_at IS NULL`).Scan(&pending, &delayed, &claimed, &expired, &ready)
 	return fmt.Sprintf("pending=%d ready=%d delayed=%d claimed=%d expired_claims=%d pool=%+v", pending, ready, delayed, claimed, expired, db.Stats()), err
 }

@@ -36,7 +36,6 @@ type Config struct {
 	LockTimeout      time.Duration
 	Poll             time.Duration
 	JobTimeout       time.Duration
-	ClaimTimeout     time.Duration
 	Backoff          time.Duration
 	MaxRetries       int32
 	Push             bool
@@ -79,7 +78,7 @@ func DefaultConfig() Config {
 	return Config{Driver: "sqlite", Seed: 1, N: 5000, MaxRange: 100,
 		Processes: 3, Concurrency: 2, Prefetch: 8, Pool: 8, LockTimeout: 100 * time.Millisecond,
 		Poll: 20 * time.Millisecond, JobTimeout: 200 * time.Millisecond,
-		ClaimTimeout: time.Second, Backoff: 30 * time.Millisecond, MaxRetries: 2,
+		Backoff: 30 * time.Millisecond, MaxRetries: 2,
 		Chaos: 3 * time.Second, Recovery: 30 * time.Second, Verification: 30 * time.Second, Shutdown: 10 * time.Second, FaultInterval: 100 * time.Millisecond,
 		Artifacts: "chaos-artifacts"}
 }
@@ -95,7 +94,6 @@ func RandomizedConfig(c Config) Config {
 	c.Pool = 1 + r.Intn(8)
 	c.Poll = time.Duration(5+r.Intn(96)) * time.Millisecond
 	c.JobTimeout = time.Duration(200+r.Intn(301)) * time.Millisecond
-	c.ClaimTimeout = RandomClaimTimeout(r, c.JobTimeout)
 	c.Backoff = time.Duration(r.Intn(101)) * time.Millisecond
 	c.MaxRetries = []int32{-1, 0, 1, 3}[r.Intn(4)]
 	c.Push = c.Driver == "sqlite" && r.Intn(2) == 0
@@ -133,8 +131,8 @@ func (c Config) Validate() error {
 	if c.Processes < 1 || c.Concurrency < 1 || c.Pool < 1 || c.LockTimeout < time.Millisecond {
 		return fmt.Errorf("processes, concurrency and pool must be positive; lock-timeout must be >= 1ms")
 	}
-	if c.Poll <= 0 || c.JobTimeout < 10*time.Millisecond || c.ClaimTimeout <= c.JobTimeout || c.Backoff < 0 {
-		return fmt.Errorf("require positive poll, job-timeout >= 10ms, claim-timeout > job-timeout, nonnegative backoff")
+	if c.Poll <= 0 || c.JobTimeout < minJobTimeout || c.Backoff < 0 {
+		return fmt.Errorf("require positive poll, job-timeout >= %s, nonnegative backoff", minJobTimeout)
 	}
 	if c.Chaos < 0 || c.Recovery <= 0 || c.Verification <= 0 || c.Shutdown <= 0 || c.FaultInterval <= 0 || c.Cleanup < 0 || c.MaxRetries < -1 || c.MaxRetries > 100 {
 		return fmt.Errorf("invalid budgets, cleanup or retries")
@@ -176,8 +174,11 @@ func buildTasks(c Config) []Task {
 
 func expected(t Task) string { return new(big.Int).MulRange(int64(t.Lo), int64(t.Hi)).String() }
 
-// RandomClaimTimeout returns a claim timeout from just over jobTimeout to four times it.
-// Short claims are as much a part of the queue's contract as long ones: see AcceptedClaimTimeout.
-func RandomClaimTimeout(r *rand.Rand, jobTimeout time.Duration) time.Duration {
-	return jobTimeout + time.Millisecond + time.Duration(r.Int63n(int64(3*jobTimeout)))
+// minJobTimeout is the shortest job timeout of the queue. The queue increases a shorter timeout to it.
+const minJobTimeout = 50 * time.Millisecond
+
+// claimLength returns the length of each claim. The queue calculates it from the job timeout:
+// the job timeout plus half of it, but not more than 10 seconds more. This is the same calculation.
+func (c Config) claimLength() time.Duration {
+	return c.JobTimeout + min(10*time.Second, c.JobTimeout/2)
 }

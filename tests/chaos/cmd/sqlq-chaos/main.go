@@ -62,7 +62,6 @@ func run(ctx context.Context, args []string) error {
 	f.DurationVar(&c.LockTimeout, "lock-timeout", c.LockTimeout, "SQLite busy timeout / PostgreSQL lock_timeout")
 	f.DurationVar(&c.Poll, "poll", c.Poll, "poll interval")
 	f.DurationVar(&c.JobTimeout, "job-timeout", c.JobTimeout, "handler timeout")
-	f.DurationVar(&c.ClaimTimeout, "claim-timeout", c.ClaimTimeout, "claim timeout, greater than job timeout")
 	f.DurationVar(&c.Backoff, "backoff", c.Backoff, "retry backoff unit")
 	retries := f.Int("retries", int(c.MaxRetries), "maximum retries (-1 means unlimited)")
 	f.BoolVar(&c.Push, "push", false, "enable SQLite async push hints")
@@ -95,7 +94,7 @@ func run(ctx context.Context, args []string) error {
 			"prefetch": strconv.Itoa(int(generated.Prefetch)), "pool": strconv.Itoa(generated.Pool),
 			"lock-timeout": generated.LockTimeout.String(),
 			"poll":         generated.Poll.String(), "job-timeout": generated.JobTimeout.String(),
-			"claim-timeout": generated.ClaimTimeout.String(), "backoff": generated.Backoff.String(),
+			"backoff": generated.Backoff.String(),
 			"retries": strconv.Itoa(int(generated.MaxRetries)), "push": strconv.FormatBool(generated.Push),
 			"push-rpm": strconv.Itoa(generated.PushRPM), "cleanup": generated.Cleanup.String(),
 			"app-timezone": generated.AppTimeZone, "db-timezone": generated.DBTimeZone,
@@ -107,14 +106,6 @@ func run(ctx context.Context, args []string) error {
 					return err
 				}
 			}
-		}
-		if !explicit["claim-timeout"] {
-			// The generated claim timeout can be shorter than the queue accepts.
-			accepted, _, err := chaos.AcceptedClaimTimeout(ctx, c.JobTimeout, c.ClaimTimeout)
-			if err != nil {
-				return err
-			}
-			c.ClaimTimeout = accepted
 		}
 	}
 	if *workers > 65535 || *prefetch > 65535 || *retries < -1 || *retries > 100 || c.PushRPM < 0 || c.PushRPM > 65535 {

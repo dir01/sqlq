@@ -84,16 +84,22 @@ const dlqRetention = time.Hour
 // text columns reject NUL and invalid UTF-8, yet the failure must still be recorded.
 const faultText = ": \x00 \xff"
 
+// pollEvery returns a poll delay function with a fixed delay. The default delay of the queue becomes
+// longer after each poll that finds no jobs. The harness uses a fixed delay, so that its timing is known.
+func pollEvery(delay time.Duration) func(emptyPolls uint16) time.Duration {
+	return func(uint16) time.Duration { return delay }
+}
+
 func queue(c Config, db *sql.DB, tracers ...trace.Tracer) (sqlq.JobsQueue, error) {
 	opts := []sqlq.NewOption{
-		sqlq.WithDefaultPollInterval(c.Poll), sqlq.WithDefaultConcurrency(c.Concurrency),
+		sqlq.WithDefaultPollDelayFunc(pollEvery(c.Poll)), sqlq.WithDefaultConcurrency(c.Concurrency),
 		sqlq.WithDefaultPrefetchCount(c.Prefetch), sqlq.WithDefaultJobTimeout(c.JobTimeout),
-		sqlq.WithDefaultClaimTimeout(c.ClaimTimeout), sqlq.WithDefaultMaxRetries(c.MaxRetries),
+		sqlq.WithDefaultMaxRetries(c.MaxRetries),
 		sqlq.WithDefaultBackoffFunc(func(retry uint16) time.Duration {
 			return c.Backoff * time.Duration(1+int(retry)%4)
 		}),
 		sqlq.WithDefaultCleanupProcessedInterval(c.Cleanup),
-		sqlq.WithDefaultCleanupProcessedAge(c.ClaimTimeout), sqlq.WithDefaultCleanupBatch(7),
+		sqlq.WithDefaultCleanupProcessedAge(c.claimLength()), sqlq.WithDefaultCleanupBatch(7),
 		// Required work must remain recoverable from the DLQ throughout chaos. No run lasts
 		// dlqRetention, so DLQ cleanup must never delete anything, in any time zone. On SQLite each
 		// cleanup takes the write lock even when it deletes nothing, and every consumer of every
@@ -284,7 +290,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		e.emit("attempt", id, fmt.Sprintf("retry=%d mode=%d", info.RetryCount, mode))
 		if mode == 4 {
 			e.emit("long_wait", id, "")
-			time.Sleep(c.ClaimTimeout + c.Poll)
+			time.Sleep(c.claimLength() + c.Poll)
 			e.emit("long_wait_finished", id, fmt.Sprintf("context=%v", ctx.Err()))
 		} else if mode == 5 {
 			e.emit("below_timeout", id, "")
@@ -447,7 +453,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		e.emit("kept_attempt", -1, fmt.Sprintf("retry=%d", info.RetryCount))
 		return errors.New(keptFailure + faultText)
 		// Each SQLite poll takes the write lock too, even when it finds nothing (see DLQ cleanup).
-	}, sqlq.WithConsumerMaxRetries(1), sqlq.WithConsumerPollInterval(50*c.Poll))
+	}, sqlq.WithConsumerMaxRetries(1), sqlq.WithConsumerPollDelayFunc(pollEvery(50*c.Poll)))
 	if err != nil {
 		return err
 	}
@@ -558,9 +564,9 @@ func verify(ctx context.Context, c Config, db *sql.DB, interrupted map[int]bool,
 		return errors.New("incorrect factorial")
 	}
 	for _, query := range []string{
-		`SELECT COUNT(*) FROM jobs WHERE processed_at IS NULL`,
-		`SELECT COUNT(*) FROM jobs WHERE job_type NOT IN ('factorial', 'audit', 'side_audit')`,
-		`SELECT COUNT(*) FROM dead_letter_queue WHERE job_type <> 'kept'`, // See verifyKept.
+		`SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NULL`,
+		`SELECT COUNT(*) FROM sqlq_jobs WHERE job_type NOT IN ('factorial', 'audit', 'side_audit')`,
+		`SELECT COUNT(*) FROM sqlq_dead_letter_queue WHERE job_type <> 'kept'`, // See verifyKept.
 	} {
 		var count int
 		if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
@@ -594,7 +600,19 @@ func verifyKept(ctx context.Context, q sqlq.JobsQueue, started time.Time) error 
 	}
 	j := jobs[0]
 	// A failed move to the DLQ reschedules the job instead, which counts as a retry too.
-	if j.RetryCount < 1 || !strings.HasPrefix(j.FailureReason, keptFailure) {
+	// The queue counts an attempt when it starts. A worker that is killed, or paused for longer
+	// than the claim, does not write the result of its attempt. When the job has no attempts left,
+	// the next attempt moves it without a handler call. Then the reason starts with
+	// "no attempts left". It contains the last error of the handler, if an attempt wrote one.
+	reason := j.FailureReason
+	if strings.HasPrefix(reason, "no attempts left") {
+		_, last, ok := strings.Cut(reason, "; last recorded error: ")
+		if !ok {
+			last = keptFailure // No attempt wrote an error, because each one was stopped.
+		}
+		reason = last
+	}
+	if j.RetryCount < 1 || !strings.HasPrefix(reason, keptFailure) {
 		return fmt.Errorf("kept job dead-lettered with retry count %d and reason %q; want at least 1 and its handler's error", j.RetryCount, j.FailureReason)
 	}
 	for name, at := range map[string]time.Time{"created": j.CreatedAt, "failed": j.FailedAt} {
@@ -616,7 +634,7 @@ func verifyAudits(ctx context.Context, c Config, db *sql.DB) error {
 	if c.Chaos > 0 {
 		return nil // Network faults and process pauses legitimately fail completions.
 	}
-	rows, err := db.QueryContext(ctx, placeholders(c, `SELECT job_type, id, last_error FROM jobs WHERE job_type IN (?, ?) AND last_error IS NOT NULL`), auditJobType, sideAuditJobType)
+	rows, err := db.QueryContext(ctx, placeholders(c, `SELECT job_type, id, last_error FROM sqlq_jobs WHERE job_type IN (?, ?) AND last_error IS NOT NULL`), auditJobType, sideAuditJobType)
 	if err != nil {
 		return err
 	}

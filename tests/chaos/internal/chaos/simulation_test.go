@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -121,16 +120,6 @@ func runSimulation(t *testing.T, driver, dsn string) {
 					// Native real-time budgets: enough time for SQL work, short
 					// enough that intentionally abandoned claims recover quickly.
 					c.JobTimeout /= 4
-					c.ClaimTimeout = RandomClaimTimeout(rand.New(rand.NewSource(seed^0x2545f4914f6cdd1d)), c.JobTimeout)
-					proposed := c.ClaimTimeout
-					var rejected int
-					var err error
-					if c.ClaimTimeout, rejected, err = AcceptedClaimTimeout(t.Context(), c.JobTimeout, c.ClaimTimeout); err != nil {
-						t.Fatalf("claim timeout probe: %v", err)
-					}
-					if rejected > 0 {
-						t.Logf("claim timeout %s rejected for job timeout %s; running with %s", proposed, c.JobTimeout, c.ClaimTimeout)
-					}
 					c.Poll = 5 * time.Millisecond
 					c.Backoff = 5 * time.Millisecond
 					c.MaxRetries = profile.retries
@@ -151,8 +140,8 @@ func runSimulation(t *testing.T, driver, dsn string) {
 					c.Shutdown = 8 * time.Second
 					c.RequireLeakCheck = true
 					c.Artifacts = filepath.Join(t.ArtifactDir(), "run")
-					t.Logf("seed=%d driver=%s n=%d processes=%d concurrency=%d prefetch=%d pool=%d job-timeout=%s claim-timeout=%s app-tz=%s db-tz=%s artifacts=%s",
-						seed, driver, c.N, c.Processes, c.Concurrency, c.Prefetch, c.Pool, c.JobTimeout, c.ClaimTimeout, c.AppTimeZone, c.DBTimeZone, c.Artifacts)
+					t.Logf("seed=%d driver=%s n=%d processes=%d concurrency=%d prefetch=%d pool=%d job-timeout=%s claim=%s app-tz=%s db-tz=%s artifacts=%s",
+						seed, driver, c.N, c.Processes, c.Concurrency, c.Prefetch, c.Pool, c.JobTimeout, c.claimLength(), c.AppTimeZone, c.DBTimeZone, c.Artifacts)
 					ctx, cancel := context.WithTimeout(t.Context(), c.Chaos+c.Recovery+c.Verification+2*c.Shutdown+5*time.Second)
 					defer cancel()
 					// The worker is this same go test binary, selected by -test.run.

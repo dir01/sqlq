@@ -84,8 +84,8 @@ func validate(run string, cache map[[2]int]string) (summary, error) {
 		Jobs []struct {
 			Type string `json:"job_type"`
 			Processed json.RawMessage `json:"processed_at"`
-		} `json:"jobs"`
-		DLQ []json.RawMessage `json:"dead_letter_queue"`
+		} `json:"sqlq_jobs"`
+		DLQ []json.RawMessage `json:"sqlq_dead_letter_queue"`
 	}
 	if err := load(filepath.Join(run, "database.json"), &snapshot); err != nil { return s, err }
 	if len(expected) != s.Tasks || len(snapshot.Ledger) != s.Tasks { return s, fmt.Errorf("manifest/ledger count mismatch") }

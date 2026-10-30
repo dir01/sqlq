@@ -73,7 +73,7 @@ func TestChaosWarmupBeforeRandomFaults(t *testing.T) {
 	c := DefaultConfig()
 	c.Seed, c.N, c.MaxRange = 4, 20, 1
 	c.Processes, c.Concurrency, c.Prefetch = 1, 1, 1
-	c.JobTimeout, c.ClaimTimeout = 40*time.Millisecond, 250*time.Millisecond
+	c.JobTimeout = minJobTimeout
 	c.Chaos, c.FaultInterval = 100*time.Millisecond, 20*time.Millisecond
 	c.Artifacts = filepath.Join(t.TempDir(), "warmup")
 	var warmup, healed time.Time
@@ -125,7 +125,7 @@ func TestOracleRejectsCorruption(t *testing.T) {
 			if err := initialize(t.Context(), c, db, q); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(`DELETE FROM jobs`); err != nil {
+			if _, err := db.Exec(`DELETE FROM sqlq_jobs`); err != nil {
 				t.Fatal(err)
 			}
 			side, err := sql.Open("sqlite3", "file:"+c.SideDB)
@@ -148,14 +148,14 @@ func TestOracleRejectsCorruption(t *testing.T) {
 			if err := q.Publish(t.Context(), sideAuditJobType, 0); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(`UPDATE jobs SET processed_at=1, last_error='failed to mark job 2 processed: database is locked' WHERE job_type='side_audit'`); err != nil {
+			if _, err := db.Exec(`UPDATE sqlq_jobs SET processed_at=1, last_error='failed to mark job 2 processed: database is locked' WHERE job_type='side_audit'`); err != nil {
 				t.Fatal(err)
 			}
 			// A processed audit that once timed out is a valid outcome.
 			if err := q.Publish(t.Context(), auditJobType, 0); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(`UPDATE jobs SET processed_at=1, last_error='context deadline exceeded' WHERE job_type='audit'`); err != nil {
+			if _, err := db.Exec(`UPDATE sqlq_jobs SET processed_at=1, last_error='context deadline exceeded' WHERE job_type='audit'`); err != nil {
 				t.Fatal(err)
 			}
 			if err := verify(t.Context(), c, db, nil); err != nil {
@@ -172,9 +172,9 @@ func TestOracleRejectsCorruption(t *testing.T) {
 			case "missing":
 				query = `DELETE FROM chaos_ledger WHERE task=0`
 			case "charged-audit":
-				query = `UPDATE jobs SET last_error='failed to mark job 1 processed: database is locked' WHERE job_type='audit'`
+				query = `UPDATE sqlq_jobs SET last_error='failed to mark job 1 processed: database is locked' WHERE job_type='audit'`
 			case "charged-side-audit":
-				query = `UPDATE jobs SET last_error='invalid audit payload' WHERE job_type='side_audit'`
+				query = `UPDATE sqlq_jobs SET last_error='invalid audit payload' WHERE job_type='side_audit'`
 			case "lost-side-effect", "duplicate-side-effect":
 				sideTask := 0
 				for !sideAudited(c, sideTask) {

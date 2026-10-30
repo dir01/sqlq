@@ -385,7 +385,7 @@ func Run(ctx context.Context, c Config, command Command, observers ...func(Event
 	// Give workers a bounded opportunity to reach a transactional write before
 	// randomized signals can starve startup/long-wait attempts. The full chaos
 	// budget starts at the targeted write-boundary kill, not process launch.
-	chaosEnd := time.NewTimer(max(c.Shutdown, c.JobTimeout+c.ClaimTimeout))
+	chaosEnd := time.NewTimer(max(c.Shutdown, c.JobTimeout+c.claimLength()))
 	defer chaosEnd.Stop()
 	// Target a write boundary once, then use independent randomized signals.
 	targetKilled := false
@@ -472,7 +472,7 @@ chaosLoop:
 			case 1:
 				if ch.resume.IsZero() {
 					_ = ch.cmd.Process.Signal(syscall.SIGSTOP)
-					ch.resume = time.Now().Add(c.ClaimTimeout + 2*c.Poll)
+					ch.resume = time.Now().Add(c.claimLength() + 2*c.Poll)
 					logEvent(Event{At: time.Now(), Worker: id, Kind: "pause", Task: -1})
 				}
 			case 2:
@@ -597,12 +597,12 @@ chaosLoop:
 			if count > len(c.Tasks) {
 				return summary, fmt.Errorf("too many committed effects: %d > %d", count, len(c.Tasks))
 			}
-			if err := db.QueryRowContext(recoveryCtx, `SELECT COUNT(*) FROM jobs WHERE processed_at IS NULL`).Scan(&pending); err != nil {
+			if err := db.QueryRowContext(recoveryCtx, `SELECT COUNT(*) FROM sqlq_jobs WHERE processed_at IS NULL`).Scan(&pending); err != nil {
 				return summary, err
 			}
 			summary.PendingJobs = pending
 			// The kept job stays in the DLQ (see verifyKept).
-			if err := db.QueryRowContext(recoveryCtx, placeholders(c, `SELECT COUNT(*) FROM dead_letter_queue WHERE job_type <> ?`), keptJobType).Scan(&summary.DLQJobs); err != nil {
+			if err := db.QueryRowContext(recoveryCtx, placeholders(c, `SELECT COUNT(*) FROM sqlq_dead_letter_queue WHERE job_type <> ?`), keptJobType).Scan(&summary.DLQJobs); err != nil {
 				return summary, err
 			}
 			if time.Since(lastProgress) >= time.Second {
@@ -636,7 +636,7 @@ chaosLoop:
 				logEvent(Event{At: time.Now(), Worker: -1, Kind: "phase_start", Task: -1, Detail: "verification"})
 				verificationCtx, stopVerification := context.WithTimeout(ctx, c.Verification)
 				lastCheck := time.Time{}
-				err := verify(verificationCtx, c, db, commits.interrupted(c.ClaimTimeout), func(checked int) {
+				err := verify(verificationCtx, c, db, commits.interrupted(c.claimLength()), func(checked int) {
 					if time.Since(lastCheck) >= time.Second || checked == len(c.Tasks) {
 						logEvent(Event{At: time.Now(), Worker: -1, Kind: "progress", Task: -1, Detail: fmt.Sprintf("verification checked=%d/%d", checked, len(c.Tasks))})
 						lastCheck = time.Now()
@@ -667,7 +667,7 @@ func writeJSON(path string, value any) error {
 
 func snapshot(ctx context.Context, db *sql.DB, path string) error {
 	data := make(map[string][]map[string]any)
-	for _, table := range []string{"jobs", "dead_letter_queue", "chaos_ledger"} {
+	for _, table := range []string{"sqlq_jobs", "sqlq_dead_letter_queue", "chaos_ledger"} {
 		rows, err := db.QueryContext(ctx, `SELECT * FROM `+table)
 		if err != nil {
 			return err

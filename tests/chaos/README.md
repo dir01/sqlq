@@ -68,10 +68,8 @@ recovery, and unlimited retries with processed-job cleanup (plus SQLite push
 registration). Seeds vary the graph, process/concurrency counts, prefetch, pool
 size, lock timeout and fault choices. The default workload is `1000!` with leaf
 ranges up to 8, and each chaos profile injects faults for 1.5 seconds. Job timeouts
-are 50–125 ms; claim timeouts run from just over the job timeout to four times it.
-A claim timeout the queue rejects (`ErrClaimTimeoutTooShort`) has its excess over
-the job timeout doubled until one is accepted, so runs start near the queue's lower
-bound: whatever registration accepts must work. Workers' `TZ` and the PostgreSQL
+are 50–125 ms. The queue calculates the claim from the job timeout: the job
+timeout plus half of it. Workers poll with a fixed delay. Workers' `TZ` and the PostgreSQL
 session `TimeZone` are each one of UTC, America/Los_Angeles, Asia/Tokyo,
 America/St_Johns or Pacific/Chatham. Independent recovery, verification
 and shutdown budgets bound completion. These are real-time tests, not simulated
@@ -138,9 +136,9 @@ directory.
 ### Configurations
 
 Use `-processes`, `-workers`, `-prefetch`, `-pool`, `-lock-timeout`, `-poll`, `-job-timeout`,
-`-claim-timeout`, `-backoff`, `-retries`, `-push`, `-push-rpm`, and `-cleanup` to
+`-backoff`, `-retries`, `-push`, `-push-rpm`, and `-cleanup` to
 explore configurations, and `-app-timezone` and `-db-timezone` for time zones.
-`-retries -1` means unlimited retries. Claim timeout must exceed job timeout.
+`-retries -1` means unlimited retries. The job timeout must be at least 50 ms.
 DLQ cleanup runs every fifty polls with a one-hour retention: required work must
 remain available for recovery, and nothing in a run is that old. Processed cleanup uses small batches and
 retains the independent execution ledger.
@@ -240,8 +238,8 @@ job in a fresh transaction. Each side-audited task must leave exactly one side
 row. There is one exception. In WAL mode, SQLite commits attached databases one
 after the other, not atomically: a worker killed between the commits leaves the
 job processed without its side row. So a task may have no side row if its last
-side audit was its worker's last event and the worker was SIGKILLed within a
-claim timeout of it. Any later event from that worker, such as its next attempt,
+side audit was its worker's last event and the worker was SIGKILLed within one
+claim length of it. Any later event from that worker, such as its next attempt,
 shows that the commit returned. Side audits run on a queue of their own, whose connections have the side
 database attached, because the queue only marks a job in a fresh transaction on
 a connection that uses no other database: plain audits keep connections without
