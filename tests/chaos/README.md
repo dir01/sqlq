@@ -237,10 +237,13 @@ transaction did write, so the queue must retry the handler rather than mark the
 job in a fresh transaction. Each side-audited task must leave exactly one side
 row. There is one exception. In WAL mode, SQLite commits attached databases one
 after the other, not atomically: a worker killed between the commits leaves the
-job processed without its side row. So a task may have no side row if its last
-side audit was its worker's last event and the worker was SIGKILLed within one
-claim length of it. Any later event from that worker, such as its next attempt,
-shows that the commit returned. Side audits run on a queue of their own, whose connections have the side
+job processed without its side row. The handler cannot see the commit, because
+the queue commits after the handler returns. Thus the worker's SQLite driver
+wrapper reports `side_committed` for a task when a transaction with its side
+write commits successfully. A task may have no side row only if no such commit
+returned, and the worker of its last side audit was SIGKILLed within one claim
+length after it. Other events of the worker show nothing about the commit,
+because a worker runs many handlers at the same time. Side audits run on a queue of their own, whose connections have the side
 database attached, because the queue only marks a job in a fresh transaction on
 a connection that uses no other database: plain audits keep connections without
 it. Like any SQLite handler that reads and then writes, a side audit may also

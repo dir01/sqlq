@@ -180,6 +180,8 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 		e.emit("fatal", -1, fmt.Sprintf("queue transaction upgraded a stale SQLite read snapshot: %s: %v", query, err))
 	}
 	snapshotConflict.Store(&report)
+	committed := func(task int) { e.emit("side_committed", task, "") }
+	sideCommitted.Store(&committed)
 	var err error
 	db, err = openDB(c, true)
 	if err != nil {
@@ -463,7 +465,7 @@ func Worker(ctx context.Context, c Config, id int, healthy bool, out io.Writer) 
 			if err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO side.chaos_side_effects VALUES (?)`, id); err != nil {
+			if _, err := tx.ExecContext(ctx, sideWrite, id); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return fmt.Errorf("side audit write: %w", ctxErr)
 				}

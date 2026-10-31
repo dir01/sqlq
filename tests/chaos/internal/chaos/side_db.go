@@ -63,9 +63,9 @@ func (attachingConnector) Driver() driver.Driver {
 }
 
 // verifySideEffects checks that each task's side audit committed its write exactly once. A task in
-// interrupted may have none: its last side audit's worker was killed right after the write, perhaps
-// between the commits of the main and the side database (see commitWatch). No queue can keep the
-// two together across a crash in WAL mode.
+// interrupted may have none: the worker of its last side audit was killed after the write, and no
+// commit of that write returned. Thus, the kill possibly came between the commits of the main and
+// the side database (see commitWatch). No queue can keep the two together across a crash in WAL mode.
 func verifySideEffects(ctx context.Context, c Config, interrupted map[int]bool) error {
 	if c.SideDB == "" {
 		return nil
@@ -120,40 +120,41 @@ func checkAuditFailure(kind string, jobID int64, reason string) error {
 // writes the main and then the side database: SQLite does not commit attached databases atomically
 // in WAL mode, so a kill between the two leaves the job processed without its side row. Events are
 // observed in order of arrival, which is not their order in time.
+//
+// The handler emits side_audit before the queue commits. The driver wrapper of the worker emits
+// side_committed for the task when that commit returns (see observedTx). A worker runs many
+// goroutines at the same time, so its other events do not show that a commit returned.
 type commitWatch struct {
-	lastEvent     map[int]Event // By worker, its latest own event.
 	lastSideAudit map[int]Event // By task.
+	committed     map[int]bool  // By task: a commit of its side write returned.
 	killedAt      map[int]time.Time
 }
 
 func newCommitWatch() *commitWatch {
-	return &commitWatch{lastEvent: make(map[int]Event), lastSideAudit: make(map[int]Event), killedAt: make(map[int]time.Time)}
+	return &commitWatch{lastSideAudit: make(map[int]Event), committed: make(map[int]bool), killedAt: make(map[int]time.Time)}
 }
 
 func (w *commitWatch) observe(e Event) {
 	switch e.Kind {
 	case "kill", "kill_at_write":
 		w.killedAt[e.Worker] = e.At
-	case "start", "exit", "pause", "resume", "shutdown", "term_at_registration", "network", "invalid_event":
-		// The supervisor's events about a worker, not the worker's own.
-	default:
-		if e.Worker >= 0 && !e.At.Before(w.lastEvent[e.Worker].At) {
-			w.lastEvent[e.Worker] = e
-		}
-		if e.Kind == "side_audit" && !e.At.Before(w.lastSideAudit[e.Task].At) {
+	case "side_committed":
+		w.committed[e.Task] = true
+	case "side_audit":
+		if !e.At.Before(w.lastSideAudit[e.Task].At) {
 			w.lastSideAudit[e.Task] = e
 		}
 	}
 }
 
-// interrupted returns the tasks whose last side audit was its worker's last event, with the worker
-// killed within window of it: the commit may not have finished. Any later event from the worker,
-// such as its next attempt, means the commit returned.
+// interrupted returns the tasks with no returned commit of a side write, whose last side audit's
+// worker was killed within window after it: the commit possibly did not finish. A task with a
+// returned commit is never in the result. If its side row is missing, the queue lost the write.
 func (w *commitWatch) interrupted(window time.Duration) map[int]bool {
 	tasks := make(map[int]bool)
 	for task, e := range w.lastSideAudit {
 		killed, ok := w.killedAt[e.Worker]
-		if ok && w.lastEvent[e.Worker] == e && !killed.Before(e.At) && killed.Sub(e.At) <= window {
+		if ok && !w.committed[task] && !killed.Before(e.At) && killed.Sub(e.At) <= window {
 			tasks[task] = true
 		}
 	}

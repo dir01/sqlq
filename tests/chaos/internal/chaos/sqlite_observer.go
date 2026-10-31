@@ -26,6 +26,14 @@ const observedSQLiteDriver = "sqlite3-observed"
 // snapshotConflict is called with each unexpected stale-snapshot upgrade. Set once per worker process.
 var snapshotConflict atomic.Pointer[func(query string, err error)]
 
+// sideCommitted is called with the task of each side write, after the transaction that wrote it
+// committed successfully. Set once per worker process. The handler cannot report this itself,
+// because the queue commits after the handler returns (see commitWatch).
+var sideCommitted atomic.Pointer[func(task int)]
+
+// sideWrite is the statement of a side audit. The observer finds the side writes by this text.
+const sideWrite = `INSERT INTO side.chaos_side_effects VALUES (?)`
+
 func init() {
 	sql.Register(observedSQLiteDriver, observedDriver{base: &sqlite3.SQLiteDriver{}})
 }
@@ -60,12 +68,52 @@ func (d observedDriver) Open(name string) (driver.Conn, error) {
 }
 
 // observedConn keeps every other method of the underlying connection.
-type observedConn struct{ *sqlite3.SQLiteConn }
+type observedConn struct {
+	*sqlite3.SQLiteConn
+	sideTasks []int // The tasks of the side writes in the open transaction.
+}
 
 func (c *observedConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	result, err := c.SQLiteConn.ExecContext(ctx, query, args)
 	observeSnapshot(query, err)
+	if err == nil && query == sideWrite && len(args) == 1 {
+		if task, ok := args[0].Value.(int64); ok {
+			c.sideTasks = append(c.sideTasks, int(task))
+		}
+	}
 	return result, err
+}
+
+func (c *observedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.sideTasks = nil
+	tx, err := c.SQLiteConn.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &observedTx{Tx: tx, conn: c}, nil
+}
+
+// observedTx reports the side writes of its transaction when the commit is successful.
+type observedTx struct {
+	driver.Tx
+	conn *observedConn
+}
+
+func (tx *observedTx) Commit() error {
+	err := tx.Tx.Commit()
+	tasks := tx.conn.sideTasks
+	tx.conn.sideTasks = nil
+	if report := sideCommitted.Load(); err == nil && report != nil {
+		for _, task := range tasks {
+			(*report)(task)
+		}
+	}
+	return err
+}
+
+func (tx *observedTx) Rollback() error {
+	tx.conn.sideTasks = nil
+	return tx.Tx.Rollback()
 }
 
 func (c *observedConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
