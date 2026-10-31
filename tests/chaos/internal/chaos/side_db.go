@@ -136,7 +136,7 @@ func newCommitWatch() *commitWatch {
 
 func (w *commitWatch) observe(e Event) {
 	switch e.Kind {
-	case "kill", "kill_at_write":
+	case "kill", "kill_at_write", "kill_at_stop":
 		w.killedAt[e.Worker] = e.At
 	case "side_committed":
 		w.committed[e.Task] = true

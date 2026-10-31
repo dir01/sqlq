@@ -35,12 +35,14 @@ func TestCommitWatch(t *testing.T) {
 		{At: ms(41), Worker: 9, Kind: "attempt", Task: 5},         // mid-way. An event of a different
 		{At: ms(41), Worker: 9, Kind: "worker_metrics", Task: -1}, // goroutine does not show that
 		{At: ms(42), Worker: 9, Kind: "kill", Task: -1},           // the commit returned.
+		{At: ms(50), Worker: 10, Kind: "side_audit", Task: 128},   // Task 128\'s worker was killed
+		{At: ms(51), Worker: 10, Kind: "kill_at_stop", Task: -1},  // when the chaos phase ended.
 	}
 	w := newCommitWatch()
 	for _, e := range events {
 		w.observe(e)
 	}
-	want := map[int]bool{0: true, 80: true, 96: true, 112: true}
+	want := map[int]bool{0: true, 80: true, 96: true, 112: true, 128: true}
 	if got := w.interrupted(100 * time.Millisecond); !reflect.DeepEqual(got, want) {
 		t.Fatalf("interrupted = %v; want %v", got, want)
 	}

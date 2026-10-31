@@ -266,10 +266,12 @@ func Run(ctx context.Context, c Config, command Command, observers ...func(Event
 		return nil
 	}
 	stopAll := func() {
-		for _, ch := range children {
+		for id, ch := range children {
 			ch.forcedKill = true
 			_ = ch.cmd.Process.Signal(syscall.SIGCONT)
 			_ = ch.cmd.Process.Kill()
+			// The kill can interrupt a side-audit commit, as a random kill can (see commitWatch).
+			logEvent(Event{At: time.Now(), Worker: id, Kind: "kill_at_stop", Task: -1})
 		}
 		for id, ch := range children {
 		wait:
