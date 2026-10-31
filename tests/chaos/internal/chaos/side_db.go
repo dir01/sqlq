@@ -137,7 +137,11 @@ func newCommitWatch() *commitWatch {
 func (w *commitWatch) observe(e Event) {
 	switch e.Kind {
 	case "kill", "kill_at_write", "kill_at_stop":
-		w.killedAt[e.Worker] = e.At
+		// stopAll also kills a worker that is already dead but not collected yet. Keep the
+		// earliest time: a process dies only one time, at its first kill.
+		if killed, ok := w.killedAt[e.Worker]; !ok || e.At.Before(killed) {
+			w.killedAt[e.Worker] = e.At
+		}
 	case "side_committed":
 		w.committed[e.Task] = true
 	case "side_audit":

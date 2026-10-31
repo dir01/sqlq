@@ -37,12 +37,15 @@ func TestCommitWatch(t *testing.T) {
 		{At: ms(42), Worker: 9, Kind: "kill", Task: -1},           // the commit returned.
 		{At: ms(50), Worker: 10, Kind: "side_audit", Task: 128},   // Task 128\'s worker was killed
 		{At: ms(51), Worker: 10, Kind: "kill_at_stop", Task: -1},  // when the chaos phase ended.
+		{At: ms(60), Worker: 11, Kind: "side_audit", Task: 144},   // Task 144\'s worker was killed at
+		{At: ms(61), Worker: 11, Kind: "kill", Task: -1},          // random, and again at the end of
+		{At: ms(300), Worker: 11, Kind: "kill_at_stop", Task: -1}, // the chaos phase. The first kill counts.
 	}
 	w := newCommitWatch()
 	for _, e := range events {
 		w.observe(e)
 	}
-	want := map[int]bool{0: true, 80: true, 96: true, 112: true, 128: true}
+	want := map[int]bool{0: true, 80: true, 96: true, 112: true, 128: true, 144: true}
 	if got := w.interrupted(100 * time.Millisecond); !reflect.DeepEqual(got, want) {
 		t.Fatalf("interrupted = %v; want %v", got, want)
 	}
